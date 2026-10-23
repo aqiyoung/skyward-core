@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // Option is the configuration that is used to create a new decoder
@@ -391,7 +392,221 @@ func (d *Decoder) decodeStruct(name string, data any, val reflect.Value) error {
 	}
 }
 
+// resolvedField is one struct field with its tag already read.
+type resolvedField struct {
+	name string
+	// key is reflect.ValueOf(name) built once: reflect.ValueOf on a string per
+	// field per decode was an allocation for every outbound in a profile.
+	key       reflect.Value
+	index     []int
+	omitempty bool
+	skip      bool
+}
+
+// resolvedStruct is a struct type described once: every field the decoder walks,
+// in order, plus where a `remain` field lives.
+type resolvedStruct struct {
+	fields      []resolvedField
+	remainIndex []int
+	// slow is set for a type this description cannot faithfully stand in for — a
+	// pointer to an embedded struct, which the original walk dereferences per
+	// value. Such a type keeps using the walk.
+	slow bool
+}
+
+// resolveKey keeps two decoders with different tag names from sharing an entry.
+type resolveKey struct {
+	tag string
+	typ reflect.Type
+}
+
+var resolvedStructs sync.Map // resolveKey -> *resolvedStruct
+
+// resolve describes a struct type. The walk this replaces ran for every map the
+// decoder saw — once per proxy in a profile — splitting every tag and building a
+// slice of reflect.StructField each time; at 200 outbounds that was most of what
+// a profile load allocated.
+func (d *Decoder) resolve(t reflect.Type) *resolvedStruct {
+	key := resolveKey{tag: d.option.TagName, typ: t}
+	if cached, ok := resolvedStructs.Load(key); ok {
+		return cached.(*resolvedStruct)
+	}
+
+	rs := &resolvedStruct{}
+	var walk func(structType reflect.Type, prefix []int) bool
+	walk = func(structType reflect.Type, prefix []int) bool {
+		for i := 0; i < structType.NumField(); i++ {
+			fieldType := structType.Field(i)
+			fieldGoType := fieldType.Type
+			if fieldGoType.Kind() == reflect.Ptr && fieldGoType.Elem().Kind() == reflect.Struct {
+				// The original walk dereferences the value; leave it to the walk.
+				return false
+			}
+
+			index := make([]int, len(prefix)+1)
+			copy(index, prefix)
+			index[len(prefix)] = i
+
+			squash := fieldGoType.Kind() == reflect.Struct && fieldType.Anonymous
+			remain := false
+			tagParts := strings.Split(fieldType.Tag.Get(d.option.TagName), ",")
+			for _, tag := range tagParts[1:] {
+				if tag == "squash" {
+					squash = true
+					break
+				}
+				if tag == "remain" {
+					remain = true
+					break
+				}
+			}
+
+			if squash {
+				if fieldGoType.Kind() != reflect.Struct {
+					return false
+				}
+				if !walk(fieldGoType, index) {
+					return false
+				}
+				continue
+			}
+			if remain {
+				rs.remainIndex = index
+				continue
+			}
+
+			field := resolvedField{index: index, name: fieldType.Name}
+			if tagParts[0] != "" {
+				field.name = tagParts[0]
+			}
+			field.key = reflect.ValueOf(field.name)
+			if tagParts[0] == "-" {
+				field.skip = true
+			}
+			for _, tag := range tagParts[1:] {
+				if tag == "omitempty" {
+					field.omitempty = true
+				}
+			}
+			rs.fields = append(rs.fields, field)
+		}
+		return true
+	}
+
+	if !walk(t, nil) {
+		rs.slow = true
+		rs.fields = nil
+		rs.remainIndex = nil
+	}
+	resolvedStructs.Store(key, rs)
+	return rs
+}
+
 func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) error {
+	dataValType := dataVal.Type()
+	if kind := dataValType.Key().Kind(); kind != reflect.String && kind != reflect.Interface {
+		return fmt.Errorf(
+			"'%s' needs a map with string keys, has '%s' keys",
+			name, dataValType.Key().Kind())
+	}
+
+	rs := d.resolve(val.Type())
+	if rs.slow {
+		return d.decodeStructFromMapWalk(name, dataVal, val)
+	}
+	return d.decodeStructFromMapResolved(name, dataVal, val, rs)
+}
+
+// decodeStructFromMapResolved is the walk with the field list handed to it.
+func (d *Decoder) decodeStructFromMapResolved(name string, dataVal, val reflect.Value, rs *resolvedStruct) error {
+	var unused map[any]struct{}
+	if rs.remainIndex != nil {
+		unused = make(map[any]struct{}, dataVal.Len())
+		for _, dataValKey := range dataVal.MapKeys() {
+			unused[dataValKey.Interface()] = struct{}{}
+		}
+	}
+
+	var unset []string
+	var errors []string
+
+	for _, field := range rs.fields {
+		if field.skip {
+			continue
+		}
+		fieldValue := val.FieldByIndex(field.index)
+
+		rawMapKey := field.key
+		rawMapVal := dataVal.MapIndex(rawMapKey)
+		if !rawMapVal.IsValid() {
+			// A slower search by iterating over each key and doing a
+			// case-insensitive match, exactly as the walk does it.
+			searchFor := field.name
+			if d.option.KeyReplacer != nil {
+				searchFor = d.option.KeyReplacer.Replace(searchFor)
+			}
+			for _, dataValKey := range dataVal.MapKeys() {
+				mK, ok := dataValKey.Interface().(string)
+				if !ok {
+					continue
+				}
+				if d.option.KeyReplacer != nil {
+					mK = d.option.KeyReplacer.Replace(mK)
+				}
+				if strings.EqualFold(mK, searchFor) {
+					rawMapKey = dataValKey
+					rawMapVal = dataVal.MapIndex(dataValKey)
+					break
+				}
+			}
+
+			if !rawMapVal.IsValid() {
+				// There was no matching key for this field.
+				if !field.omitempty {
+					unset = append(unset, field.name)
+				}
+				continue
+			}
+		}
+
+		// Delete the key we're using from the unused map so we stop tracking it.
+		if unused != nil {
+			delete(unused, rawMapKey.Interface())
+		}
+
+		if err := d.decode(field.name, rawMapVal.Interface(), fieldValue); err != nil {
+			errors = append(errors, err.Error())
+		}
+	}
+
+	if rs.remainIndex != nil && len(unused) > 0 {
+		remain := map[any]any{}
+		for key := range unused {
+			remain[key] = dataVal.MapIndex(reflect.ValueOf(key)).Interface()
+		}
+		if err := d.decodeMap(name, remain, val.FieldByIndex(rs.remainIndex)); err != nil {
+			errors = append(errors, err.Error())
+		}
+		unused = nil
+	}
+
+	if len(unset) > 0 {
+		sorted := append([]string(nil), unset...)
+		sort.Strings(sorted)
+		errors = append(errors,
+			fmt.Sprintf("'%s' has unset fields: %s", name, strings.Join(sorted, ", ")))
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf(strings.Join(errors, ","))
+	}
+	return nil
+}
+
+// decodeStructFromMapWalk is the original per-call walk: it reads every tag and
+// builds the field list from the value. It still serves the types the resolved
+// description above cannot stand in for.
+func (d *Decoder) decodeStructFromMapWalk(name string, dataVal, val reflect.Value) error {
 	dataValType := dataVal.Type()
 	if kind := dataValType.Key().Kind(); kind != reflect.String && kind != reflect.Interface {
 		return fmt.Errorf(
