@@ -3,6 +3,12 @@ name: size
 # What the trimming tags are worth, measured on every push to our branch instead
 # of guessed at. The linux binary is a proxy for the .so the app ships: same
 # packages, same tags, and it builds in a minute on a runner.
+#
+# NOTE: this app's editor (customProxyTypes in lib/models/clash_config.dart and
+# the outbound schemas in lib/features/editor/clash_schema.dart) DOES expose
+# easytier/tailscale/zerotier, so dropping them is a real feature-removal
+# tradeoff, not free. We measured it here and chose to keep them for now;
+# revisit only if the ~19 MiB matters more than those three outbound types.
 
 on:
   push:
@@ -32,7 +38,9 @@ jobs:
           }
           # What the app builds today.
           build full with_gvisor
-          # Drop the mesh VPNs mihomo carries but this app never exposes.
+          # The mesh VPNs mihomo carries. The app exposes these in its UI, so
+          # these tags are a deliberate feature-removal tradeoff -- measured
+          # here, not applied to the app's build.
           build trim with_gvisor,no_tailscale,no_zerotier,no_easytier
           # Also drop the fake-ip TUN sniffing path.
           build lean with_gvisor,no_tailscale,no_zerotier,no_easytier,no_fake_tcp
