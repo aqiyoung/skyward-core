@@ -6,6 +6,8 @@ import (
 	"net/netip"
 	"os"
 	"strconv"
+	"sync"
+	"time"
 
 	"github.com/metacubex/mihomo/adapter/outboundgroup"
 	"github.com/metacubex/mihomo/common/structure"
@@ -185,10 +187,40 @@ func validateDialerProxies(proxies map[string]C.Proxy) error {
 	return nil
 }
 
+// ipv6CheckTTL is how long one interface probe answers later parses.
+//
+// Enumerating the host's addresses is a syscall (a cgocall on Windows, netlink on
+// Android) and it was run on every parse: on this machine half of the time a
+// profile took to load. Addresses do not change between two parses a second
+// apart, so the answer is kept for a while — long enough that switching profiles
+// or reloading one costs nothing, short enough that enabling IPv6 on the device
+// is noticed without restarting the core.
+const ipv6CheckTTL = 30 * time.Second
+
+var (
+	ipv6Mu      sync.Mutex
+	ipv6Checked time.Time
+	ipv6Present bool
+)
+
 func verifyIP6() bool {
 	if skip, _ := strconv.ParseBool(os.Getenv("SKIP_SYSTEM_IPV6_CHECK")); skip {
 		return true
 	}
+
+	ipv6Mu.Lock()
+	defer ipv6Mu.Unlock()
+	if !ipv6Checked.IsZero() && time.Since(ipv6Checked) < ipv6CheckTTL {
+		return ipv6Present
+	}
+	ipv6Present = detectIP6()
+	ipv6Checked = time.Now()
+	return ipv6Present
+}
+
+// detectIP6 is the probe itself, kept apart so the cache above is the only thing
+// that decides whether it runs.
+func detectIP6() bool {
 	if iAddrs, err := net.InterfaceAddrs(); err == nil {
 		for _, addr := range iAddrs {
 			if prefix, err := netip.ParsePrefix(addr.String()); err == nil {
@@ -204,3 +236,4 @@ func verifyIP6() bool {
 	}
 	return false
 }
+
