@@ -34,11 +34,15 @@ func ParseParams(params []string) (isSrc bool, noResolve bool) {
 	return
 }
 
+// trimArr trims every element in place. The slice already belongs to the caller
+// (it comes from strings.Split on a rule line), so trimming it allocates nothing
+// — the old version built a second slice per rule, and a subscription carries
+// hundreds of rules.
 func trimArr(arr []string) (r []string) {
-	for _, e := range arr {
-		r = append(r, strings.Trim(e, " "))
+	for i, e := range arr {
+		arr[i] = strings.Trim(e, " ")
 	}
-	return
+	return arr
 }
 
 // ParseRulePayload parse rule format like:

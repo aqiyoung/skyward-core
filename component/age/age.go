@@ -14,6 +14,11 @@ import (
 
 const FileHeader = armor.Header
 
+// fileHeaderBytes is FileHeader in the form the prefix check needs, built once:
+// every profile load used to copy the whole document into a string just to look
+// at its first few bytes.
+var fileHeaderBytes = []byte(FileHeader)
+
 var globalSecretKeys []string
 
 // parseIdentities parse age-secret-key to age.Identity
@@ -84,7 +89,7 @@ func VerityPublicKeys(publicKeys ...string) error {
 // DecryptBytes decrypt age armor format encrypted data
 // if not the age armor format, return original data
 func DecryptBytes(data []byte, secretKeys ...string) ([]byte, error) {
-	if !strings.HasPrefix(string(data), FileHeader) { // not age armor format
+	if !bytes.HasPrefix(data, fileHeaderBytes) { // not age armor format
 		return data, nil
 	}
 	var identities []age.Identity
