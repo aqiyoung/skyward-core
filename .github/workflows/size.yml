@@ -1,0 +1,54 @@
+name: size
+
+# What the trimming tags are worth, measured on every push to our branch instead
+# of guessed at. The linux binary is a proxy for the .so the app ships: same
+# packages, same tags, and it builds in a minute on a runner.
+
+on:
+  push:
+    branches: [skyward]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  size:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          cache: true
+
+      - name: Build the variants
+        run: |
+          mkdir -p dist
+          build() {
+            name="$1"; shift
+            GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath \
+              -ldflags "-s -w" -tags "$*" -o "dist/$name" .
+          }
+          # What the app builds today.
+          build full with_gvisor
+          # Drop the mesh VPNs mihomo carries but this app never exposes.
+          build trim with_gvisor,no_tailscale,no_zerotier,no_easytier
+          # Also drop the fake-ip TUN sniffing path.
+          build lean with_gvisor,no_tailscale,no_zerotier,no_easytier,no_fake_tcp
+
+      - name: Report
+        run: |
+          {
+            echo "| variant | tags | size |"
+            echo "| --- | --- | --- |"
+            echo "| full | with_gvisor | $(du -h dist/full | cut -f1) |"
+            echo "| trim | +no_tailscale,no_zerotier,no_easytier | $(du -h dist/trim | cut -f1) |"
+            echo "| lean | trim + no_fake_tcp | $(du -h dist/lean | cut -f1) |"
+            echo
+            echo "Exact bytes:"
+            echo '```'
+            du -b dist/* | sort -k2
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          du -b dist/*
