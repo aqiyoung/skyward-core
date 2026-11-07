@@ -33,7 +33,7 @@ import (
 )
 
 const (
-	queueCapacity  = 64  // chan capacity tcpQueue and udpQueue
+	queueCapacity  = 256 // chan capacity tcpQueue and udpQueue; a full udp queue drops packets, and QUIC reads those drops as congestion
 	senderCapacity = 128 // chan capacity of PacketSender
 )
 
@@ -419,12 +419,22 @@ func processUDP(queue chan C.PacketAdapter) {
 }
 
 func handleUDPConn(packet C.PacketAdapter) {
-	if !isHandle(packet.Metadata().Type) {
+	metadata := packet.Metadata()
+	if !isHandle(metadata.Type) {
 		packet.Drop()
 		return
 	}
 
-	metadata := packet.Metadata()
+	key := packet.Key()
+	// Steady state: the flow already owns a sender, so route selection,
+	// fake-ip resolution and sniffing were settled when it was created.
+	// Cloning metadata and pre-handling it again on every packet can only
+	// recompute the same answer, and this runs at packet rate.
+	if sender, loaded := natTable.Get(key); loaded {
+		sender.Send(packet)
+		return
+	}
+
 	if !metadata.Valid() {
 		packet.Drop()
 		log.Warnln("[Metadata] not valid: %#v", metadata)
@@ -438,7 +448,6 @@ func handleUDPConn(packet C.PacketAdapter) {
 		return
 	}
 
-	key := packet.Key()
 	sender, loaded := natTable.GetOrCreate(key, func() C.PacketSender {
 		sender := newPacketSender()
 		if sniffingEnable && snifferDispatcher.Enable() {
