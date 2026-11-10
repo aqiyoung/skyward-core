@@ -28,6 +28,7 @@ import (
 	"github.com/metacubex/sing/common/buf"
 	E "github.com/metacubex/sing/common/exceptions"
 	M "github.com/metacubex/sing/common/metadata"
+	N "github.com/metacubex/sing/common/network"
 
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/log"
@@ -208,6 +209,23 @@ func (h goStackHandler) NewDNSPacket(payload []byte, source goM.Socksaddr, desti
 }
 
 func (h goStackHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source goM.Socksaddr, destination goM.Socksaddr, onClose goN.CloseHandlerFunc) {
+	if side, isGoConn := conn.(goStreamSide); isGoConn {
+		// The stack waits for the handshake to be over before it lets the
+		// connection go, and it is told that by the side that carries it.
+		if err := side.HandshakeSuccess(); err != nil {
+			_ = conn.Close()
+			if onClose != nil {
+				onClose(err)
+			}
+			return
+		}
+		conn = &goStreamConn{
+			Conn:   conn,
+			side:   side,
+			local:  destination.TCPAddr(),
+			remote: source.TCPAddr(),
+		}
+	}
 	err := h.handler.NewConnection(ctx, conn, M.Metadata{
 		Source:      fromGoSocksaddr(source),
 		Destination: fromGoSocksaddr(destination),
@@ -216,6 +234,55 @@ func (h goStackHandler) NewConnectionEx(ctx context.Context, conn net.Conn, sour
 		onClose(err)
 	}
 }
+
+// goStreamSide is the handshake the stack's connection carries.
+type goStreamSide interface {
+	WaitReadable() error
+	NeedHandshakeForRead() bool
+	HandshakeSuccess() error
+	HandshakeFailure(err error) error
+	CloseRead() error
+	CloseWrite() error
+}
+
+// goStreamConn presents the stack's connection to the core's handler, and
+// keeps the handshake and the read waiting the stack does: the handler reads
+// through the stack, not through the socket under it.
+type goStreamConn struct {
+	net.Conn
+	side    goStreamSide
+	local   net.Addr
+	remote  net.Addr
+	options N.ReadWaitOptions
+}
+
+func (c *goStreamConn) InitializeReadWaiter(options N.ReadWaitOptions) (needCopy bool) {
+	c.options = options
+	return false
+}
+
+func (c *goStreamConn) WaitReadBuffer() (*buf.Buffer, error) {
+	if err := c.side.WaitReadable(); err != nil {
+		return nil, err
+	}
+	buffer := c.options.NewBuffer()
+	n, err := c.Conn.Read(buffer.FreeBytes())
+	if err != nil {
+		buffer.Release()
+		return nil, err
+	}
+	buffer.Truncate(n)
+	c.options.PostReturn(buffer)
+	return buffer, nil
+}
+
+func (c *goStreamConn) HandshakeDeferred() bool          { return c.side.NeedHandshakeForRead() }
+func (c *goStreamConn) HandshakeSuccess() error          { return c.side.HandshakeSuccess() }
+func (c *goStreamConn) HandshakeFailure(err error) error { return c.side.HandshakeFailure(err) }
+func (c *goStreamConn) CloseRead() error                 { return c.side.CloseRead() }
+func (c *goStreamConn) CloseWrite() error                { return c.side.CloseWrite() }
+func (c *goStreamConn) LocalAddr() net.Addr              { return c.local }
+func (c *goStreamConn) RemoteAddr() net.Addr             { return c.remote }
 
 func (h goStackHandler) NewPacketConnectionEx(ctx context.Context, conn goN.PacketConn, source goM.Socksaddr, destination goM.Socksaddr, onClose goN.CloseHandlerFunc) {
 	err := h.handler.NewPacketConnection(ctx, goPacketConn{PacketConn: conn}, M.Metadata{
