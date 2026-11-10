@@ -22,7 +22,7 @@ import (
 	goM "github.com/sagernet/sing/common/metadata"
 	goN "github.com/sagernet/sing/common/network"
 	goRanges "github.com/sagernet/sing/common/ranges"
-	"golang.org/x/sys/unix"
+	"syscall"
 
 	tun "github.com/metacubex/sing-tun"
 	"github.com/metacubex/sing/common/buf"
@@ -179,7 +179,7 @@ type goStackHandler struct {
 }
 
 func (h goStackHandler) JudgeFlow(network uint8, source netip.AddrPort, destination netip.AddrPort, firstPacket []byte) gotun.FlowVerdict {
-	if network == unix.IPPROTO_UDP && h.handler != nil && h.handler.ShouldHijackDns(destination) {
+	if network == syscall.IPPROTO_UDP && h.handler != nil && h.handler.ShouldHijackDns(destination) {
 		return gotun.FlowVerdict{Action: gotun.ActionHijackDNS}
 	}
 	return gotun.FlowVerdict{Action: gotun.ActionAccept}
