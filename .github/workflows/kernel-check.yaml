@@ -1,0 +1,66 @@
+name: kernel check
+
+# The workflows this repository inherited from upstream are wired to the
+# upstream Alpha branch, so a commit on our branches is checked by nobody.
+# This job is what checks it: it builds the kernel, keeps the packages this
+# project owns formatted, runs their tests, and vets them for every platform
+# the app ships on.
+#
+# The app repository checks the other half: the wrapper that binds this
+# kernel, and whether the pin it carries still compiles.
+
+on:
+  push:
+    branches:
+      - skyward
+  pull_request:
+    branches:
+      - skyward
+  workflow_dispatch:
+
+concurrency:
+  group: kernel-check-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: '1.27.1'
+
+jobs:
+  kernel:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+      - name: Build and test the kernel
+        env:
+          CGO_ENABLED: 0
+        run: |
+          # The tags the app builds with (build_config.yaml in the app
+          # repository, which upstream's own build uses as well), and the go
+          # stack's own tag, which the releases do not carry yet.
+          tags="with_gvisor,with_go_stack"
+          go build -tags "$tags" ./...
+          # The packages this project owns. The rest of the kernel is upstream
+          # code, and its formatting is upstream's business: config/utils.go,
+          # for one, is not gofmt-clean.
+          test -z "$(gofmt -l ./constant ./listener/sing_tun ./config/tun_stack_test.go)" || {
+            # The diff, not just the name of the file: the fix is in it.
+            gofmt -d ./constant ./listener/sing_tun ./config/tun_stack_test.go >&2
+            exit 1
+          }
+          go test -count=1 -v -tags "$tags" ./constant/... ./listener/sing_tun/...
+          # The config package reaches out to the network in some of its tests,
+          # so only the tests this project added run here.
+          go test -count=1 -tags "$tags" -run 'TestRawTun' ./config/
+          go vet -tags "$tags" ./constant/... ./config/... ./listener/sing_tun/...
+          GOOS=darwin GOARCH=arm64 go vet -tags "$tags" ./constant/... ./listener/sing_tun/...
+          GOOS=windows GOARCH=amd64 go vet -tags "$tags" ./constant/... ./listener/sing_tun/...
+          GOOS=android GOARCH=arm64 go vet -tags "$tags" ./constant/... ./listener/sing_tun/...
