@@ -4,7 +4,10 @@ package sing_tun
 
 import (
 	"net/netip"
+	"syscall"
 	"testing"
+
+	gotun "github.com/sagernet/sing-tun"
 
 	tun "github.com/metacubex/sing-tun"
 	"github.com/metacubex/sing/common/ranges"
@@ -53,4 +56,24 @@ func TestGoStackCongestionNames(t *testing.T) {
 	assert.Equal(t, "bbr", goStackCongestion("bbr3"))
 	assert.Equal(t, "bbr", goStackCongestion("bbr"))
 	assert.Equal(t, "cubic", goStackCongestion("cubic"))
+}
+
+func TestGoStackJudgeFlowTakesTheDnsOver(t *testing.T) {
+	handler := &ListenerHandler{
+		DnsAddrPorts: []netip.AddrPort{netip.MustParseAddrPort("1.1.1.1:53")},
+	}
+	stackHandler := goStackHandler{handler: handler}
+
+	source := netip.MustParseAddrPort("10.0.0.2:5353")
+
+	hijacked := stackHandler.JudgeFlow(uint8(syscall.IPPROTO_UDP), source, netip.MustParseAddrPort("1.1.1.1:53"), nil)
+	assert.Equal(t, gotun.ActionHijackDNS, hijacked.Action)
+
+	// Another name server is not the tunnel's business.
+	other := stackHandler.JudgeFlow(uint8(syscall.IPPROTO_UDP), source, netip.MustParseAddrPort("8.8.8.8:53"), nil)
+	assert.Equal(t, gotun.ActionAccept, other.Action)
+
+	// A connection is never a DNS query, even to the same address.
+	connection := stackHandler.JudgeFlow(uint8(syscall.IPPROTO_TCP), netip.MustParseAddrPort("10.0.0.2:5000"), netip.MustParseAddrPort("1.1.1.1:53"), nil)
+	assert.Equal(t, gotun.ActionAccept, connection.Action)
 }
