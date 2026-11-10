@@ -214,9 +214,9 @@ func TestGoStackCarriesAPacketFromADescriptor(t *testing.T) {
 
 // tcpSegment builds a TCP segment the way the kernel hands one to the
 // tunnel: an IPv4 header, a TCP header and the payload.
-func tcpSegment(source, destination netip.Addr, sequence, acknowledgment uint32, flags byte, payload []byte) []byte {
-	sourceAddress := source.As4()
-	destinationAddress := destination.As4()
+func tcpSegment(source, destination netip.AddrPort, sequence, acknowledgment uint32, flags byte, payload []byte) []byte {
+	sourceAddress := source.Addr().As4()
+	destinationAddress := destination.Addr().As4()
 	segmentLength := 20 + len(payload)
 
 	packet := make([]byte, 20+segmentLength)
@@ -227,15 +227,19 @@ func tcpSegment(source, destination netip.Addr, sequence, acknowledgment uint32,
 	copy(packet[12:16], sourceAddress[:])
 	copy(packet[16:20], destinationAddress[:])
 
-	binary.BigEndian.PutUint32(packet[20:24], sequence)
-	binary.BigEndian.PutUint32(packet[24:28], acknowledgment)
-	packet[28] = 0x50 // five words of header, no options
-	packet[29] = flags
-	binary.BigEndian.PutUint16(packet[30:32], 65535)
+	// The TCP header: the two ports, the two numbers, the flags, the
+	// window, the checksum and the urgent pointer.
+	binary.BigEndian.PutUint16(packet[20:22], source.Port())
+	binary.BigEndian.PutUint16(packet[22:24], destination.Port())
+	binary.BigEndian.PutUint32(packet[24:28], sequence)
+	binary.BigEndian.PutUint32(packet[28:32], acknowledgment)
+	packet[32] = 0x50 // five words of header, no options
+	packet[33] = flags
+	binary.BigEndian.PutUint16(packet[34:36], 65535)
 	copy(packet[40:], payload)
 
 	binary.BigEndian.PutUint16(packet[10:12], internetChecksum(packet[0:20]))
-	binary.BigEndian.PutUint16(packet[32:34], tcpChecksum(sourceAddress, destinationAddress, packet[20:40+len(payload)]))
+	binary.BigEndian.PutUint16(packet[36:38], tcpChecksum(sourceAddress, destinationAddress, packet[20:40+len(payload)]))
 	return packet
 }
 
@@ -291,7 +295,7 @@ func TestGoStackFinishesTheHandshakeBeforeItHandsOver(t *testing.T) {
 	destination := netip.MustParseAddrPort("172.19.0.1:80")
 
 	// The handshake starts.
-	syn := tcpSegment(source.Addr(), destination.Addr(), clientSequence, 0, 0x02, nil)
+	syn := tcpSegment(source, destination, clientSequence, 0, 0x02, nil)
 	assert.NoError(t, device.WaitWritePackets([][]byte{syn}))
 
 	// The stack answers with a sequence number of its own.
@@ -303,12 +307,12 @@ func TestGoStackFinishesTheHandshakeBeforeItHandsOver(t *testing.T) {
 	}
 	// The stack has to answer with a SYN and an acknowledgement, not with a
 	// reset: the reset would look the same by the acknowledgement number.
-	assert.Equal(t, byte(0x12), answer[29], "the stack answered with flags %02x: %x", answer[29], answer)
-	serverSequence := binary.BigEndian.Uint32(answer[20:24])
-	assert.Equal(t, clientSequence+1, binary.BigEndian.Uint32(answer[24:28]))
+	assert.Equal(t, byte(0x12), answer[33], "the stack answered with flags %02x: %x", answer[33], answer)
+	serverSequence := binary.BigEndian.Uint32(answer[24:28])
+	assert.Equal(t, clientSequence+1, binary.BigEndian.Uint32(answer[28:32]))
 
 	// The handshake finishes.
-	ack := tcpSegment(source.Addr(), destination.Addr(), clientSequence+1, serverSequence+1, 0x10, nil)
+	ack := tcpSegment(source, destination, clientSequence+1, serverSequence+1, 0x10, nil)
 	assert.NoError(t, device.WaitWritePackets([][]byte{ack}))
 
 	// Only now does the connection reach the handler.
