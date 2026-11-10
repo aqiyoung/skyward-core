@@ -8,12 +8,12 @@ import (
 	"net"
 	"net/netip"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
 	gotun "github.com/sagernet/sing-tun"
 	gobuf "github.com/sagernet/sing/common/buf"
+	"golang.org/x/sys/unix"
 
 	tun "github.com/metacubex/sing-tun"
 	M "github.com/metacubex/sing/common/metadata"
@@ -149,12 +149,12 @@ func TestGoStackCarriesAPacketToTheHandler(t *testing.T) {
 // tunnel hands its device over: the system opens it, the core takes it.
 func TestGoStackCarriesAPacketFromADescriptor(t *testing.T) {
 	handler := &recordingGoStackHandler{}
-	descriptors, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_DGRAM, 0)
+	descriptors, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM, 0)
 	assert.NoError(t, err)
 	core, system := descriptors[0], descriptors[1]
 	t.Cleanup(func() {
-		_ = syscall.Close(core)
-		_ = syscall.Close(system)
+		_ = unix.Close(core)
+		_ = unix.Close(system)
 	})
 
 	original := goStackDeviceFactory
@@ -184,7 +184,7 @@ func TestGoStackCarriesAPacketFromADescriptor(t *testing.T) {
 		netip.MustParseAddrPort("172.19.0.1:53"),
 		[]byte("hello"),
 	)
-	_, err = syscall.Write(system, packet)
+	_, err = unix.Write(system, packet)
 	assert.NoError(t, err)
 
 	assert.Eventually(t, func() bool {
