@@ -263,3 +263,4 @@ func (l goStackLogger) Info(args ...any)  { log.SingLogger.Info(args...) }
 func (l goStackLogger) Warn(args ...any)  { log.SingLogger.Warn(args...) }
 func (l goStackLogger) Error(args ...any) { log.SingLogger.Error(args...) }
 func (l goStackLogger) Fatal(args ...any) { log.SingLogger.Fatal(args...) }
+func (l goStackLogger) Panic(args ...any) { log.SingLogger.Panic(args...) }
