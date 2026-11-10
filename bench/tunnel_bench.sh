@@ -86,7 +86,10 @@ cleanup() {
   if [[ "$route_added" == true ]]; then
     $SUDO ip route del 198.18.0.0/16 dev skyward-bench 2>/dev/null || true
   fi
-  rm -rf "$work_dir"
+  # The core writes until it is gone, and a directory that is still being
+  # written cannot be removed.
+  sleep 0.5
+  rm -rf "$work_dir" 2>/dev/null || true
 }
 trap cleanup EXIT
 
