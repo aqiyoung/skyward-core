@@ -477,10 +477,17 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		}
 
 	}
-	tunIf, err := tunNew(tunOptions)
-	if err != nil {
-		err = E.Cause(err, "configure tun interface")
-		return
+	// The go stack brings its own device: it reads and writes through the
+	// file descriptor the device owns, and a stack that reads through an
+	// interface cannot hand that descriptor over. Every other stack uses the
+	// device this creates.
+	var tunIf tun.Tun
+	if options.Stack != C.TunGo {
+		tunIf, err = tunNew(tunOptions)
+		if err != nil {
+			err = E.Cause(err, "configure tun interface")
+			return
+		}
 	}
 
 	l.dnsServerIp = dnsServerIp
@@ -505,15 +512,26 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 
 	var tunStack tun.Stack
 	if options.Stack == C.TunGo {
-		tunStack, err = newGoStack(GoStackOptions{
-			StackOptions:    stackOptions,
-			ListenerHandler: handler,
+		goStack, err := newGoStack(GoStackOptions{
+			Context:                 ctx,
+			DeviceOptions:           tunOptions,
+			Handler:                 handler,
+			UDPTimeout:              udpTimeout,
+			ICMPTimeout:             icmpTimeout,
+			CongestionControl:       options.CongestionController,
+			EndpointIndependentNat:  options.EndpointIndependentNat,
+			ForwarderBindInterface:  forwarderBindInterface,
 		})
+		if err != nil {
+			return
+		}
+		tunStack = goStack
+		l.tunIf = goStack.Device()
 	} else {
 		tunStack, err = tun.NewStack(strings.ToLower(options.Stack.String()), stackOptions)
-	}
-	if err != nil {
-		return
+		if err != nil {
+			return
+		}
 	}
 
 	err = tunStack.Start()

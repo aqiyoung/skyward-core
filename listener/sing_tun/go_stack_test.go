@@ -20,6 +20,10 @@ func (f *fakeGoStack) Close() error {
 	return nil
 }
 
+func (f *fakeGoStack) Device() tun.Tun {
+	return nil
+}
+
 // A build without a go stack must say so. Running another stack in its place
 // would leave the configuration describing something the tunnel is not doing.
 func TestGoStackIsRefusedWithoutAnImplementation(t *testing.T) {
