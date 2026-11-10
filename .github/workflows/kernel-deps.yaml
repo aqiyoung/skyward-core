@@ -1,0 +1,66 @@
+name: kernel deps
+
+# The go stack needs sing-tun's own TCP/IP stack, and that stack lives in a
+# repository that has no release tags: it is pinned to a commit. This job is
+# how that pin moves.
+#
+# It resolves the modules and writes go.mod and go.sum back to the branch. It
+# does not build the core: the app's kernel check does that, and it is the one
+# that has to stay green before a pin is merged.
+#
+# The pin is a commit, never a branch: a branch head would make the build
+# depend on what somebody pushed this morning.
+
+on:
+  workflow_dispatch:
+    inputs:
+      module:
+        description: 'The module to pin, for example github.com/sagernet/sing-tun'
+        required: true
+      ref:
+        description: 'The commit to pin it to'
+        required: true
+      branch:
+        description: 'The branch to write the result to'
+        required: true
+        default: skyward
+
+permissions:
+  contents: write
+
+env:
+  GO_VERSION: '1.27.1'
+
+jobs:
+  deps:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.branch }}
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+      - name: Pin the module
+        run: |
+          set -euo pipefail
+          go get "${{ inputs.module }}@${{ inputs.ref }}"
+          # The build has to still work with the new module graph.
+          go build ./...
+          go vet ./constant/... ./listener/sing_tun/...
+      - name: Write the result back
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- go.mod go.sum; then
+            echo 'Nothing changed; the module was already pinned.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add go.mod go.sum
+          git commit -m "build: pin ${{ inputs.module }} to ${{ inputs.ref }}"
+          git push origin HEAD:${{ inputs.branch }}
+          echo "Pushed $(git rev-parse HEAD)"
