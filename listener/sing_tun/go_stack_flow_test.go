@@ -212,7 +212,6 @@ func TestGoStackCarriesAPacketFromADescriptor(t *testing.T) {
 	assert.Equal(t, netip.MustParseAddrPort("172.19.0.2:40001"), recorded.Source.AddrPort())
 }
 
-
 // tcpSegment builds a TCP segment the way the kernel hands one to the
 // tunnel: an IPv4 header, a TCP header and the payload.
 func tcpSegment(source, destination netip.Addr, sequence, acknowledgment uint32, flags byte, payload []byte) []byte {
