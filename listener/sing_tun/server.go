@@ -512,15 +512,16 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 
 	var tunStack tun.Stack
 	if options.Stack == C.TunGo {
-		goStack, err := newGoStack(GoStackOptions{
-			Context:                 ctx,
-			DeviceOptions:           tunOptions,
-			Handler:                 handler,
-			UDPTimeout:              udpTimeout,
-			ICMPTimeout:             icmpTimeout,
-			CongestionControl:       options.CongestionController,
-			EndpointIndependentNat:  options.EndpointIndependentNat,
-			ForwarderBindInterface:  forwarderBindInterface,
+		var goStack GoStack
+		goStack, err = newGoStack(GoStackOptions{
+			Context:                ctx,
+			DeviceOptions:          tunOptions,
+			Handler:                handler,
+			UDPTimeout:             udpTimeout,
+			ICMPTimeout:            icmpTimeout,
+			CongestionControl:      options.CongestionController,
+			EndpointIndependentNat: options.EndpointIndependentNat,
+			ForwarderBindInterface: forwarderBindInterface,
 		})
 		if err != nil {
 			return
