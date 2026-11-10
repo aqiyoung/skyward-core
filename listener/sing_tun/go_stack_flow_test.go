@@ -167,10 +167,10 @@ func TestGoStackCarriesAPacketFromADescriptor(t *testing.T) {
 	stack, err := buildGoStack(GoStackOptions{
 		Context: context.Background(),
 		DeviceOptions: tun.Options{
-			Name:         "go-stack-descriptor",
-			MTU:          1500,
+			Name:           "go-stack-descriptor",
+			MTU:            1500,
 			FileDescriptor: core,
-			Inet4Address: []netip.Prefix{netip.MustParsePrefix("172.19.0.1/30")},
+			Inet4Address:   []netip.Prefix{netip.MustParsePrefix("172.19.0.1/30")},
 		},
 		Handler:    handler,
 		UDPTimeout: time.Second * 30,
