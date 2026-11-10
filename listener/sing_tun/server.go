@@ -503,7 +503,15 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 	}
 	l.tunIf = tunIf
 
-	tunStack, err := tun.NewStack(strings.ToLower(options.Stack.String()), stackOptions)
+	var tunStack tun.Stack
+	if options.Stack == C.TunGo {
+		tunStack, err = newGoStack(GoStackOptions{
+			StackOptions:    stackOptions,
+			ListenerHandler: handler,
+		})
+	} else {
+		tunStack, err = tun.NewStack(strings.ToLower(options.Stack.String()), stackOptions)
+	}
 	if err != nil {
 		return
 	}

@@ -10,6 +10,7 @@ var StackTypeMapping = map[string]TUNStack{
 	strings.ToLower(TunSystem.String()): TunSystem,
 	strings.ToLower(TunMixed.String()):  TunMixed,
 	strings.ToLower(TunMips.String()):   TunMips,
+	strings.ToLower(TunGo.String()):     TunGo,
 }
 
 const (
@@ -17,6 +18,11 @@ const (
 	TunSystem
 	TunMixed
 	TunMips
+	// TunGo is the Go-native TCP/IP stack. The kernel does not carry it: a
+	// build that has one registers it through sing_tun.SetGoStackFactory, and
+	// a build that does not refuses the stack rather than running another
+	// one in its place.
+	TunGo
 )
 
 type TUNStack int
@@ -46,6 +52,8 @@ func (e TUNStack) String() string {
 		return "Mixed"
 	case TunMips:
 		return "Mips"
+	case TunGo:
+		return "Go"
 	default:
 		return "unknown"
 	}
