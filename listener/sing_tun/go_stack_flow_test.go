@@ -301,6 +301,9 @@ func TestGoStackFinishesTheHandshakeBeforeItHandsOver(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the stack did not answer the handshake")
 	}
+	// The stack has to answer with a SYN and an acknowledgement, not with a
+	// reset: the reset would look the same by the acknowledgement number.
+	assert.Equal(t, byte(0x12), answer[29], "the stack answered with flags %02x: %x", answer[29], answer)
 	serverSequence := binary.BigEndian.Uint32(answer[20:24])
 	assert.Equal(t, clientSequence+1, binary.BigEndian.Uint32(answer[24:28]))
 
