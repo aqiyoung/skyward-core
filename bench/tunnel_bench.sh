@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # Measures what the tunnel costs, on one machine, without touching the network.
 #
-# The traffic goes through the tunnel, the rules and the outbound, and comes
-# back to the same machine: the client, the core and the target all live here,
-# so the number is the core's own processing capacity and nothing else. That
-# is the same shape as the measurement the Clash kernel publishes, and it is
+# The traffic goes through the tunnel, the rules and a proxy node, and comes
+# back to the same machine: the client, the core and the target all live
+# here, so the number is the core's own capacity and nothing else. That is
+# the same shape as the measurement the Clash kernel publishes, and it is
 # the only shape that can be compared across machines.
 #
 # Two modes:
 #
 #   --mode tun     the client's packets go through the tunnel device, so the
-#                  user space stack (gVisor, mips, the go stack) is measured.
-#                  Needs a core binary and, on macOS and Linux, root: the
-#                  tunnel device and its routes are the system's.
+#                  user space stack (mips, the go stack) is measured. Needs
+#                  a core binary and, on macOS and Linux, root: the tunnel
+#                  device and its routes are the system's.
 #   --mode proxy   the client's packets go straight into the core's inbound.
 #                  Measures the relay path (splice, copy blocks, buffers)
 #                  without the tunnel device.
@@ -21,8 +21,8 @@
 # point --core at it.
 #
 # Usage:
-#   tool/bench/tunnel_bench.sh --core /path/to/SkywardCore [--mode tun|proxy]
-#                               [--stack legacy|go] [--size 256] [--runs 3]
+#   bench/tunnel_bench.sh --core /path/to/SkywardCore [--mode tun|proxy]
+#                          [--stack legacy|go] [--size 256] [--runs 3]
 
 set -euo pipefail
 
@@ -33,10 +33,15 @@ runs=3
 core_bin=""
 target_port=18080
 mixed_port=17890
+proxy_port=17891
 file_name="payload.bin"
+# The client asks for this address. In tunnel mode it is routed into the
+# tunnel, and the local proxy node reaches the target from there, so the
+# traffic never leaves the machine.
+client_address="198.18.0.2"
 
 usage() {
-  sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -65,16 +70,22 @@ if ! command -v curl >/dev/null; then
   exit 1
 fi
 if ! command -v python3 >/dev/null; then
-  echo "python3 is required (it serves the target)" >&2
+  echo "python3 is required (it serves the target and the proxy node)" >&2
   exit 1
 fi
 
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/skyward-bench.XXXXXX")"
 core_pid=""
 target_pid=""
+proxy_pid=""
+route_added=false
 cleanup() {
   [[ -n "$core_pid" ]] && kill "$core_pid" 2>/dev/null || true
   [[ -n "$target_pid" ]] && kill "$target_pid" 2>/dev/null || true
+  [[ -n "$proxy_pid" ]] && kill "$proxy_pid" 2>/dev/null || true
+  if [[ "$route_added" == true ]]; then
+    $SUDO ip route del 198.18.0.0/16 dev skyward-bench 2>/dev/null || true
+  fi
   rm -rf "$work_dir"
 }
 trap cleanup EXIT
@@ -84,16 +95,77 @@ trap cleanup EXIT
 # not the setup.
 head -c "$((size_mib * 1024 * 1024))" /dev/urandom > "$work_dir/$file_name"
 
-# A domain that resolves to this machine. The tunnel mode reaches it through
-# the fake-ip range, so the client can ask for an address the tunnel owns and
-# the core still knows the real destination.
+# The proxy node. It answers every request by reaching the target, whatever
+# address it was asked for: that is what keeps the traffic on this machine.
+# A second core would do the same job; this is smaller.
+start_proxy() {
+  python3 - "$proxy_port" "$target_port" <<'PY' &
+import socket
+import sys
+import threading
+
+proxy_port, target_port = int(sys.argv[1]), int(sys.argv[2])
+target = ("127.0.0.1", target_port)
+
+
+def pipe(left, right):
+    try:
+        while True:
+            data = left.recv(65536)
+            if not data:
+                break
+            right.sendall(data)
+    except OSError:
+        pass
+    finally:
+        for sock in (left, right):
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def handle(client):
+    data = b""
+    try:
+        while b"\r\n\r\n" not in data:
+            chunk = client.recv(4096)
+            if not chunk:
+                return
+            data += chunk
+        upstream = socket.create_connection(target)
+    except OSError:
+        client.close()
+        return
+    if data.upper().startswith(b"CONNECT"):
+        client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+    else:
+        upstream.sendall(data)
+    threading.Thread(target=pipe, args=(client, upstream), daemon=True).start()
+    pipe(upstream, client)
+
+
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", proxy_port))
+server.listen(128)
+while True:
+    connection, _ = server.accept()
+    threading.Thread(target=handle, args=(connection,), daemon=True).start()
+PY
+  proxy_pid=$!
+  sleep 1
+}
+
 if [[ "$mode" == "tun" ]]; then
   tun_enable=true
-  # "legacy" is the stack the kernel runs today. The configuration has to name
-  # a stack, so the name is spelled out here.
+  outbound=local
+  # "legacy" is the stack the kernel runs today. The configuration has to
+  # name a stack, so the name is spelled out here.
   tun_stack=mips
 else
   tun_enable=false
+  outbound=DIRECT
   tun_stack=mips
 fi
 if [[ "$stack" != "legacy" ]]; then
@@ -107,26 +179,22 @@ mode: rule
 log-level: warning
 ipv6: false
 dns:
-  # The client asks for an address the tunnel owns, so no name is ever
-  # looked up, and the system's own resolver is left alone.
-  enable: true
-  enhanced-mode: fake-ip
-  fake-ip-range: 198.18.0.1/16
-  listen: 127.0.0.1:1053
-  nameserver:
-    - 127.0.0.1
-hosts:
-  bench.invalid: 127.0.0.1
+  enable: false
+proxies:
+  - name: local
+    type: http
+    server: 127.0.0.1
+    port: $proxy_port
+rules:
+  - MATCH,$outbound
 tun:
   enable: $tun_enable
   stack: $tun_stack
   device: skyward-bench
-  auto-route: true
-  auto-detect-interface: true
+  auto-route: false
+  auto-detect-interface: false
   inet4-address:
     - 172.31.0.1/30
-rules:
-  - MATCH,DIRECT
 EOF
 
 python3 - "$work_dir" "$target_port" <<'PY' &
@@ -153,18 +221,15 @@ if ! curl --silent --fail --max-time 5 -o /dev/null "http://127.0.0.1:$target_po
   exit 1
 fi
 
-# The tunnel device and its routes are the system's, so the core needs root on
-# macOS and Linux. On Windows the driver asks for the privilege itself.
+# The tunnel device and its routes are the system's, so the core needs root
+# on macOS and Linux. On Windows the driver asks for the privilege itself.
+SUDO=""
+if [[ $EUID -ne 0 ]]; then
+  SUDO="sudo -n"
+fi
+
 run_core() {
-  if [[ "$(uname -s)" == "Darwin" || "$(uname -s)" == "Linux" ]]; then
-    if [[ "${SKYWARD_BENCH_SUDO:-1}" == "1" ]]; then
-      sudo -n "$core_bin" -d "$work_dir" -f "$work_dir/config.yaml" &
-    else
-      "$core_bin" -d "$work_dir" -f "$work_dir/config.yaml" &
-    fi
-  else
-    "$core_bin" -d "$work_dir" -f "$work_dir/config.yaml" &
-  fi
+  $SUDO "$core_bin" -d "$work_dir" -f "$work_dir/config.yaml" &
   core_pid=$!
   sleep 3
   if ! kill -0 "$core_pid" 2>/dev/null; then
@@ -172,13 +237,34 @@ run_core() {
     exit 1
   fi
 }
-run_core
 
-# In tunnel mode the client asks for an address the tunnel owns: the fake-ip
-# range. The core maps it back to bench.invalid, which the hosts entry sends
-# to this machine. In proxy mode the client talks to the inbound directly.
 if [[ "$mode" == "tun" ]]; then
-  url="http://198.18.0.2:$target_port/$file_name"
+  start_proxy
+  run_core
+  # Only the address the client asks for is routed into the tunnel, so the
+  # machine's own traffic is left alone.
+  for _ in $(seq 1 50); do
+    if $SUDO ip link show skyward-bench >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.2
+  done
+  if ! $SUDO ip link show skyward-bench >/dev/null 2>&1; then
+    echo "the tunnel device did not come up; the links are:" >&2
+    $SUDO ip -brief link show >&2
+    exit 1
+  fi
+  $SUDO ip route add 198.18.0.0/16 dev skyward-bench
+  route_added=true
+else
+  run_core
+fi
+
+# In tunnel mode the client asks for an address the tunnel owns; the local
+# proxy node reaches the target from there. In proxy mode the client talks
+# to the inbound directly.
+if [[ "$mode" == "tun" ]]; then
+  url="http://$client_address:$target_port/$file_name"
   proxy_arg=()
 else
   url="http://127.0.0.1:$target_port/$file_name"
