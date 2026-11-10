@@ -45,14 +45,18 @@ jobs:
         run: |
           go build -tags with_gvisor -o "$RUNNER_TEMP/core-legacy" .
           go build -tags "with_gvisor,with_go_stack" -o "$RUNNER_TEMP/core-go" .
-      - name: Measure
+      # The relay path is measured first: it needs no tunnel device, and it
+      # checks the harness end to end. The tunnel path needs the app's
+      # wrapper to bring the device up, because this fork does not start the
+      # tunnel from the configuration on its own.
+      - name: Measure the relay path
         run: |
           set -euo pipefail
           for stack in legacy go; do
-            echo "=== the $stack stack ==="
+            echo "=== the $stack stack, through the inbound ==="
             sudo bash bench/tunnel_bench.sh \
               --core "$RUNNER_TEMP/core-$stack" \
-              --mode tun --stack "$stack" --size 64 --runs 3 \
+              --mode proxy --stack "$stack" --size 64 --runs 3 \
               | tee "$RUNNER_TEMP/$stack.log"
           done
       - name: Attach the numbers
