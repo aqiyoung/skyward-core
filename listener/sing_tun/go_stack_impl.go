@@ -34,7 +34,7 @@ import (
 )
 
 func init() {
-	SetGoStackFactory(newGoStack)
+	SetGoStackFactory(buildGoStack)
 }
 
 // goStack is the stack and the device it owns.
@@ -67,7 +67,7 @@ func (d goStackDevice) Close() error {
 	return nil
 }
 
-func newGoStack(options GoStackOptions) (GoStack, error) {
+func buildGoStack(options GoStackOptions) (GoStack, error) {
 	deviceOptions := goStackDeviceOptions(options)
 	device, err := gotun.New(deviceOptions)
 	if err != nil {
@@ -92,7 +92,7 @@ func newGoStack(options GoStackOptions) (GoStack, error) {
 	stackOptions.Handler = goStackHandler{handler: options.Handler}
 	stackOptions.Logger = goStackLogger{}
 	stackOptions.ForwarderBindInterface = options.ForwarderBindInterface
-	stackOptions.TCPPongestionControl = goStackCongestion(options.CongestionControl)
+	stackOptions.TCPCongestionControl = goStackCongestion(options.CongestionControl)
 
 	stack, err := gotun.NewGo(stackOptions)
 	if err != nil {
@@ -128,7 +128,6 @@ func goStackDeviceOptions(options GoStackOptions) gotun.Options {
 	translated.AutoRedirectMarkMode = device.AutoRedirectMarkMode
 	translated.AutoRedirectInputMark = device.AutoRedirectInputMark
 	translated.AutoRedirectOutputMark = device.AutoRedirectOutputMark
-	translated.AutoRedirectResetMark = device.AutoRedirectResetMark
 	translated.ExcludeMPTCP = device.ExcludeMPTCP
 	translated.Inet4LoopbackAddress = device.Inet4LoopbackAddress
 	translated.Inet6LoopbackAddress = device.Inet6LoopbackAddress
@@ -263,3 +262,4 @@ func (l goStackLogger) Debug(args ...any) { log.SingLogger.Debug(args...) }
 func (l goStackLogger) Info(args ...any)  { log.SingLogger.Info(args...) }
 func (l goStackLogger) Warn(args ...any)  { log.SingLogger.Warn(args...) }
 func (l goStackLogger) Error(args ...any) { log.SingLogger.Error(args...) }
+func (l goStackLogger) Fatal(args ...any) { log.SingLogger.Fatal(args...) }
