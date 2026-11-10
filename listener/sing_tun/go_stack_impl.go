@@ -236,8 +236,11 @@ func (h goStackHandler) NewConnectionEx(ctx context.Context, conn net.Conn, sour
 }
 
 // goStreamSide is the handshake the stack's connection carries.
+//
+// There is no separate "wait until readable" here: the stack's own Read
+// waits, because the handshake and the read are the same wait. A side that
+// offered one would be a second, weaker copy of it.
 type goStreamSide interface {
-	WaitReadable() error
 	NeedHandshakeForRead() bool
 	HandshakeSuccess() error
 	HandshakeFailure(err error) error
@@ -245,9 +248,10 @@ type goStreamSide interface {
 	CloseWrite() error
 }
 
-// goStreamConn presents the stack's connection to the core's handler, and
-// keeps the handshake and the read waiting the stack does: the handler reads
-// through the stack, not through the socket under it.
+// goStreamConn presents the stack's connection to the core's handler: the
+// handler reads and writes through the stack, and the addresses are the ones
+// the stack reported for the flow. The handshake is forwarded, not repeated,
+// so a handler that defers it still drives the stack's own handshake.
 type goStreamConn struct {
 	net.Conn
 	side    goStreamSide
@@ -262,9 +266,6 @@ func (c *goStreamConn) InitializeReadWaiter(options N.ReadWaitOptions) (needCopy
 }
 
 func (c *goStreamConn) WaitReadBuffer() (*buf.Buffer, error) {
-	if err := c.side.WaitReadable(); err != nil {
-		return nil, err
-	}
 	buffer := c.options.NewBuffer()
 	n, err := c.Conn.Read(buffer.FreeBytes())
 	if err != nil {
