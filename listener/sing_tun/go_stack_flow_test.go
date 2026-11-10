@@ -7,13 +7,13 @@ import (
 	"encoding/binary"
 	"net"
 	"net/netip"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	gotun "github.com/sagernet/sing-tun"
 	gobuf "github.com/sagernet/sing/common/buf"
-	"golang.org/x/sys/unix"
 
 	tun "github.com/metacubex/sing-tun"
 	M "github.com/metacubex/sing/common/metadata"
@@ -149,13 +149,20 @@ func TestGoStackCarriesAPacketToTheHandler(t *testing.T) {
 // tunnel hands its device over: the system opens it, the core takes it.
 func TestGoStackCarriesAPacketFromADescriptor(t *testing.T) {
 	handler := &recordingGoStackHandler{}
-	descriptors, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM, 0)
+	// A datagram socket pair: one end is the descriptor the stack reads
+	// from, the other is where the system writes.
+	socketPath := filepath.Join(t.TempDir(), "tun.sock")
+	listener, err := net.ListenPacket("unixgram", socketPath)
 	assert.NoError(t, err)
-	core, system := descriptors[0], descriptors[1]
-	t.Cleanup(func() {
-		_ = unix.Close(core)
-		_ = unix.Close(system)
-	})
+	t.Cleanup(func() { _ = listener.Close() })
+
+	system, err := net.DialUnix("unixgram", nil, &net.UnixAddr{Name: socketPath, Net: "unixgram"})
+	assert.NoError(t, err)
+	t.Cleanup(func() { _ = system.Close() })
+
+	descriptor, err := listener.(*net.UnixConn).File()
+	assert.NoError(t, err)
+	core := int(descriptor.Fd())
 
 	original := goStackDeviceFactory
 	goStackDeviceFactory = func(options gotun.Options) (gotun.Tun, error) {
@@ -184,7 +191,7 @@ func TestGoStackCarriesAPacketFromADescriptor(t *testing.T) {
 		netip.MustParseAddrPort("172.19.0.1:53"),
 		[]byte("hello"),
 	)
-	_, err = unix.Write(system, packet)
+	_, err = system.Write(packet)
 	assert.NoError(t, err)
 
 	assert.Eventually(t, func() bool {
