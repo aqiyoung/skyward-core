@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -142,4 +143,54 @@ func TestGoStackCarriesAPacketToTheHandler(t *testing.T) {
 	recorded := handler.recorded()[0]
 	assert.Equal(t, netip.MustParseAddrPort("172.19.0.2:40000"), recorded.Source.AddrPort())
 	assert.Equal(t, netip.MustParseAddrPort("172.19.0.1:53"), recorded.Destination.AddrPort())
+}
+
+// The device can also arrive as a descriptor, which is how the Android
+// tunnel hands its device over: the system opens it, the core takes it.
+func TestGoStackCarriesAPacketFromADescriptor(t *testing.T) {
+	handler := &recordingGoStackHandler{}
+	descriptors, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_DGRAM, 0)
+	assert.NoError(t, err)
+	core, system := descriptors[0], descriptors[1]
+	t.Cleanup(func() {
+		_ = syscall.Close(core)
+		_ = syscall.Close(system)
+	})
+
+	original := goStackDeviceFactory
+	goStackDeviceFactory = func(options gotun.Options) (gotun.Tun, error) {
+		options.FileDescriptor = core
+		return gotun.New(options)
+	}
+	t.Cleanup(func() { goStackDeviceFactory = original })
+
+	stack, err := buildGoStack(GoStackOptions{
+		Context: context.Background(),
+		DeviceOptions: tun.Options{
+			Name:         "go-stack-descriptor",
+			MTU:          1500,
+			FileDescriptor: core,
+			Inet4Address: []netip.Prefix{netip.MustParsePrefix("172.19.0.1/30")},
+		},
+		Handler:    handler,
+		UDPTimeout: time.Second * 30,
+	})
+	assert.NoError(t, err)
+	assert.NoError(t, stack.Start())
+	t.Cleanup(func() { _ = stack.Close() })
+
+	packet := udpPacket(
+		netip.MustParseAddrPort("172.19.0.2:40001"),
+		netip.MustParseAddrPort("172.19.0.1:53"),
+		[]byte("hello"),
+	)
+	_, err = syscall.Write(system, packet)
+	assert.NoError(t, err)
+
+	assert.Eventually(t, func() bool {
+		return len(handler.recorded()) == 1
+	}, 10*time.Second, 20*time.Millisecond)
+
+	recorded := handler.recorded()[0]
+	assert.Equal(t, netip.MustParseAddrPort("172.19.0.2:40001"), recorded.Source.AddrPort())
 }
