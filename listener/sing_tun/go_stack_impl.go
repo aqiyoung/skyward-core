@@ -67,9 +67,16 @@ func (d goStackDevice) Close() error {
 	return nil
 }
 
+// goStackDeviceFactory opens the tunnel device. A test replaces it with a
+// device it can drive, so the stack can be exercised without the system's
+// privileges.
+var goStackDeviceFactory = func(options gotun.Options) (gotun.Tun, error) {
+	return gotun.New(options)
+}
+
 func buildGoStack(options GoStackOptions) (GoStack, error) {
 	deviceOptions := goStackDeviceOptions(options)
-	device, err := gotun.New(deviceOptions)
+	device, err := goStackDeviceFactory(deviceOptions)
 	if err != nil {
 		return nil, E.Cause(err, "go stack: open the tun device")
 	}
@@ -175,7 +182,7 @@ func goStackCongestion(name string) string {
 // handler does the routing: the rules, the sniffing, the outbound. That
 // keeps the two stacks on one set of rules.
 type goStackHandler struct {
-	handler *ListenerHandler
+	handler GoStackHandler
 }
 
 func (h goStackHandler) JudgeFlow(network uint8, source netip.AddrPort, destination netip.AddrPort, firstPacket []byte) gotun.FlowVerdict {

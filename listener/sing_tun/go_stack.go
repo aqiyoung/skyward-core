@@ -2,13 +2,33 @@ package sing_tun
 
 import (
 	"context"
+	"net"
+	"net/netip"
 	"sync/atomic"
 	"time"
 
 	tun "github.com/metacubex/sing-tun"
 	"github.com/metacubex/sing/common/control"
 	E "github.com/metacubex/sing/common/exceptions"
+	M "github.com/metacubex/sing/common/metadata"
+	N "github.com/metacubex/sing/common/network"
 )
+
+// GoStackHandler is what the go stack asks about the traffic it carries.
+//
+// The core's handler answers it. The stack only carries the traffic: where
+// a connection goes is still the handler's business, so both stacks run on
+// one set of rules.
+type GoStackHandler interface {
+	// ShouldHijackDns says whether the tunnel answers this query itself.
+	ShouldHijackDns(targetAddr netip.AddrPort) bool
+
+	// NewConnection takes a connection the stack opened.
+	NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error
+
+	// NewPacketConnection takes a packet connection the stack opened.
+	NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata M.Metadata) error
+}
 
 // GoStackOptions is what a go stack implementation is handed.
 //
@@ -23,10 +43,8 @@ type GoStackOptions struct {
 	// into the options its own stack understands.
 	DeviceOptions tun.Options
 
-	// Handler decides where a connection goes. It is the core's handler, so
-	// the routing stays where it always was: the stack only carries the
-	// connection to it.
-	Handler *ListenerHandler
+	// Handler decides where a connection goes.
+	Handler GoStackHandler
 
 	UDPTimeout        time.Duration
 	ICMPTimeout       time.Duration
