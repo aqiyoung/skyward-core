@@ -34,6 +34,7 @@ import (
 var (
 	version                       bool
 	testConfig                    bool
+	startInbound                  bool
 	geodataMode                   bool
 	homeDir                       string
 	configFile                    string
@@ -74,6 +75,7 @@ func init() {
 	flag.BoolVar(&geodataMode, "m", false, "set geodata mode")
 	flag.BoolVar(&version, "v", false, "show current version of mihomo")
 	flag.BoolVar(&testConfig, "t", false, "test configuration and exit")
+	flag.BoolVar(&startInbound, "inbound", false, "start the inbound listeners the configuration names")
 	flag.Parse()
 }
 
@@ -213,8 +215,12 @@ func main() {
 		options = append(options, hub.WithSecret(secret))
 	}
 
-	if err := hub.Parse(configBytes, options...); err != nil {
+	cfg, err := hub.Parse(configBytes, options...)
+	if err != nil {
 		log.Fatalln("Parse config error: %s", err.Error())
+	}
+	if startInbound {
+		hub.StartInbound(cfg)
 	}
 
 	if updater.GeoAutoUpdate() {
@@ -245,8 +251,13 @@ func main() {
 		case <-termSign:
 			return
 		case <-hupSign:
-			if err := hub.Parse(configBytes, options...); err != nil {
+			reloaded, err := hub.Parse(configBytes, options...)
+			if err != nil {
 				log.Errorln("Parse config error: %s", err.Error())
+				continue
+			}
+			if startInbound {
+				hub.StartInbound(reloaded)
 			}
 		}
 	}
