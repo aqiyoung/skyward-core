@@ -40,23 +40,23 @@ func TestGoStackFactoryBuildsTheStack(t *testing.T) {
 
 	var seen GoStackOptions
 	built := &fakeGoStack{}
-	SetGoStackFactory(func(options GoStackOptions) (tun.Stack, error) {
+	SetGoStackFactory(func(options GoStackOptions) (GoStack, error) {
 		seen = options
 		return built, nil
 	})
 
 	handler := &ListenerHandler{}
-	stack, err := newGoStack(GoStackOptions{ListenerHandler: handler})
+	stack, err := newGoStack(GoStackOptions{Handler: handler})
 
 	assert.NoError(t, err)
 	assert.Same(t, built, stack)
-	assert.Same(t, handler, seen.ListenerHandler)
+	assert.Same(t, handler, seen.Handler)
 }
 
 func TestGoStackFactoryErrorIsReported(t *testing.T) {
 	t.Cleanup(func() { SetGoStackFactory(nil) })
 
-	SetGoStackFactory(func(options GoStackOptions) (tun.Stack, error) {
+	SetGoStackFactory(func(options GoStackOptions) (GoStack, error) {
 		return nil, assert.AnError
 	})
 
