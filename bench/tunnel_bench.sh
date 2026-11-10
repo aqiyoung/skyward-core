@@ -232,7 +232,11 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 run_core() {
-  $SUDO "$core_bin" -d "$work_dir" -f "$work_dir/config.yaml" &
+  # -inbound is what opens the ports the configuration names. The core is
+  # built to be driven by the app, which starts the listeners itself after
+  # its tunnel is up; a core run from here has no app behind it, so it has
+  # to be told to open them, or the mixed port would be read and ignored.
+  $SUDO "$core_bin" -d "$work_dir" -f "$work_dir/config.yaml" -inbound &
   core_pid=$!
   sleep 3
   if ! kill -0 "$core_pid" 2>/dev/null; then
@@ -274,9 +278,29 @@ else
   proxy_arg=(--proxy "http://127.0.0.1:$mixed_port")
 fi
 
-sample_process() {
-  # ps prints the same columns on macOS and Linux.
-  ps -o %cpu=,rss= -p "$core_pid" 2>/dev/null | tr -s ' ' | sed 's/^ //'
+sample_rss() {
+  # ps prints the same column on macOS and Linux.
+  ps -o rss= -p "$core_pid" 2>/dev/null | tr -d ' '
+}
+
+core_cpu_seconds() {
+  # The CPU the core has spent so far, in seconds.
+  #
+  # On Linux the kernel's own counter is read: ps prints the time as a
+  # clock, whole seconds only, and a transfer that costs a tenth of a second
+  # would print as no cost at all. Anywhere else ps is the only source, and
+  # the clock it prints is read back into seconds before two reads can be
+  # subtracted. %cpu is not used: it is the average over the core's whole
+  # life, and a three second life with a second of work averages to a third
+  # of the answer.
+  if [[ -r "/proc/$core_pid/stat" ]]; then
+    awk -v ticks="$(getconf CLK_TCK 2>/dev/null || echo 100)" \
+      '{ sub(/^[0-9]+ \([^)]*\) /, ""); print ($12 + $13) / ticks }' \
+      "/proc/$core_pid/stat" 2>/dev/null
+  else
+    ps -o cputime= -p "$core_pid" 2>/dev/null | tr -d ' ' |
+      awk -F: '{ seconds = 0; for (field = 1; field <= NF; field++) seconds = seconds * 60 + $field; print seconds }'
+  fi
 }
 
 echo "mode=$mode stack=$stack size=${size_mib}MiB runs=$runs"
@@ -285,32 +309,34 @@ echo "core pid $core_pid, target 127.0.0.1:$target_port"
 results=()
 for run in $(seq 1 "$runs"); do
   peak_rss=0
-  sum_cpu=0
-  samples=0
 
   (
     while kill -0 "$core_pid" 2>/dev/null; do
-      read -r cpu rss < <(sample_process) || true
-      [[ -n "${rss:-}" ]] && echo "$cpu $rss" >> "$work_dir/samples"
-      sleep 0.5
+      rss=$(sample_rss)
+      [[ -n "$rss" ]] && echo "$rss" >> "$work_dir/samples"
+      sleep 0.1
     done
   ) &
   sampler=$!
 
-  speed=$(curl --silent --output /dev/null --write-out '%{speed_download}' \
+  cpu_before=$(core_cpu_seconds)
+  # curl measures the transfer itself, so the window the CPU is divided by
+  # is the transfer and not the setup around it.
+  read -r speed total < <(curl --silent --output /dev/null \
+    --write-out '%{speed_download} %{time_total}\n' \
     --max-time 600 "${proxy_arg[@]}" "$url")
+  cpu_after=$(core_cpu_seconds)
   kill "$sampler" 2>/dev/null || true
   wait "$sampler" 2>/dev/null || true
 
   if [[ -s "$work_dir/samples" ]]; then
-    peak_rss=$(awk '{ if ($2 > max) max = $2 } END { print max + 0 }' "$work_dir/samples")
-    sum_cpu=$(awk '{ total += $1 } END { print total + 0 }' "$work_dir/samples")
-    samples=$(wc -l < "$work_dir/samples" | tr -d ' ')
+    peak_rss=$(awk '{ if ($1 > max) max = $1 } END { print max + 0 }' "$work_dir/samples")
   fi
   : > "$work_dir/samples"
 
   mib_s=$(awk -v s="$speed" 'BEGIN { printf "%.1f", s / 1048576 }')
-  cpu_avg=$(awk -v c="$sum_cpu" -v n="$samples" 'BEGIN { printf "%.0f", (n > 0 ? c / n : 0) }')
+  cpu_avg=$(awk -v before="$cpu_before" -v after="$cpu_after" -v elapsed="$total" \
+    'BEGIN { printf "%.0f", (elapsed > 0 ? (after - before) * 100 / elapsed : 0) }')
   rss_mib=$(awk -v r="$peak_rss" 'BEGIN { printf "%.1f", r / 1024 }')
   echo "run $run: ${mib_s} MiB/s  cpu ${cpu_avg}%  peak rss ${rss_mib} MiB"
   results+=("$mib_s")
