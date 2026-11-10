@@ -1,0 +1,65 @@
+name: benchmark
+
+# What the tunnel costs, measured on one machine: the client, the core and
+# the target all live here, so the number is the core's own capacity and
+# nothing else. It is the same shape as the measurement the Clash kernel
+# publishes.
+#
+# Two stacks are measured the same way, in the same run: the one the releases
+# carry and the go stack. The ratio is the question; either number alone is
+# not.
+#
+# The run needs the tunnel device, and the device and its routes are the
+# system's, so it runs as root.
+
+on:
+  push:
+    branches:
+      - skyward
+  workflow_dispatch:
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: '1.27.1'
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+      - name: Build both cores
+        env:
+          CGO_ENABLED: 0
+        run: |
+          go build -tags with_gvisor -o "$RUNNER_TEMP/core-legacy" .
+          go build -tags "with_gvisor,with_go_stack" -o "$RUNNER_TEMP/core-go" .
+      - name: Measure
+        run: |
+          set -euo pipefail
+          for stack in legacy go; do
+            echo "=== the $stack stack ==="
+            sudo bash bench/tunnel_bench.sh \
+              --core "$RUNNER_TEMP/core-$stack" \
+              --mode tun --stack "$stack" --size 64 --runs 3 \
+              | tee "$RUNNER_TEMP/$stack.log"
+          done
+      - name: Attach the numbers
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tunnel-benchmark
+          path: |
+            ${{ runner.temp }}/legacy.log
+            ${{ runner.temp }}/go.log
