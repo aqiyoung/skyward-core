@@ -19,4 +19,4 @@ tun:
   stack: mips
   device: skyward-bench
   auto-route: false
-  auto-detect-interface: false
+  auto-detect-interface: true
