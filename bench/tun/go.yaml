@@ -1,0 +1,22 @@
+mixed-port: 17890
+mode: rule
+log-level: warning
+ipv6: false
+external-controller: ""
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+proxies:
+  - name: local
+    type: http
+    server: 127.0.0.1
+    port: 17891
+rules:
+  - MATCH,local
+tun:
+  enable: true
+  stack: go
+  device: skyward-bench
+  auto-route: false
+  auto-detect-interface: false

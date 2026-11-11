@@ -45,10 +45,10 @@ jobs:
         run: |
           go build -tags with_gvisor -o "$RUNNER_TEMP/core-legacy" .
           go build -tags "with_gvisor,with_go_stack" -o "$RUNNER_TEMP/core-go" .
-      # The relay path is measured first: it needs no tunnel device, and it
-      # checks the harness end to end. The tunnel path needs the app's
-      # wrapper to bring the device up, because this fork does not start the
-      # tunnel from the configuration on its own.
+      # The relay path needs no tunnel device; the tunnel path does, and
+      # the tunnel is brought up the way the application brings it up.
+      - name: Build the tunnel benchmark
+        run: go build -tags "with_gvisor,with_go_stack" -o "$RUNNER_TEMP/bench-tun" ./bench/tun
       - name: Measure the relay path
         run: |
           set -euo pipefail
@@ -59,11 +59,18 @@ jobs:
               --mode proxy --stack "$stack" --size 64 --runs 3 \
               | tee "$RUNNER_TEMP/$stack.log"
           done
+      - name: Measure the tunnel path
+        run: |
+          set -euo pipefail
+          for stack in legacy go; do
+            echo "=== the $stack stack, through the tunnel ==="
+            sudo "$RUNNER_TEMP/bench-tun" -config "bench/tun/$stack.yaml" -runs 3 -size 64 \
+              | tee "$RUNNER_TEMP/tun-$stack.log"
+          done
       - name: Attach the numbers
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: tunnel-benchmark
           path: |
-            ${{ runner.temp }}/legacy.log
-            ${{ runner.temp }}/go.log
+            ${{ runner.temp }}/*.log
