@@ -14,6 +14,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"flag"
 	"fmt"
@@ -127,7 +128,23 @@ func main() {
 	route(true, *device)
 	defer route(false, *device)
 
-	url := fmt.Sprintf("http://%s:%d/payload.bin", clientAddress, targetPort)
+	// The core runs in fake-ip mode: it expects the client to ask for a
+	// name, so that it can hand out an address and remember the mapping.
+	// A literal address is one it never handed out, and the connection is
+	// dropped before it begins.
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			dialer := net.Dialer{}
+			return dialer.DialContext(ctx, "udp", "127.0.0.1:1053")
+		},
+	}
+	addresses, err := resolver.LookupHost(context.Background(), "bench.invalid")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "the core's DNS did not answer:", err)
+		os.Exit(1)
+	}
+	url := fmt.Sprintf("http://%s:%d/payload.bin", addresses[0], targetPort)
 	fmt.Printf("device=%s runs=%d size=%dMiB\n", *device, *runs, *sizeMiB)
 
 	best := 0.0
