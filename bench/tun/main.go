@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/metacubex/mihomo/hub/executor"
@@ -42,6 +43,31 @@ const (
 	routeRange = "198.18.0.0/16"
 )
 
+// outgoingAddress is the address of the interface the machine reaches the
+// world by. The core binds its own outbound to that interface, so a node on
+// the loopback is one it cannot reach.
+func outgoingAddress() string {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return "127.0.0.1"
+	}
+	for _, item := range interfaces {
+		if item.Flags&net.FlagUp == 0 || item.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addresses, err := item.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, address := range addresses {
+			if network, ok := address.(*net.IPNet); ok && network.IP.To4() != nil {
+				return network.IP.String()
+			}
+		}
+	}
+	return "127.0.0.1"
+}
+
 func main() {
 	configPath := flag.String("config", "", "the configuration to measure")
 	device := flag.String("device", "skyward-bench", "the tunnel device")
@@ -57,7 +83,11 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	cfg, err := executor.ParseWithBytes(config)
+	// The configuration names the loopback for the node, which the core
+	// cannot reach while it binds its outbound to the machine's interface.
+	node := outgoingAddress()
+	patched := strings.Replace(string(config), "server: 127.0.0.1", "server: "+node, 1)
+	cfg, err := executor.ParseWithBytes([]byte(patched))
 	if err != nil {
 		panic(err)
 	}
@@ -86,7 +116,7 @@ func main() {
 
 	// The proxy node. It reaches the target whatever address it was asked
 	// for, which is what keeps the traffic on this machine.
-	proxy, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", proxyPort))
+	proxy, err := net.Listen("tcp", fmt.Sprintf("%s:%d", outgoingAddress(), proxyPort))
 	if err != nil {
 		panic(err)
 	}
