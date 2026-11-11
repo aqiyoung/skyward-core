@@ -210,15 +210,11 @@ func (h goStackHandler) NewDNSPacket(payload []byte, source goM.Socksaddr, desti
 
 func (h goStackHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source goM.Socksaddr, destination goM.Socksaddr, onClose goN.CloseHandlerFunc) {
 	if side, isGoConn := conn.(goStreamSide); isGoConn {
-		// The stack waits for the handshake to be over before it lets the
-		// connection go, and it is told that by the side that carries it.
-		if err := side.HandshakeSuccess(); err != nil {
-			_ = conn.Close()
-			if onClose != nil {
-				onClose(err)
-			}
-			return
-		}
+		// The stack hands the connection over as soon as it has the opening
+		// packet, and it finishes the handshake itself. Waiting for the
+		// handshake here would hold the very goroutine that has to send the
+		// answer, so the wait belongs on the read side: the read asks the
+		// stack when the connection has something to say.
 		conn = &goStreamConn{
 			Conn:   conn,
 			side:   side,
