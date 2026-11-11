@@ -26,13 +26,20 @@ import (
 // conversions that harness will rely on, so a mismatch cannot be blamed on
 // an address that changed shape on its way across the two sing forks.
 type parityObserver struct {
-	mu          sync.Mutex
-	connections []M.Metadata
-	packets     []M.Metadata
-	dnsHijack   bool
+	mu           sync.Mutex
+	connections  []M.Metadata
+	packets      []M.Metadata
+	dnsHijack    bool
+	hijackTarget netip.AddrPort
 }
 
-func (o *parityObserver) ShouldHijackDns(netip.AddrPort) bool { return o.dnsHijack }
+// ShouldHijackDns mirrors the core's handler: it claims only the name server
+// the tunnel answers for, so a flow to any other resolver stays on the
+// ordinary path. This also pins that JudgeFlow passes the destination through
+// unchanged: a wrong address here would turn the hijack case into Accept.
+func (o *parityObserver) ShouldHijackDns(targetAddr netip.AddrPort) bool {
+	return o.dnsHijack && targetAddr == o.hijackTarget
+}
 
 func (o *parityObserver) NewConnection(_ context.Context, conn net.Conn, metadata M.Metadata) error {
 	o.mu.Lock()
@@ -92,12 +99,12 @@ func TestGoStackJudgeFlowFollowsTheHandlersDnsDecision(t *testing.T) {
 	udp := uint8(syscall.IPPROTO_UDP)
 	tcp := uint8(syscall.IPPROTO_TCP)
 
-	claims := goStackHandler{handler: &parityObserver{dnsHijack: true}}
+	claims := goStackHandler{handler: &parityObserver{dnsHijack: true, hijackTarget: dns}}
 	assert.Equal(t, gotun.ActionHijackDNS, claims.JudgeFlow(udp, source, dns, nil).Action)
 	assert.Equal(t, gotun.ActionAccept, claims.JudgeFlow(tcp, source, dns, nil).Action)
 	assert.Equal(t, gotun.ActionAccept, claims.JudgeFlow(udp, source, other, nil).Action)
 
-	declines := goStackHandler{handler: &parityObserver{dnsHijack: false}}
+	declines := goStackHandler{handler: &parityObserver{dnsHijack: false, hijackTarget: dns}}
 	assert.Equal(t, gotun.ActionAccept, declines.JudgeFlow(udp, source, dns, nil).Action)
 
 	assert.Equal(t, gotun.ActionAccept, (goStackHandler{}).JudgeFlow(udp, source, dns, nil).Action)
