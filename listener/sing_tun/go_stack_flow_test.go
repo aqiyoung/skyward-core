@@ -38,8 +38,20 @@ func (h *recordingGoStackHandler) NewConnection(
 	metadata M.Metadata,
 ) error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	h.connections = append(h.connections, metadata)
+	h.mu.Unlock()
+	// The stack answers the client when the handler starts reading: the
+	// handshake and the first read are the same wait. A handler that never
+	// reads never gets an answer, and a client waiting for one waits
+	// forever.
+	go func() {
+		buffer := make([]byte, 4096)
+		for {
+			if _, err := conn.Read(buffer); err != nil {
+				return
+			}
+		}
+	}()
 	return nil
 }
 
