@@ -124,6 +124,12 @@ func main() {
 	defer proxy.Close()
 	go serveProxy(proxy)
 
+	// The executor leaves the tunnel device to the application, and the go
+	// stack hands it over down. A down interface cannot be a nexthop, so
+	// bring it up before pointing a route at it. The legacy stack already
+	// has it up, and setting IFF_UP twice is harmless.
+	linkUp(*device)
+
 	// Only the address the client asks for is routed into the tunnel.
 	route(true, *device)
 	defer route(false, *device)
@@ -169,6 +175,19 @@ func main() {
 		fmt.Printf("run %d: %.1f MiB/s (%d bytes in %s)\n", run, speed, read, elapsed.Round(time.Millisecond))
 	}
 	fmt.Printf("best: %.1f MiB/s\n", best)
+}
+
+// linkUp brings the tunnel device up. The bare core leaves this to the
+// application: the legacy stack sets IFF_UP itself, the go stack does not,
+// and `ip route add ... dev` refuses a nexthop whose device is down.
+func linkUp(device string) {
+	command := exec.Command("ip", "link", "set", "dev", device, "up")
+	command.Stdout = os.Stdout
+	command.Stderr = os.Stderr
+	if err := command.Run(); err != nil {
+		fmt.Fprintln(os.Stderr, "the tunnel device could not be brought up:", err)
+		os.Exit(1)
+	}
 }
 
 // route points the measured range at the tunnel device, or puts the machine
