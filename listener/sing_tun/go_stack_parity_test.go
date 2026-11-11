@@ -10,10 +10,10 @@ import (
 	"syscall"
 	"testing"
 
-	gotun "github.com/sagernet/sing-tun"
-	goM "github.com/sagernet/sing/common/metadata"
 	M "github.com/metacubex/sing/common/metadata"
 	N "github.com/metacubex/sing/common/network"
+	gotun "github.com/sagernet/sing-tun"
+	goM "github.com/sagernet/sing/common/metadata"
 	"github.com/stretchr/testify/assert"
 )
 
