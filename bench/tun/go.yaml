@@ -1,6 +1,6 @@
 mixed-port: 17890
 mode: rule
-log-level: warning
+log-level: info
 ipv6: false
 external-controller: ""
 dns:
