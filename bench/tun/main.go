@@ -61,9 +61,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	if err := executor.ApplyConfig(cfg, true); err != nil {
-		panic(err)
-	}
+	executor.ApplyConfig(cfg, true)
 	// The executor leaves the listeners and the tunnel to the application.
 	// There is no application here, so this opens both.
 	listener.PatchInboundListeners(cfg.Listeners, tunnel.Tunnel, true)
