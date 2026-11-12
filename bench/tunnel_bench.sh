@@ -22,14 +22,20 @@
 #
 # Usage:
 #   bench/tunnel_bench.sh --core /path/to/SkywardCore [--mode tun|proxy]
-#                          [--stack legacy|go] [--size 256] [--runs 3]
+#                          [--stack legacy|go] [--size 256] [--runs 9]
+#                          [--warmup 1]
+#
+# The median of the measured runs is the verdict, not the best one. The
+# first transfer warms caches and the congestion window and is discarded.
+# cv and spread are printed so a noisy run cannot be mistaken for a result.
 
 set -euo pipefail
 
 mode=tun
 stack=legacy
 size_mib=256
-runs=3
+runs=9
+warmup=1
 core_bin=""
 target_port=18080
 mixed_port=17890
@@ -52,6 +58,7 @@ while [[ $# -gt 0 ]]; do
     --stack) stack="$2"; shift 2 ;;
     --size) size_mib="$2"; shift 2 ;;
     --runs) runs="$2"; shift 2 ;;
+    --warmup) warmup="$2"; shift 2 ;;
     --help|-h) usage 0 ;;
     *) echo "unknown argument: $1" >&2; usage 1 ;;
   esac
@@ -303,11 +310,15 @@ core_cpu_seconds() {
   fi
 }
 
-echo "mode=$mode stack=$stack size=${size_mib}MiB runs=$runs"
+echo "mode=$mode stack=$stack size=${size_mib}MiB runs=$runs warmup=$warmup"
 echo "core pid $core_pid, target 127.0.0.1:$target_port"
 
 results=()
-for run in $(seq 1 "$runs"); do
+# The first transfer warms caches and the sender's congestion window. It is
+# measured and printed, but never enters the statistics: on the legacy stack
+# the first three runs rose monotonically, which made best-of-three a measure
+# of warm-up rather than of the stack.
+for run in $(seq 1 "$((runs + warmup))"); do
   peak_rss=0
 
   (
@@ -338,14 +349,36 @@ for run in $(seq 1 "$runs"); do
   cpu_avg=$(awk -v before="$cpu_before" -v after="$cpu_after" -v elapsed="$total" \
     'BEGIN { printf "%.0f", (elapsed > 0 ? (after - before) * 100 / elapsed : 0) }')
   rss_mib=$(awk -v r="$peak_rss" 'BEGIN { printf "%.1f", r / 1024 }')
-  echo "run $run: ${mib_s} MiB/s  cpu ${cpu_avg}%  peak rss ${rss_mib} MiB"
+  if (( run <= warmup )); then
+    echo "warmup $run: ${mib_s} MiB/s  cpu ${cpu_avg}%  peak rss ${rss_mib} MiB"
+    continue
+  fi
+  echo "run $((run - warmup)): ${mib_s} MiB/s  cpu ${cpu_avg}%  peak rss ${rss_mib} MiB"
   results+=("$mib_s")
 done
 
-printf '%.0f\n' "${results[@]}" | sort -n | awk '
-  { values[NR] = $1 }
+printf '%s\n' "${results[@]}" | sort -n | awk '
+  { values[NR] = $1; sum += $1 }
   END {
-    mid = int((NR + 1) / 2)
-    printf "median: %.1f MiB/s\n", values[mid]
-    printf "best:  %.1f MiB/s\n", values[NR]
+    n = NR
+    mid = int((n + 1) / 2)
+    median = (n % 2 == 0) ? (values[mid] + values[mid + 1]) / 2 : values[mid]
+    mean = sum / n
+    for (i = 1; i <= n; i++) sq += (values[i] - mean) ^ 2
+    sd = (n > 1) ? sqrt(sq / (n - 1)) : 0
+    cv = (mean > 0) ? sd / mean * 100 : 0
+    low = values[1]; high = values[n]
+    spread = (low > 0) ? (high / low - 1) * 100 : 0
+    printf "median: %.1f MiB/s\n", median
+    printf "mean:   %.1f MiB/s\n", mean
+    printf "stdev:  %.1f MiB/s (cv %.1f%%)\n", sd, cv
+    printf "min:    %.1f MiB/s\n", low
+    printf "max:    %.1f MiB/s\n", high
+    printf "spread: %.1f%% (max/min - 1)\n", spread
+    # Kept only so existing parsers keep working; it is not the verdict.
+    printf "best:   %.1f MiB/s\n", high
+    if (cv <= 5 && spread <= 10)
+      print "stable: yes (cv <= 5% and spread <= 10%)"
+    else
+      print "stable: no (cv > 5% or spread > 10%; re-run on a quiet runner)"
   }'

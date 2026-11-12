@@ -9,6 +9,13 @@ name: benchmark
 # carry and the go stack. The ratio is the question; either number alone is
 # not.
 #
+# The verdict is the median of 9 measured transfers, after one discarded
+# warm-up transfer. Best-of-three used to be reported, but the first three
+# legacy runs rose monotonically while the go stack's did not, so best was
+# measuring cache warm-up rather than the stack. Every run also prints cv and
+# spread; a run whose own cv exceeds 5% is flagged unstable and must not be
+# used to settle the ratio.
+#
 # The run needs the tunnel device, and the device and its routes are the
 # system's, so it runs as root.
 
@@ -56,7 +63,7 @@ jobs:
             echo "=== the $stack stack, through the inbound ==="
             sudo bash bench/tunnel_bench.sh \
               --core "$RUNNER_TEMP/core-$stack" \
-              --mode proxy --stack "$stack" --size 64 --runs 3 \
+              --mode proxy --stack "$stack" --size 64 --runs 9 --warmup 1 \
               | tee "$RUNNER_TEMP/$stack.log"
           done
       - name: Measure the tunnel path
@@ -64,9 +71,75 @@ jobs:
           set -euo pipefail
           for stack in legacy go; do
             echo "=== the $stack stack, through the tunnel ==="
-            sudo "$RUNNER_TEMP/bench-tun" -config "bench/tun/$stack.yaml" -runs 3 -size 64 \
+            sudo "$RUNNER_TEMP/bench-tun" -config "bench/tun/$stack.yaml" \
+              -runs 9 -warmup 1 -size 64 \
               | tee "$RUNNER_TEMP/tun-$stack.log"
           done
+      # Turn the four logs into a verdict. Without this, "is there an
+      # improvement?" requires downloading artifacts and doing the arithmetic
+      # by hand, which is how a noisy run gets mistaken for a result.
+      - name: Compare the stacks
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import os, re, pathlib
+
+          tmp = pathlib.Path(os.environ["RUNNER_TEMP"])
+
+          def parse(name):
+              path = tmp / f"{name}.log"
+              if not path.exists():
+                  return None
+              text = path.read_text()
+              def grab(pattern):
+                  m = re.search(pattern, text, re.M)
+                  return float(m.group(1)) if m else None
+              return {
+                  "median": grab(r"^median:\s+([\d.]+)"),
+                  "cv": grab(r"cv\s+([\d.]+)%"),
+                  "stable": "stable: yes" in text,
+              }
+
+          rows = ["| path | legacy median | go median | go/legacy | cv legacy / go | verdict |",
+                  "| --- | ---: | ---: | ---: | ---: | --- |"]
+          any_unstable = False
+          for label, legacy_name, go_name in (("relay", "legacy", "go"),
+                                              ("tunnel", "tun-legacy", "tun-go")):
+              legacy, go = parse(legacy_name), parse(go_name)
+              if not legacy or not go or not legacy["median"] or not go["median"]:
+                  rows.append(f"| {label} | — | — | — | — | logs missing |")
+                  any_unstable = True
+                  continue
+              ratio = go["median"] / legacy["median"]
+              unstable = not (legacy["stable"] and go["stable"])
+              any_unstable |= unstable
+              cv_l = legacy["cv"] if legacy["cv"] is not None else float("nan")
+              cv_g = go["cv"] if go["cv"] is not None else float("nan")
+              cv = f"{cv_l:.1f}% / {cv_g:.1f}%"
+              if unstable:
+                  verdict = "UNSTABLE — re-run, do not use this ratio"
+              elif ratio >= 2.0:
+                  verdict = f"{ratio:.2f}x — meets the P4 2x gate"
+              elif ratio >= 1.5:
+                  verdict = f"{ratio:.2f}x — above the R6 stop line, below P4"
+              else:
+                  verdict = f"{ratio:.2f}x — below 1.5x, R6 says stop and profile"
+              rows.append(f'| {label} | {legacy["median"]:.1f} | {go["median"]:.1f} | '
+                          f'{ratio:.3f} | {cv} | {verdict} |')
+
+          rows.append("")
+          rows.append("P0 gate: both stacks must report `stable: yes` (cv <= 5%).")
+          rows.append("P4 gate: >= 2x to consider switching the default; R6: < 1.5x means stop and profile.")
+          if any_unstable:
+              rows.append("**This run cannot settle the ratio.** A shared runner is not a quiet machine; "
+                          "fix the baseline before drawing conclusions.")
+          report = "\n".join(rows)
+          print(report)
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a") as f:
+                  f.write("## Stack comparison\n\n" + report + "\n")
+          PY
       - name: Attach the numbers
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

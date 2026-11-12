@@ -19,10 +19,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -72,7 +74,8 @@ func outgoingAddress() string {
 func main() {
 	configPath := flag.String("config", "", "the configuration to measure")
 	device := flag.String("device", "skyward-bench", "the tunnel device")
-	runs := flag.Int("runs", 3, "how many times to measure")
+	runs := flag.Int("runs", 9, "how many measured transfers")
+	warmup := flag.Int("warmup", 1, "how many unmeasured transfers to discard before the first run")
 	sizeMiB := flag.Int("size", 64, "the payload size in MiB")
 	flag.Parse()
 	if *configPath == "" {
@@ -151,10 +154,9 @@ func main() {
 		os.Exit(1)
 	}
 	url := fmt.Sprintf("http://%s:%d/payload.bin", addresses[0], targetPort)
-	fmt.Printf("device=%s runs=%d size=%dMiB\n", *device, *runs, *sizeMiB)
+	fmt.Printf("device=%s runs=%d warmup=%d size=%dMiB\n", *device, *runs, *warmup, *sizeMiB)
 
-	best := 0.0
-	for run := 1; run <= *runs; run++ {
+	transfer := func() (float64, int64, time.Duration) {
 		start := time.Now()
 		response, err := http.Get(url)
 		if err != nil {
@@ -168,13 +170,78 @@ func main() {
 			os.Exit(1)
 		}
 		elapsed := time.Since(start)
-		speed := float64(read) / 1048576 / elapsed.Seconds()
-		if speed > best {
-			best = speed
-		}
-		fmt.Printf("run %d: %.1f MiB/s (%d bytes in %s)\n", run, speed, read, elapsed.Round(time.Millisecond))
+		return float64(read) / 1048576 / elapsed.Seconds(), read, elapsed
 	}
-	fmt.Printf("best: %.1f MiB/s\n", best)
+
+	// The first transfers warm caches and the sender's congestion window.
+	// Legacy stacks rose on every one of the first three runs while the go
+	// stack did not, so counting those transfers biased the comparison.
+	for w := 1; w <= *warmup; w++ {
+		speed, read, elapsed := transfer()
+		fmt.Printf("warmup %d: %.1f MiB/s (%d bytes in %s)\n", w, speed, read, elapsed.Round(time.Millisecond))
+	}
+
+	results := make([]float64, 0, *runs)
+	for run := 1; run <= *runs; run++ {
+		speed, read, elapsed := transfer()
+		fmt.Printf("run %d: %.1f MiB/s (%d bytes in %s)\n", run, speed, read, elapsed.Round(time.Millisecond))
+		results = append(results, speed)
+	}
+	report(results)
+}
+
+// report makes the median the headline number and prints the spread that
+// says whether that median can be trusted. Best-of-three used to be the
+// verdict; it hid a warm-up ramp and said nothing about the noise.
+func report(values []float64) {
+	if len(values) == 0 {
+		return
+	}
+	sorted := append([]float64(nil), values...)
+	sort.Float64s(sorted)
+
+	median := sorted[len(sorted)/2]
+	if len(sorted)%2 == 0 {
+		median = (sorted[len(sorted)/2-1] + sorted[len(sorted)/2]) / 2
+	}
+	var sum float64
+	for _, v := range sorted {
+		sum += v
+	}
+	mean := sum / float64(len(sorted))
+	var sq float64
+	for _, v := range sorted {
+		sq += (v - mean) * (v - mean)
+	}
+	sd := 0.0
+	if len(sorted) > 1 {
+		sd = math.Sqrt(sq / float64(len(sorted)-1))
+	}
+	cv := 0.0
+	if mean > 0 {
+		cv = sd / mean * 100
+	}
+	low, high := sorted[0], sorted[len(sorted)-1]
+	spread := 0.0
+	if low > 0 {
+		spread = (high/low - 1) * 100
+	}
+
+	fmt.Printf("median: %.1f MiB/s\n", median)
+	fmt.Printf("mean:   %.1f MiB/s\n", mean)
+	fmt.Printf("stdev:  %.1f MiB/s (cv %.1f%%)\n", sd, cv)
+	fmt.Printf("min:    %.1f MiB/s\n", low)
+	fmt.Printf("max:    %.1f MiB/s\n", high)
+	fmt.Printf("spread: %.1f%% (max/min - 1)\n", spread)
+	// Kept only so existing parsers keep working; it is not the verdict.
+	fmt.Printf("best:   %.1f MiB/s\n", high)
+	// P0 asks for two runs within 5%. A single run whose own cv exceeds
+	// that threshold is already noise and cannot settle the ratio.
+	if cv <= 5 && spread <= 10 {
+		fmt.Println("stable: yes (cv <= 5% and spread <= 10%)")
+	} else {
+		fmt.Println("stable: no (cv > 5% or spread > 10%; re-run on a quiet runner)")
+	}
 }
 
 // linkUp brings the tunnel device up. The bare core leaves this to the
