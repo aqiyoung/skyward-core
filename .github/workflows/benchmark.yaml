@@ -16,6 +16,13 @@ name: benchmark
 # spread; a run whose own cv exceeds 5% is flagged unstable and must not be
 # used to settle the ratio.
 #
+# The payload defaults to 512 MiB. At 64 MiB a transfer lasts only 50-96 ms,
+# so scheduler jitter on a shared runner dominates the result: the first
+# measurement with 9 runs still produced cv 4.9-17.7% and spread up to 71%.
+# A longer transfer does not remove the noise, but it shrinks its share of
+# the measured time. Size, runs and warm-up are dispatch inputs so the
+# baseline can be tuned without another commit.
+#
 # The run needs the tunnel device, and the device and its routes are the
 # system's, so it runs as root.
 
@@ -24,6 +31,22 @@ on:
     branches:
       - skyward
   workflow_dispatch:
+    inputs:
+      size:
+        description: 'payload size in MiB; longer transfers shrink scheduler noise'
+        required: false
+        default: '512'
+        type: string
+      runs:
+        description: 'measured transfers per stack (warm-up excluded)'
+        required: false
+        default: '9'
+        type: string
+      warmup:
+        description: 'unmeasured transfers discarded before the first run'
+        required: false
+        default: '1'
+        type: string
 
 concurrency:
   group: benchmark-${{ github.ref }}
@@ -34,6 +57,10 @@ permissions:
 
 env:
   GO_VERSION: '1.27.1'
+  # inputs is empty on push, so the defaults apply to every automatic run.
+  BENCH_SIZE: ${{ inputs.size || '512' }}
+  BENCH_RUNS: ${{ inputs.runs || '9' }}
+  BENCH_WARMUP: ${{ inputs.warmup || '1' }}
 
 jobs:
   benchmark:
@@ -59,11 +86,15 @@ jobs:
       - name: Measure the relay path
         run: |
           set -euo pipefail
+          for v in BENCH_SIZE BENCH_RUNS BENCH_WARMUP; do
+            [[ -n "${!v}" ]] || { echo "::error::$v is empty; check the dispatch inputs"; exit 2; }
+          done
           for stack in legacy go; do
             echo "=== the $stack stack, through the inbound ==="
             sudo bash bench/tunnel_bench.sh \
               --core "$RUNNER_TEMP/core-$stack" \
-              --mode proxy --stack "$stack" --size 64 --runs 9 --warmup 1 \
+              --mode proxy --stack "$stack" \
+              --size "$BENCH_SIZE" --runs "$BENCH_RUNS" --warmup "$BENCH_WARMUP" \
               | tee "$RUNNER_TEMP/$stack.log"
           done
       - name: Measure the tunnel path
@@ -72,7 +103,7 @@ jobs:
           for stack in legacy go; do
             echo "=== the $stack stack, through the tunnel ==="
             sudo "$RUNNER_TEMP/bench-tun" -config "bench/tun/$stack.yaml" \
-              -runs 9 -warmup 1 -size 64 \
+              -runs "$BENCH_RUNS" -warmup "$BENCH_WARMUP" -size "$BENCH_SIZE" \
               | tee "$RUNNER_TEMP/tun-$stack.log"
           done
       # Turn the four logs into a verdict. Without this, "is there an
@@ -97,6 +128,7 @@ jobs:
               return {
                   "median": grab(r"^median:\s+([\d.]+)"),
                   "cv": grab(r"cv\s+([\d.]+)%"),
+                  "size": grab(r"size=(\d+)MiB"),
                   "stable": "stable: yes" in text,
               }
 
@@ -127,7 +159,15 @@ jobs:
               rows.append(f'| {label} | {legacy["median"]:.1f} | {go["median"]:.1f} | '
                           f'{ratio:.3f} | {cv} | {verdict} |')
 
+          sizes = set()
+          for name in ("legacy", "go", "tun-legacy", "tun-go"):
+              p = parse(name)
+              if p and p["size"]:
+                  sizes.add(p["size"])
           rows.append("")
+          if sizes:
+              rows.append("payload: " + ", ".join(f"{s:.0f} MiB" for s in sorted(sizes))
+                          + " per transfer")
           rows.append("P0 gate: both stacks must report `stable: yes` (cv <= 5%).")
           rows.append("P4 gate: >= 2x to consider switching the default; R6: < 1.5x means stop and profile.")
           if any_unstable:
