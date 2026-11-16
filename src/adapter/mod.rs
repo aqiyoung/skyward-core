@@ -18,6 +18,10 @@ use tokio::time::timeout;
 use crate::common::TargetAddr;
 use crate::config::Config;
 
+pub mod shadowsocks;
+
+use shadowsocks::ShadowsocksOutbound;
+
 pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncStream for T {}
 pub type BoxedStream = Box<dyn AsyncStream>;
@@ -142,6 +146,19 @@ impl OutboundManager {
             let outbound: Arc<dyn Outbound> = match def.kind.as_str() {
                 "direct" => Arc::new(DirectOutbound::new(def.name.clone())),
                 "reject" => Arc::new(RejectOutbound::new(def.name.clone())),
+                "ss" | "shadowsocks" => {
+                    let made = match (def.server.as_deref(), def.port, def.cipher.as_deref(), def.password.as_deref()) {
+                        (Some(server), Some(port), Some(cipher), Some(password)) => {
+                            ShadowsocksOutbound::try_new(&def.name, server, port, cipher, password)
+                        }
+                        _ => None,
+                    };
+                    made.map(|o| Arc::new(o) as Arc<dyn Outbound>)
+                        .unwrap_or_else(|| Arc::new(UnimplementedOutbound {
+                            name: def.name.clone(),
+                            kind: format!("ss ({})", def.cipher.as_deref().unwrap_or("invalid config")),
+                        }))
+                }
                 _ => Arc::new(UnimplementedOutbound {
                     name: def.name.clone(),
                     kind: def.kind.clone(),

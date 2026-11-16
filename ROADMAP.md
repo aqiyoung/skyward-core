@@ -18,7 +18,8 @@ tracks the incremental Rust port on branch `rust-core`.
 Each protocol becomes an `Outbound` implementation in `src/adapter/`, keyed by
 `type` in the config. Current placeholders are in `UnimplementedOutbound`.
 
-- [ ] Shadowsocks (AEAD ciphers) — `transport/ss` equivalent
+- [x] Shadowsocks AEAD — AES-128/192/256-GCM, ChaCha20/XChaCha20-Poly1305
+  (`src/adapter/shadowsocks.rs`). Plugins and 2022 ciphers remain out of scope.
 - [ ] VLESS / VMess (XTLS/REALITY later) — `transport/vless`, `transport/vmess`
 - [ ] Trojan, Snell
 - [ ] Hysteria / Hysteria2, TUIC — UDP-capable transports

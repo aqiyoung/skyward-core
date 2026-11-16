@@ -62,9 +62,12 @@ CLI flags mirror the Go binary where practical:
 - **Rules** (`src/rules`): `DOMAIN`, `DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`, `IP-CIDR`,
   `MATCH`, with `no-resolve` modifier.
 - **DNS** (`src/dns`): cached async forward resolver used for IP-CIDR matching.
-- **Adapters** (`src/adapter`): `Outbound` trait; `DIRECT` and `REJECT` terminate
-  connections. Proxy groups: `select`, `load-balance`, `url-test`/`fallback`
-  (TCP-connect latency probe, cached 60 s), plus synthetic `GLOBAL`.
+- **Adapters** (`src/adapter`): `Outbound` trait. `DIRECT` and `REJECT` terminate
+  connections; `Shadowsocks` AEAD terminates via `src/adapter/shadowsocks.rs`
+  (AES-128/192/256-GCM, ChaCha20-Poly1305, XChaCha20-Poly1305; MD5 EVP-BytesToKey,
+  HKDF-SHA1 subkey, SOCKS5 target header, chunked AEAD framing). Proxy groups:
+  `select`, `load-balance`, `url-test`/`fallback` (TCP-connect latency probe,
+  cached 60 s), plus synthetic `GLOBAL`.
 - **Tunnel** (`src/tunnel`): mode dispatch (`rule`/`direct`/`global`), rule lookup,
   outbound resolution, bidirectional relay with upload/download counters.
 - **Hub** (`src/hub`): REST controller with optional bearer/token auth.
@@ -96,6 +99,7 @@ or `?token=<secret>`.
 | `rules/` | `src/rules` | subset implemented |
 | `component/dns` | `src/dns` | simplified resolver |
 | `adapter/`, `adapter/outboundgroup/` | `src/adapter` | DIRECT/REJECT + groups |
+| `adapter/outbound/shadowsocks.go`, `transport/shadowsocks/shadowaead/` | `src/adapter/shadowsocks.rs` | implemented (AEAD subset) |
 | `tunnel/` | `src/tunnel` | implemented |
 | `hub/`, `hub/executor/` | `src/hub`, `src/lib.rs` | REST + reload |
 | `common/` | `src/common` | implemented |
@@ -104,8 +108,9 @@ or `?token=<secret>`.
 
 ## Known limitations
 
-- Only `DIRECT` and `REJECT` actually connect. Other `proxies` entries are parsed and
-  listed in `/proxies`, but selecting one returns a clear "not implemented" error.
+- Beyond Shadowsocks AEAD, other `proxies` entries are parsed and listed in
+  `/proxies`, but selecting one returns a clear "not implemented" error. Shadowsocks
+  plugins (obfs, v2ray-plugin, shadow-tls, etc.) and the 2022 ciphers are not supported.
 - No TUN/TPROXY, no GEOIP/GEOSITE, no process-name rules, no rule providers.
 - DNS uses the system forward resolver with a 60 s cache — no DoH/DoT or fake-ip.
 - The REST controller does not implement the full mihomo API (no WebSocket traffic
