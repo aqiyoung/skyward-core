@@ -61,6 +61,7 @@ pub struct ProxyDef {
     pub cipher: Option<String>,
     pub password: Option<String>,
     pub uuid: Option<String>,
+    pub sni: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

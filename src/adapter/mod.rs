@@ -19,8 +19,11 @@ use crate::common::TargetAddr;
 use crate::config::Config;
 
 pub mod shadowsocks;
+pub mod tls;
+pub mod trojan;
 
 use shadowsocks::ShadowsocksOutbound;
+use trojan::TrojanOutbound;
 
 pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncStream for T {}
@@ -157,6 +160,23 @@ impl OutboundManager {
                         .unwrap_or_else(|| Arc::new(UnimplementedOutbound {
                             name: def.name.clone(),
                             kind: format!("ss ({})", def.cipher.as_deref().unwrap_or("invalid config")),
+                        }))
+                }
+                "trojan" => {
+                    let made = match (def.server.as_deref(), def.port, def.password.as_deref()) {
+                        (Some(server), Some(port), Some(password)) => TrojanOutbound::try_new(
+                            &def.name,
+                            server,
+                            port,
+                            password,
+                            def.sni.as_deref(),
+                        ),
+                        _ => None,
+                    };
+                    made.map(|o| Arc::new(o) as Arc<dyn Outbound>)
+                        .unwrap_or_else(|| Arc::new(UnimplementedOutbound {
+                            name: def.name.clone(),
+                            kind: "trojan (invalid config)".into(),
                         }))
                 }
                 _ => Arc::new(UnimplementedOutbound {

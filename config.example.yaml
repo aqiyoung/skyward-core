@@ -33,6 +33,12 @@ proxies:
     port: 8388
     cipher: aes-256-gcm
     password: "password"
+  - name: "trojan-demo"
+    type: trojan
+    server: example.com
+    port: 443
+    password: "password"
+    # sni: example.com   # defaults to `server`
 
 proxy-groups:
   - name: "auto"

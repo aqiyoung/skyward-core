@@ -65,7 +65,9 @@ CLI flags mirror the Go binary where practical:
 - **Adapters** (`src/adapter`): `Outbound` trait. `DIRECT` and `REJECT` terminate
   connections; `Shadowsocks` AEAD terminates via `src/adapter/shadowsocks.rs`
   (AES-128/256-GCM, ChaCha20-Poly1305, XChaCha20-Poly1305; MD5 EVP-BytesToKey,
-  HKDF-SHA1 subkey, SOCKS5 target header, chunked AEAD framing). Proxy groups:
+  HKDF-SHA1 subkey, SOCKS5 target header, chunked AEAD framing), and `Trojan`
+  over TLS (SHA-224 password hash, CRLF header, SNI override via `sni`).
+  Proxy groups:
   `select`, `load-balance`, `url-test`/`fallback` (TCP-connect latency probe,
   cached 60 s), plus synthetic `GLOBAL`.
 - **Tunnel** (`src/tunnel`): mode dispatch (`rule`/`direct`/`global`), rule lookup,
@@ -100,6 +102,7 @@ or `?token=<secret>`.
 | `component/dns` | `src/dns` | simplified resolver |
 | `adapter/`, `adapter/outboundgroup/` | `src/adapter` | DIRECT/REJECT + groups |
 | `adapter/outbound/shadowsocks.go`, `transport/shadowsocks/shadowaead/` | `src/adapter/shadowsocks.rs` | implemented (AEAD subset) |
+| `adapter/outbound/trojan.go`, `transport/trojan/` | `src/adapter/trojan.rs`, `src/adapter/tls.rs` | implemented (TCP over TLS subset) |
 | `tunnel/` | `src/tunnel` | implemented |
 | `hub/`, `hub/executor/` | `src/hub`, `src/lib.rs` | REST + reload |
 | `common/` | `src/common` | implemented |
@@ -108,9 +111,10 @@ or `?token=<secret>`.
 
 ## Known limitations
 
-- Beyond Shadowsocks AEAD, other `proxies` entries are parsed and listed in
-  `/proxies`, but selecting one returns a clear "not implemented" error. Shadowsocks
-  plugins (obfs, v2ray-plugin, shadow-tls, etc.) and the 2022 ciphers are not supported.
+- Beyond Shadowsocks AEAD and Trojan, other `proxies` entries are parsed and listed
+  in `/proxies`, but selecting one returns a clear "not implemented" error.
+  Shadowsocks plugins/2022 ciphers and Trojan WebSocket/obfs are not supported.
+- TLS uses webpki-roots; `skip-cert-verify` and client certificates are not supported.
 - No TUN/TPROXY, no GEOIP/GEOSITE, no process-name rules, no rule providers.
 - DNS uses the system forward resolver with a 60 s cache — no DoH/DoT or fake-ip.
 - The REST controller does not implement the full mihomo API (no WebSocket traffic
