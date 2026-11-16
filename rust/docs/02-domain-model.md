@@ -185,7 +185,7 @@ pub trait Rule: Send + Sync {
 }
 ```
 
-36 种规则按"看哪个字段"分四组，各自的实现模板固定：
+36 种规则按"看哪个字段"分四组，各自的实现模板固定（逐条对照表见 [appendix/A-rule-types.md](appendix/A-rule-types.md)）：
 
 | 组 | 规则 | 匹配字段 |
 | --- | --- | --- |

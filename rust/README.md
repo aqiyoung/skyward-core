@@ -24,7 +24,7 @@
 | [02-domain-model.md](docs/02-domain-model.md) | 核心类型与 trait：`Metadata`、`Proxy`、`Rule`、`Tunnel`、`Inbound`、`Provider`、错误与钩子 |
 | [03-runtime.md](docs/03-runtime.md) | 运行时与并发：任务模型、TCP relay、UDP 分片队列与 NAT 会话、热重载快照、内存与缓冲池 |
 | [04-protocols.md](docs/04-protocols.md) | 协议层：出站/入站全清单、分阶段实现顺序、依赖库映射、逐协议风险 |
-| [05-rules-providers.md](docs/05-rules-providers.md) | 规则引擎与 provider：36 种规则的匹配语义、ruleset（MRS）、订阅、override |
+| [05-rules-providers.md](docs/05-rules-providers.md) | 规则引擎与 provider：36 种规则的匹配语义（37 个语法名，`IP-CIDR6` 是别名）、ruleset（MRS）、订阅、override |
 | [06-config-dns.md](docs/06-config-dns.md) | 配置解析（宽容解码、默认值、热更新）与 DNS（协议、fake-ip、策略、中间件链） |
 | [07-api-host.md](docs/07-api-host.md) | 外部控制器 REST/WS API、DoH 入口、嵌入式宿主接口（FFI）与 Go 的缝（hook） |
 | [08-migration-plan.md](docs/08-migration-plan.md) | 迁移路线图 M0–M7、每阶段出口准则、工作量估算、并行开发约定 |

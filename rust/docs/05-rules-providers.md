@@ -48,6 +48,8 @@ pub fn split_rule(raw: &str) -> Option<RawRule<'_>> {
 
 ## 2. 36 种规则的实现表
 
+下表按 `rules/parser.go` 的**语法名**列（配置里写的那个）。`RuleType` 枚举有 36 个成员，但语法名有 37 个——`IP-CIDR6` 与 `IP-CIDR` 共用一个枚举成员——完整的双向映射见 [appendix/A-rule-types.md](appendix/A-rule-types.md)。
+
 | 规则 | 数据 | 匹配 | 易错点 |
 | --- | --- | --- | --- |
 | DOMAIN | `Box<str>` | `host == payload`（大小写不敏感） | 必须先小写化；`host` 可能来自 sniff |
