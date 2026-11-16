@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use aes_gcm::aead::{Aead, Payload};
-use aes_gcm::{Aes128Gcm, Aes192Gcm, Aes256Gcm, KeyInit, Nonce as AesNonce};
+use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit, Nonce as AesNonce};
 use async_trait::async_trait;
 use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaChaNonce, XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac};
@@ -34,7 +34,6 @@ type HmacSha1 = Hmac<Sha1>;
 #[derive(Clone, Copy)]
 enum Method {
     Aes128Gcm,
-    Aes192Gcm,
     Aes256Gcm,
     ChaCha20Poly1305,
     XChaCha20Poly1305,
@@ -44,7 +43,6 @@ impl Method {
     fn parse(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().replace('_', "-").as_str() {
             "aes-128-gcm" => Some(Self::Aes128Gcm),
-            "aes-192-gcm" => Some(Self::Aes192Gcm),
             "aes-256-gcm" => Some(Self::Aes256Gcm),
             "chacha20-ietf-poly1305" | "chacha20-poly1305" => Some(Self::ChaCha20Poly1305),
             "xchacha20-ietf-poly1305" | "xchacha20-poly1305" => Some(Self::XChaCha20Poly1305),
@@ -53,11 +51,7 @@ impl Method {
     }
 
     fn key_len(self) -> usize {
-        match self {
-            Self::Aes128Gcm => 16,
-            Self::Aes192Gcm => 24,
-            _ => 32,
-        }
+        if matches!(self, Self::Aes128Gcm) { 16 } else { 32 }
     }
 
     fn salt_len(self) -> usize {
@@ -86,7 +80,7 @@ fn kdf(password: &[u8], key_len: usize) -> Vec<u8> {
 }
 
 fn hkdf_sha1(ikm: &[u8], salt: &[u8], info: &[u8], out_len: usize) -> Vec<u8> {
-    let mut extract = HmacSha1::new_from_slice(salt).expect("HMAC accepts any key length");
+    let mut extract = <HmacSha1 as Mac>::new_from_slice(salt).expect("HMAC accepts any key length");
     extract.update(ikm);
     let prk = extract.finalize().into_bytes();
 
@@ -94,7 +88,7 @@ fn hkdf_sha1(ikm: &[u8], salt: &[u8], info: &[u8], out_len: usize) -> Vec<u8> {
     let mut t: Vec<u8> = Vec::new();
     let mut counter = 1u8;
     while out.len() < out_len {
-        let mut mac = HmacSha1::new_from_slice(&prk).expect("HMAC accepts any key length");
+        let mut mac = <HmacSha1 as Mac>::new_from_slice(&prk).expect("HMAC accepts any key length");
         mac.update(&t);
         mac.update(info);
         mac.update(&[counter]);
@@ -108,7 +102,6 @@ fn hkdf_sha1(ikm: &[u8], salt: &[u8], info: &[u8], out_len: usize) -> Vec<u8> {
 
 enum Cipher {
     Aes128(Aes128Gcm),
-    Aes192(Aes192Gcm),
     Aes256(Aes256Gcm),
     ChaCha(ChaCha20Poly1305),
     XChaCha(XChaCha20Poly1305),
@@ -122,7 +115,6 @@ impl Cipher {
     fn new(method: Method, key: &[u8]) -> io::Result<Self> {
         Ok(match method {
             Method::Aes128Gcm => Self::Aes128(Aes128Gcm::new_from_slice(key).map_err(|_| aead_error())?),
-            Method::Aes192Gcm => Self::Aes192(Aes192Gcm::new_from_slice(key).map_err(|_| aead_error())?),
             Method::Aes256Gcm => Self::Aes256(Aes256Gcm::new_from_slice(key).map_err(|_| aead_error())?),
             Method::ChaCha20Poly1305 => Self::ChaCha(ChaCha20Poly1305::new_from_slice(key).map_err(|_| aead_error())?),
             Method::XChaCha20Poly1305 => Self::XChaCha(XChaCha20Poly1305::new_from_slice(key).map_err(|_| aead_error())?),
@@ -133,7 +125,6 @@ impl Cipher {
         let payload = Payload { msg, aad: &[] };
         match self {
             Self::Aes128(c) => c.encrypt(AesNonce::from_slice(nonce), payload).map_err(|_| aead_error()),
-            Self::Aes192(c) => c.encrypt(AesNonce::from_slice(nonce), payload).map_err(|_| aead_error()),
             Self::Aes256(c) => c.encrypt(AesNonce::from_slice(nonce), payload).map_err(|_| aead_error()),
             Self::ChaCha(c) => c.encrypt(ChaChaNonce::from_slice(nonce), payload).map_err(|_| aead_error()),
             Self::XChaCha(c) => c.encrypt(XNonce::from_slice(nonce), payload).map_err(|_| aead_error()),
@@ -144,7 +135,6 @@ impl Cipher {
         let payload = Payload { msg, aad: &[] };
         match self {
             Self::Aes128(c) => c.decrypt(AesNonce::from_slice(nonce), payload).map_err(|_| aead_error()),
-            Self::Aes192(c) => c.decrypt(AesNonce::from_slice(nonce), payload).map_err(|_| aead_error()),
             Self::Aes256(c) => c.decrypt(AesNonce::from_slice(nonce), payload).map_err(|_| aead_error()),
             Self::ChaCha(c) => c.decrypt(ChaChaNonce::from_slice(nonce), payload).map_err(|_| aead_error()),
             Self::XChaCha(c) => c.decrypt(XNonce::from_slice(nonce), payload).map_err(|_| aead_error()),
@@ -241,16 +231,19 @@ fn poll_read_into(
     filled: &mut usize,
 ) -> Poll<io::Result<()>> {
     while *filled < dst.len() {
-        match Pin::new(&mut *inner).poll_read(cx, &mut dst[*filled..]) {
+        let mut buf = ReadBuf::new(&mut dst[*filled..]);
+        match Pin::new(&mut *inner).poll_read(cx, &mut buf) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Ready(Ok(0)) => {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "ss: connection closed mid-frame",
-                )));
+            Poll::Ready(Ok(())) => {
+                if buf.filled().is_empty() {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "ss: connection closed mid-frame",
+                    )));
+                }
+                *filled += buf.filled().len();
             }
-            Poll::Ready(Ok(n)) => *filled += n,
         }
     }
     Poll::Ready(Ok(()))
@@ -483,7 +476,7 @@ mod tests {
         assert_eq!(domain[0], 3);
         assert_eq!(domain[1], 11);
         assert_eq!(&domain[2..13], b"example.com");
-        assert_eq!(&domain[13..], &80u16.to_be_bytes());
+        assert_eq!(&domain[13..], &80u16.to_be_bytes()[..]);
     }
 
     #[test]

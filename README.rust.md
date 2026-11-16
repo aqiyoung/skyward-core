@@ -64,7 +64,7 @@ CLI flags mirror the Go binary where practical:
 - **DNS** (`src/dns`): cached async forward resolver used for IP-CIDR matching.
 - **Adapters** (`src/adapter`): `Outbound` trait. `DIRECT` and `REJECT` terminate
   connections; `Shadowsocks` AEAD terminates via `src/adapter/shadowsocks.rs`
-  (AES-128/192/256-GCM, ChaCha20-Poly1305, XChaCha20-Poly1305; MD5 EVP-BytesToKey,
+  (AES-128/256-GCM, ChaCha20-Poly1305, XChaCha20-Poly1305; MD5 EVP-BytesToKey,
   HKDF-SHA1 subkey, SOCKS5 target header, chunked AEAD framing). Proxy groups:
   `select`, `load-balance`, `url-test`/`fallback` (TCP-connect latency probe,
   cached 60 s), plus synthetic `GLOBAL`.
