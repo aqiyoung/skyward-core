@@ -26,3 +26,7 @@ test/config/cache*
 /output
 .vscode/
 .fleet/
+
+# Rust build artifacts
+/target/
+*.rs.bk
