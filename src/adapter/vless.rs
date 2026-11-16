@@ -167,10 +167,11 @@ mod tests {
         assert_eq!(&header[22..], &[1, 2, 3, 4]);
 
         let domain = encode_request(&uuid, &TargetAddr::Domain("example.com".into(), 80));
+        assert_eq!(&domain[19..21], &80u16.to_be_bytes()); // port precedes the address
         assert_eq!(domain[21], ATYP_DOMAIN);
         assert_eq!(domain[22], 11);
         assert_eq!(&domain[23..34], b"example.com");
-        assert_eq!(&domain[34..], &80u16.to_be_bytes());
+        assert_eq!(domain.len(), 34);
 
         let v6: IpAddr = "2001:db8::1".parse().unwrap();
         let header6 = encode_request(&uuid, &TargetAddr::Ip(v6, 80));

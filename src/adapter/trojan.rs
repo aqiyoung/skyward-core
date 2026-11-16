@@ -105,7 +105,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn password_is_sha256_hex() {
+    fn password_is_sha224_hex() {
         let outbound = TrojanOutbound::try_new("t", "example.com", 443, "password", None).unwrap();
         assert_eq!(outbound.password_hash.len(), 56);
         assert_eq!(
