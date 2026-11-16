@@ -62,6 +62,9 @@ pub struct ProxyDef {
     pub password: Option<String>,
     pub uuid: Option<String>,
     pub sni: Option<String>,
+    pub tls: Option<bool>,
+    #[serde(rename = "server-name")]
+    pub server_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

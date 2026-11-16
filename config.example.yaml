@@ -39,6 +39,13 @@ proxies:
     port: 443
     password: "password"
     # sni: example.com   # defaults to `server`
+  - name: "vless-demo"
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    # server-name: example.com   # SNI override, defaults to `server`
 
 proxy-groups:
   - name: "auto"

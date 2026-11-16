@@ -16,9 +16,11 @@ pub async fn connect_tls(host: &str, tcp: TcpStream) -> io::Result<BoxedStream> 
     let roots = RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
-    let config = ClientConfig::builder()
+    let mut config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
+    // Matches the ALPN set the Go kernel advertises for TLS-based outbounds.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     let server_name = match host.parse::<IpAddr>() {
         Ok(ip) => ServerName::IpAddress(ip.into()),

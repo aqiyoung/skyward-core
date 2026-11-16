@@ -21,9 +21,11 @@ use crate::config::Config;
 pub mod shadowsocks;
 pub mod tls;
 pub mod trojan;
+pub mod vless;
 
 use shadowsocks::ShadowsocksOutbound;
 use trojan::TrojanOutbound;
+use vless::VlessOutbound;
 
 pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncStream for T {}
@@ -160,6 +162,24 @@ impl OutboundManager {
                         .unwrap_or_else(|| Arc::new(UnimplementedOutbound {
                             name: def.name.clone(),
                             kind: format!("ss ({})", def.cipher.as_deref().unwrap_or("invalid config")),
+                        }))
+                }
+                "vless" => {
+                    let made = match (def.server.as_deref(), def.port, def.uuid.as_deref()) {
+                        (Some(server), Some(port), Some(uuid)) => VlessOutbound::try_new(
+                            &def.name,
+                            server,
+                            port,
+                            uuid,
+                            def.tls.unwrap_or(false),
+                            def.sni.as_deref().or(def.server_name.as_deref()),
+                        ),
+                        _ => None,
+                    };
+                    made.map(|o| Arc::new(o) as Arc<dyn Outbound>)
+                        .unwrap_or_else(|| Arc::new(UnimplementedOutbound {
+                            name: def.name.clone(),
+                            kind: "vless (invalid config)".into(),
                         }))
                 }
                 "trojan" => {
