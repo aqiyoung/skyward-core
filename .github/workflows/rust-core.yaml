@@ -1,0 +1,65 @@
+name: rust-core
+
+# The Rust rewrite lives on its own branch and is built entirely on the
+# runner: nothing in this workflow expects a local toolchain or a local build.
+# fmt/test/release all happen here, and the release binary is kept as an
+# artifact so the branch can be tried without building it by hand.
+
+on:
+  push:
+    branches:
+      - rust-core
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - ".github/workflows/rust-core.yaml"
+  pull_request:
+    branches:
+      - rust-core
+  workflow_dispatch:
+
+concurrency:
+  group: rust-core-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build & test (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Verify dependency lockfile
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      - name: Test
+        run: cargo test --locked --all-targets
+
+      - name: Release build
+        run: cargo build --locked --release
+
+      - name: Smoke test the binary
+        run: |
+          ./target/release/skyward-core --version
+          ./target/release/skyward-core -c config.example.yaml -t
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: skyward-core-rust-linux-amd64
+          path: target/release/skyward-core
+          if-no-files-found: error
+          retention-days: 30

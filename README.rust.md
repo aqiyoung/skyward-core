@@ -20,19 +20,22 @@ SOCKS5 / HTTP inbound  ->  rule match  ->  outbound selection  ->  DIRECT / REJE
 Config (YAML)  +  DNS resolver  +  REST controller / hot reload
 ```
 
-## Quick start
+## Builds run on GitHub
+
+This branch is built entirely by [`.github/workflows/rust-core.yaml`](.github/workflows/rust-core.yaml):
+a push to `rust-core` runs `cargo test --locked --all-targets`, a locked release
+build, and a CLI smoke test on a GitHub runner, then uploads the binary as the
+`skyward-core-rust-linux-amd64` artifact. No local build is required.
+
+The workflow is also manually dispatchable from the Actions tab.
+
+## Running the binary
+
+Download the artifact from a successful workflow run, then:
 
 ```bash
-# build & test
-cargo build
-cargo test
-
-# validate a config
-cargo run -- -c config.example.yaml -t
-
-# run
-cp config.example.yaml config.yaml
-cargo run --release -- -c config.yaml
+./skyward-core -c config.example.yaml -t   # validate config
+./skyward-core -c config.example.yaml      # run
 ```
 
 CLI flags mirror the Go binary where practical:

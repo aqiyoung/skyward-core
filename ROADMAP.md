@@ -61,5 +61,5 @@ or `rustls`), a `TLS` connector abstraction, and a UUID/TLV codec layer.
   independently.
 - Every phase should land with `cargo test` green and a manual curl-based smoke
   test where a data path exists.
-- No build on the host beyond `cargo build` / `cargo test` (see AGENTS.md);
-  release builds belong in CI.
+- Nothing is built on the host: fmt/test/release all run in GitHub Actions via
+  `.github/workflows/rust-core.yaml`, and the binary is kept as an artifact.
