@@ -67,8 +67,9 @@ CLI flags mirror the Go binary where practical:
   (AES-128/256-GCM, ChaCha20-Poly1305, XChaCha20-Poly1305; MD5 EVP-BytesToKey,
   HKDF-SHA1 subkey, SOCKS5 target header, chunked AEAD framing), and `Trojan`
   over TLS (SHA-224 password hash, CRLF header, SNI override via `sni`), and
-  `VLESS` (UUID request header, optional `tls`, SNI via `sni`/`server-name`).
-  Proxy groups:
+  `VLESS` (UUID request header, optional `tls`, SNI via `sni`/`server-name`),
+  and `VMess` AEAD (`aes-128-gcm` / `chacha20-poly1305`, nested-HMAC KDF,
+  AuthID, encrypted header and body chunks). Proxy groups:
   `select`, `load-balance`, `url-test`/`fallback` (TCP-connect latency probe,
   cached 60 s), plus synthetic `GLOBAL`.
 - **Tunnel** (`src/tunnel`): mode dispatch (`rule`/`direct`/`global`), rule lookup,
@@ -105,6 +106,7 @@ or `?token=<secret>`.
 | `adapter/outbound/shadowsocks.go`, `transport/shadowsocks/shadowaead/` | `src/adapter/shadowsocks.rs` | implemented (AEAD subset) |
 | `adapter/outbound/trojan.go`, `transport/trojan/` | `src/adapter/trojan.rs`, `src/adapter/tls.rs` | implemented (TCP over TLS subset) |
 | `adapter/outbound/vless.go`, `transport/vless/` | `src/adapter/vless.rs` | implemented (TCP, no XTLS/REALITY) |
+| `adapter/outbound/vmess.go`, `transport/vmess/` | `src/adapter/vmess.rs` | implemented (AEAD TCP subset) |
 | `tunnel/` | `src/tunnel` | implemented |
 | `hub/`, `hub/executor/` | `src/hub`, `src/lib.rs` | REST + reload |
 | `common/` | `src/common` | implemented |
@@ -113,10 +115,10 @@ or `?token=<secret>`.
 
 ## Known limitations
 
-- Beyond Shadowsocks AEAD, Trojan and VLESS, other `proxies` entries are parsed and
-  listed in `/proxies`, but selecting one returns a clear "not implemented" error.
-  Shadowsocks plugins/2022 ciphers, Trojan WebSocket/obfs, and VLESS XTLS/REALITY
-  flows are not supported.
+- Beyond Shadowsocks AEAD, Trojan, VLESS and VMess, other `proxies` entries are
+  parsed and listed in `/proxies`, but selecting one returns a clear "not
+  implemented" error. Shadowsocks plugins/2022 ciphers, Trojan WebSocket/obfs,
+  VLESS XTLS/REALITY, and legacy (non-AEAD) VMess are not supported.
 - TLS uses webpki-roots; `skip-cert-verify` and client certificates are not supported.
 - No TUN/TPROXY, no GEOIP/GEOSITE, no process-name rules, no rule providers.
 - DNS uses the system forward resolver with a 60 s cache — no DoH/DoT or fake-ip.

@@ -22,7 +22,8 @@ Each protocol becomes an `Outbound` implementation in `src/adapter/`, keyed by
   (`src/adapter/shadowsocks.rs`). Plugins and 2022 ciphers remain out of scope.
 - [x] VLESS over optional TLS — UUID request header, response handshake
   (`src/adapter/vless.rs`). XTLS/REALITY flows and UDP remain out of scope.
-- [ ] VMess (AEAD) — `transport/vmess`
+- [x] VMess AEAD — AES-128-GCM / ChaCha20-Poly1305, nested-HMAC KDF, encrypted
+  header/body (`src/adapter/vmess.rs`). Legacy auth, UDP, WS/H2 wrappers remain out.
 - [x] Trojan over TLS — SHA-224 auth header, SNI override (`sni`)
 - [ ] Snell
 - [ ] Hysteria / Hysteria2, TUIC — UDP-capable transports

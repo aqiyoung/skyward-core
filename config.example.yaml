@@ -46,6 +46,13 @@ proxies:
     uuid: b831381d-6324-4d53-ad4f-8cda48b30811
     tls: true
     # server-name: example.com   # SNI override, defaults to `server`
+  - name: "vmess-demo"
+    type: vmess
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    cipher: auto          # aes-128-gcm / chacha20-poly1305
+    tls: true
 
 proxy-groups:
   - name: "auto"
