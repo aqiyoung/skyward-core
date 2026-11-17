@@ -236,6 +236,8 @@ mod tests {
             password: None,
             psk: None,
             version: None,
+            protocol: None,
+            obfs: None,
             username: None,
             uuid: None,
             sni: None,

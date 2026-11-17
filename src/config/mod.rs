@@ -75,6 +75,8 @@ pub struct ProxyDef {
     pub password: Option<String>,
     pub psk: Option<String>,
     pub version: Option<i32>,
+    pub protocol: Option<String>,
+    pub obfs: Option<String>,
     pub username: Option<String>,
     pub uuid: Option<String>,
     pub sni: Option<String>,

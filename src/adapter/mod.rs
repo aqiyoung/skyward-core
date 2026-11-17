@@ -23,6 +23,7 @@ pub mod provider;
 pub mod shadowsocks;
 pub mod snell;
 pub mod socks5;
+pub mod ssr;
 pub mod tls;
 pub mod trojan;
 pub mod vless;
@@ -32,6 +33,7 @@ use http_proxy::HttpOutbound;
 use shadowsocks::ShadowsocksOutbound;
 use snell::SnellOutbound;
 use socks5::Socks5Outbound;
+use ssr::SsrOutbound;
 use trojan::TrojanOutbound;
 use vless::VlessOutbound;
 use vmess::VmessOutbound;
@@ -190,6 +192,25 @@ pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
                         .unwrap_or_else(|| Arc::new(UnimplementedOutbound {
                             name: def.name.clone(),
                             kind: "socks5 (invalid config)".into(),
+                        }))
+                }
+                "ssr" | "shadowsocksr" => {
+                    let made = match (def.server.as_deref(), def.port, def.password.as_deref(), def.cipher.as_deref()) {
+                        (Some(server), Some(port), Some(password), Some(cipher)) => SsrOutbound::try_new(
+                            &def.name,
+                            server,
+                            port,
+                            password,
+                            cipher,
+                            def.protocol.as_deref(),
+                            def.obfs.as_deref(),
+                        ),
+                        _ => None,
+                    };
+                    made.map(|o| Arc::new(o) as Arc<dyn Outbound>)
+                        .unwrap_or_else(|| Arc::new(UnimplementedOutbound {
+                            name: def.name.clone(),
+                            kind: "ssr (unsupported cipher/protocol/obfs or invalid config)".into(),
                         }))
                 }
                 "snell" => {

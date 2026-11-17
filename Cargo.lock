@@ -933,6 +933,7 @@ dependencies = [
  "argon2",
  "async-trait",
  "base64",
+ "chacha20",
  "chacha20poly1305",
  "crc32fast",
  "hmac",
