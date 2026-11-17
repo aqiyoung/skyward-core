@@ -16,6 +16,8 @@ use std::sync::OnceLock;
 
 use crate::common::VERSION;
 
+pub mod share_links;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct MethodCall {
     #[serde(default)]
@@ -96,6 +98,8 @@ pub fn invoke(data: &[u8]) -> Vec<u8> {
         "getTraffic" => handle_get_traffic(&call, false),
         "getTotalTraffic" => handle_get_traffic(&call, true),
         "resetTraffic" => handle_reset_traffic(&call),
+        "encodeShareLinks" => handle_encode_share_links(&call),
+        "decodeShareLinks" => handle_decode_share_links(&call),
         "getConfig" => handle_get_config(&call),
         "getProfileBase" => handle_get_profile_base(&call),
         "getProfileOutbounds" => handle_get_profile_outbounds(&call),
@@ -286,6 +290,18 @@ fn handle_get_traffic(call: &MethodCall, total: bool) -> Vec<u8> {
 
 fn handle_reset_traffic(call: &MethodCall) -> Vec<u8> {
     ok(&call.id, Value::Bool(true))
+}
+
+fn handle_encode_share_links(call: &MethodCall) -> Vec<u8> {
+    let mappings = call.arguments.as_array().cloned().unwrap_or_default();
+    ok(&call.id, json!(share_links::encode_links(&mappings)))
+}
+
+fn handle_decode_share_links(call: &MethodCall) -> Vec<u8> {
+    let lines: Vec<String> = call.arguments.as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    ok(&call.id, json!(share_links::decode_lines(&lines)))
 }
 
 fn handle_get_config(call: &MethodCall) -> Vec<u8> {
