@@ -315,6 +315,7 @@ mod tests {
 
     #[test]
     fn setup_config_without_path_succeeds() {
+        let _guard = crate::runtime_state::TEST_LOCK.lock().unwrap();
         let r = response(invoke(br#"{"method":"setupConfig","arguments":{}}"#));
         assert_eq!(r["error"], Value::Null);
         assert_eq!(r["result"], "");
@@ -322,6 +323,7 @@ mod tests {
 
     #[test]
     fn get_proxies_returns_all_and_views() {
+        let _guard = crate::runtime_state::TEST_LOCK.lock().unwrap();
         // Ensure an engine exists from a config with a group.
         let _ = block_on(crate::runtime_state::apply_config(
             crate::config::Config::from_str(
@@ -338,6 +340,7 @@ mod tests {
 
     #[test]
     fn change_proxy_updates_selection() {
+        let _guard = crate::runtime_state::TEST_LOCK.lock().unwrap();
         // Set up an engine with a group first (tests share global state).
         let _ = block_on(crate::runtime_state::apply_config(
             crate::config::Config::from_str(
@@ -356,6 +359,7 @@ mod tests {
 
     #[test]
     fn setup_config_from_file() {
+        let _guard = crate::runtime_state::TEST_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("skyward-setup-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let file = dir.join("config.yaml");
