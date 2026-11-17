@@ -1,7 +1,9 @@
 //! The tunnel glues inbound connections to rules and outbound adapters.
 
 use std::io;
+use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -12,6 +14,7 @@ use crate::adapter::OutboundManager;
 use crate::common::{SharedTraffic, TargetAddr};
 use crate::config::Config;
 use crate::dns::Resolver;
+use crate::geo::GeoData;
 use crate::rules::RuleSet;
 
 /// AsyncWrite wrapper that feeds bytes moved through it into the traffic counters.
@@ -59,15 +62,17 @@ pub struct Engine {
     pub outbounds: OutboundManager,
     pub traffic: SharedTraffic,
     pub mode: RwLock<String>,
+    pub geo: Arc<GeoData>,
 }
 
 impl Engine {
-    pub fn new(config: Config, traffic: SharedTraffic) -> Self {
+    pub fn new(config: Config, traffic: SharedTraffic, data_dir: &Path) -> Self {
         let rules = RuleSet::new(&config.rules);
         let resolver = Resolver::new(config.dns.clone().unwrap_or_default());
         let outbounds = OutboundManager::new(&config);
         let mode = RwLock::new(config.mode.clone());
-        Self { config, rules, resolver, outbounds, traffic, mode }
+        let geo = Arc::new(GeoData::load(data_dir));
+        Self { config, rules, resolver, outbounds, traffic, mode, geo }
     }
 
     /// Choose a rule target based on the active mode and the rule set.
@@ -81,7 +86,7 @@ impl Engine {
                     TargetAddr::Domain(h, _) => self.resolver.resolve_first(h).await.ok(),
                     TargetAddr::Ip(ip, _) => Some(*ip),
                 };
-                self.rules.find(target, resolved)
+                self.rules.find(target, resolved, Some(&self.geo))
                     .map(|r| r.target.clone())
                     .unwrap_or_else(|| "DIRECT".to_string())
             }

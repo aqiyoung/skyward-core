@@ -36,10 +36,13 @@ or `rustls`), a `TLS` connector abstraction, and a UUID/TLV codec layer.
 
 ## Phase 2 — rule completeness
 
-- [ ] RULE-SET providers and remote provider updates
-- [ ] GEOIP / GEOSITE (MMDB reader — `maxminddb` crate)
-- [ ] PROCESS-NAME / PROCESS-PATH (platform-specific)
-- [ ] Domain sets, ASN rules, rule `no-resolve` semantics parity
+- [x] GEOIP / GEOSITE via mihomo's protobuf `geoip.dat` / `geosite.dat`
+  (self-contained decoder in `src/geo`), including `GEOIP,lan`
+- [x] More rule types: `DOMAIN-REGEX`, `DOMAIN-WILDCARD`, `IP-SUFFIX`, `DST-PORT`
+- [ ] RULE-SET providers (yaml/text/mrs) and remote provider updates
+- [ ] MMDB fallback for `GEOIP` when `.dat` files are absent
+- [ ] PROCESS-NAME / PROCESS-PATH, ASN and source-address rules (need metadata)
+- [ ] Logic rules (`AND`/`OR`/`NOT`), `SUB-RULE`, `REMATCH-NAME`
 
 ## Phase 3 — DNS parity
 

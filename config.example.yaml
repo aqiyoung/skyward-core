@@ -76,9 +76,13 @@ proxy-groups:
     interval: 300
 
 rules:
-  - DOMAIN-SUFFIX,localhost,DIRECT
-  - DOMAIN-SUFFIX,127.0.0.1,DIRECT
+  # GEOIP/GEOSITE read geoip.dat / geosite.dat from the config directory.
+  - GEOSITE,cn,DIRECT
+  - GEOIP,lan,DIRECT
+  - GEOIP,private,DIRECT
+  - DOMAIN-REGEX,^ads[0-9]+\.example\.com$,REJECT
   - DOMAIN-KEYWORD,ads,REJECT
+  - DOMAIN-SUFFIX,localhost,DIRECT
   - IP-CIDR,10.0.0.0/8,DIRECT
   - IP-CIDR,192.168.0.0/16,DIRECT
   - MATCH,DIRECT

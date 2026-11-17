@@ -59,9 +59,12 @@ CLI flags mirror the Go binary where practical:
   `proxy-groups`, `rules`, `dns`. Validates mode and duplicate names.
 - **Inbound** (`src/inbound`): SOCKS5 (IPv4/IPv6/domain, CONNECT), HTTP proxy
   (CONNECT + absolute-form with origin-form rewrite), mixed port auto-detection.
-- **Rules** (`src/rules`): `DOMAIN`, `DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`, `IP-CIDR`,
-  `MATCH`, with `no-resolve` modifier.
-- **DNS** (`src/dns`): cached async forward resolver used for IP-CIDR matching.
+- **Rules** (`src/rules`): `DOMAIN`, `DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`,
+  `DOMAIN-REGEX`, `DOMAIN-WILDCARD`, `IP-CIDR`/`IP-CIDR6`, `IP-SUFFIX`,
+  `DST-PORT`, `GEOIP` (incl. `lan`), `GEOSITE`, `MATCH`, with `no-resolve`.
+- **Geodata** (`src/geo`): self-contained protobuf decoder for mihomo's
+  `geoip.dat` / `geosite.dat`, loaded from the config directory.
+- **DNS** (`src/dns`): cached async forward resolver used for IP-CIDR/GEOIP matching.
 - **Adapters** (`src/adapter`): `Outbound` trait. `DIRECT` and `REJECT` terminate
   connections; `Shadowsocks` AEAD terminates via `src/adapter/shadowsocks.rs`
   (AES-128/256-GCM, ChaCha20-Poly1305, XChaCha20-Poly1305; MD5 EVP-BytesToKey,
@@ -104,6 +107,7 @@ or `?token=<secret>`.
 | `listener/` (socks, http, mixed) | `src/inbound` | implemented |
 | `rules/` | `src/rules` | subset implemented |
 | `component/dns` | `src/dns` | simplified resolver |
+| `component/geodata/`, `rules/common/{geoip,geosite}.go` | `src/geo` | implemented (protobuf subset) |
 | `adapter/`, `adapter/outboundgroup/` | `src/adapter` | DIRECT/REJECT + groups |
 | `adapter/outbound/shadowsocks.go`, `transport/shadowsocks/shadowaead/` | `src/adapter/shadowsocks.rs` | implemented (AEAD subset) |
 | `adapter/outbound/trojan.go`, `transport/trojan/` | `src/adapter/trojan.rs`, `src/adapter/tls.rs` | implemented (TCP over TLS subset) |

@@ -4,12 +4,13 @@ pub mod adapter;
 pub mod common;
 pub mod config;
 pub mod dns;
+pub mod geo;
 pub mod hub;
 pub mod inbound;
 pub mod rules;
 pub mod tunnel;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -38,7 +39,8 @@ impl AppState {
     pub async fn reload(&self) -> anyhow::Result<()> {
         let path = self.config_path.read().await.clone();
         let config = Config::load(&path)?;
-        *self.engine.write().await = Arc::new(Engine::new(config, self.traffic.clone()));
+        let data_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        *self.engine.write().await = Arc::new(Engine::new(config, self.traffic.clone(), data_dir));
         tracing::info!("configuration reloaded from {}", path.display());
         Ok(())
     }
