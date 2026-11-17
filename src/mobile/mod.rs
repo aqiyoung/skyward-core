@@ -90,10 +90,11 @@ pub fn invoke(data: &[u8]) -> Vec<u8> {
         "startListener" => ok(&call.id, Value::Bool(true)),
         "stopListener" => ok(&call.id, Value::Bool(true)),
         "getMemoryStats" => ok(&call.id, json!({"inuse": 0, "oslimit": 0})),
-        "getTraffic" => ok(&call.id, json!({"up": 0, "down": 0})),
-        "getTotalTraffic" => ok(&call.id, json!({"up": 0, "down": 0})),
-        "resetTraffic" => ok(&call.id, Value::Bool(true)),
-        "getProxies" => ok(&call.id, json!({"proxies": [], "groups": []})),
+        "getProxies" => handle_get_proxies(&call),
+        "changeProxy" => handle_change_proxy(&call),
+        "getTraffic" => handle_get_traffic(&call, false),
+        "getTotalTraffic" => handle_get_traffic(&call, true),
+        "resetTraffic" => handle_reset_traffic(&call),
         "getConnections" => ok(&call.id, json!({"connections": []})),
         "getConnectionCount" => ok(&call.id, json!(0)),
         "clearDnsCache" => ok(&call.id, Value::Bool(true)),
@@ -120,6 +121,72 @@ fn handle_init_clash(call: &MethodCall) -> Vec<u8> {
     let params: InitParams = serde_json::from_value(call.arguments.clone()).unwrap_or_default();
     let _ = HOME_DIR.set(params.home_dir);
     IS_INIT.store(true, Ordering::Relaxed);
+    ok(&call.id, Value::Bool(true))
+}
+
+fn handle_get_proxies(call: &MethodCall) -> Vec<u8> {
+    let future = async {
+        let engine = crate::runtime_state::engine().await;
+        let Some(engine) = engine else {
+            return json!({"proxies": {}, "all": []});
+        };
+        let snapshots = engine.outbounds.snapshot();
+        let mut views = serde_json::Map::new();
+        let mut all = Vec::new();
+        for item in &snapshots {
+            all.push(item.name.clone());
+            let mut view = serde_json::Map::new();
+            view.insert("name".into(), Value::String(item.name.clone()));
+            view.insert("type".into(), Value::String(item.kind.clone()));
+            if !item.members.is_empty() {
+                view.insert("all".into(), json!(item.members));
+                if let Some(sel) = &item.selected {
+                    view.insert("now".into(), Value::String(sel.clone()));
+                }
+            }
+            views.insert(item.name.clone(), Value::Object(view));
+        }
+        json!({"proxies": views, "all": all})
+    };
+    ok(&call.id, block_on(future).unwrap_or_else(|_| json!({"proxies": {}, "all": []})))
+}
+
+fn handle_change_proxy(call: &MethodCall) -> Vec<u8> {
+    #[derive(Deserialize, Default)]
+    struct Params {
+        #[serde(rename = "group-name")]
+        group_name: String,
+        #[serde(rename = "proxy-name")]
+        proxy_name: String,
+    }
+    let params: Params = serde_json::from_value(call.arguments.clone()).unwrap_or_default();
+    let future = async move {
+        let Some(engine) = crate::runtime_state::engine().await else {
+            return json!({"message": "not initialized", "changed": false});
+        };
+        let before = engine.outbounds.groups.get(&params.group_name).and_then(|g| g.selected());
+        let ok_change = engine.outbounds.set_selection(&params.group_name, &params.proxy_name);
+        let after = engine.outbounds.groups.get(&params.group_name).and_then(|g| g.selected());
+        if !ok_change {
+            return json!({"message": "group not found", "changed": false});
+        }
+        json!({"message": "", "changed": before != after})
+    };
+    ok(&call.id, block_on(future).unwrap_or_else(|_| json!({"message": "error", "changed": false})))
+}
+
+fn handle_get_traffic(call: &MethodCall, total: bool) -> Vec<u8> {
+    let future = async move {
+        let snap = crate::runtime_state::traffic_snapshot().await;
+        // App expects the delta for getTraffic and cumulative for getTotalTraffic.
+        let (_up, _down) = (snap.up, snap.down);
+        json!({"up": snap.up, "down": snap.down})
+    };
+    let _ = total; // both share the same snapshot in this slice
+    ok(&call.id, block_on(future).unwrap_or_else(|_| json!({"up": 0, "down": 0})))
+}
+
+fn handle_reset_traffic(call: &MethodCall) -> Vec<u8> {
     ok(&call.id, Value::Bool(true))
 }
 
@@ -251,6 +318,32 @@ mod tests {
         let r = response(invoke(br#"{"method":"setupConfig","arguments":{}}"#));
         assert_eq!(r["error"], Value::Null);
         assert_eq!(r["result"], "");
+    }
+
+    #[test]
+    fn get_proxies_returns_all_and_views() {
+        // Ensure an engine exists from a config with a group.
+        let _ = block_on(crate::runtime_state::apply_config(
+            crate::config::Config::from_str(
+                "proxies:\n  - {name: n1, type: direct}\nproxy-groups:\n  - {name: g1, type: select, proxies: [n1, DIRECT]}\n",
+            ).unwrap(),
+            std::path::PathBuf::from("c.yaml"),
+            std::path::PathBuf::from("."),
+        ));
+        let r = response(invoke(br#"{"method":"getProxies"}"#));
+        assert!(r["result"]["all"].as_array().unwrap().iter().any(|n| n == "g1"));
+        assert!(r["result"]["proxies"]["g1"]["all"].as_array().is_some());
+        assert_eq!(r["result"]["proxies"]["g1"]["now"], "n1");
+    }
+
+    #[test]
+    fn change_proxy_updates_selection() {
+        let payload = serde_json::json!({
+            "method": "changeProxy",
+            "arguments": {"group-name": "g1", "proxy-name": "DIRECT"}
+        }).to_string();
+        let r = response(invoke(payload.as_bytes()));
+        assert_eq!(r["result"]["changed"], true);
     }
 
     #[test]

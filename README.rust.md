@@ -104,9 +104,10 @@ CLI flags mirror the Go binary where practical:
   16 native methods `Core.kt` calls, plus `ResultHandler`/`TunHandler` callbacks
   and event delivery from native threads. TUN returns `false` (smoltcp pending).
 - **Mobile protocol** (`src/mobile`): gomobile-compatible `invokeMethod` JSON
-  protocol (`MethodCall`/`MethodResponse`), with stateless/lifecycle methods
-  implemented (`coreVersion`, `getIsInit`, `initClash`, `shutdown`, …) and a
-  structured `not_implemented` error for the rest. Exposed via
+  protocol (`MethodCall`/`MethodResponse`). Implemented: lifecycle, `setupConfig`/
+  `updateConfig`, `getProxies` (nodes + groups from the live engine), `changeProxy`
+  (group selection), `getTraffic`/`getTotalTraffic` (real counters), `validateConfig`.
+  Remaining methods return a structured `not_implemented` error. Exposed via
   `skyward_invoke_method` for the App's JNI bridge.
 - **FFI** (`src/ffi`): C ABI (`cdylib`) with `skyward_create` / `apply_config` /
   `start_inbound` / `close_inbound` / `test_config` / `query_dns` / `set_hooks` /
