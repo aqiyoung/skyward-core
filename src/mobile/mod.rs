@@ -96,6 +96,10 @@ pub fn invoke(data: &[u8]) -> Vec<u8> {
         "getTraffic" => handle_get_traffic(&call, false),
         "getTotalTraffic" => handle_get_traffic(&call, true),
         "resetTraffic" => handle_reset_traffic(&call),
+        "getConfig" => handle_get_config(&call),
+        "getProfileBase" => handle_get_profile_base(&call),
+        "getProfileOutbounds" => handle_get_profile_outbounds(&call),
+        "getProxyDefinition" => handle_get_proxy_definition(&call),
         "getExternalProviders" => handle_external_providers(&call),
         "getExternalProvider" => handle_external_provider(&call),
         "updateDns" => handle_update_dns(&call),
@@ -282,6 +286,128 @@ fn handle_get_traffic(call: &MethodCall, total: bool) -> Vec<u8> {
 
 fn handle_reset_traffic(call: &MethodCall) -> Vec<u8> {
     ok(&call.id, Value::Bool(true))
+}
+
+fn handle_get_config(call: &MethodCall) -> Vec<u8> {
+    let path = call.arguments.as_str().map(str::to_string);
+    let future = async move {
+        crate::runtime_state::raw_config_json_at(&path.unwrap_or_default())
+            .or_else(|_| futures_block_on_raw())
+    };
+    // withFallible shape: result on success, error string on failure.
+    match block_on(future) {
+        Ok(Ok(value)) => ok(&call.id, value),
+        Ok(Err(e)) => fallible_err(&call.id, &e),
+        Err(e) => fallible_err(&call.id, &e),
+    }
+}
+
+fn futures_block_on_raw() -> Result<serde_json::Value, String> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let out = rt.block_on(crate::runtime_state::raw_config_json());
+        let _ = tx.send(out);
+    });
+    rx.recv().map_err(|_| "config read failed".to_string())?
+}
+
+fn fallible_err(id: &str, message: &str) -> Vec<u8> {
+    encode(MethodResponse {
+        id: id.to_string(),
+        result: Value::Null,
+        error: Some(MethodError {
+            code: "config_error".into(),
+            message: message.to_string(),
+            details: None,
+        }),
+    })
+}
+
+fn handle_get_profile_base(call: &MethodCall) -> Vec<u8> {
+    let path = call.arguments.as_str().unwrap_or("").to_string();
+    let future = async move {
+        let value = crate::runtime_state::raw_config_json_at(&path)
+            .or_else(|_| futures_block_on_raw())?;
+        let digest = sha256_hex(&value.to_string().into_bytes());
+        let proxies = value.get("proxies").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+        let groups = value.get("proxy-groups").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+        let rules = value.get("rules").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+        Ok::<_, String>(json!({
+            "config": value,
+            "digest": digest,
+            "match-rules": [],
+            "proxies": proxies,
+            "proxy-groups": groups,
+            "rules": rules,
+        }))
+    };
+    match block_on(future) {
+        Ok(v) => ok(&call.id, v),
+        Err(e) => fallible_err(&call.id, &e),
+    }
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(data);
+    hex_encode(&h.finalize())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const H: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(H[(b >> 4) as usize] as char);
+        out.push(H[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn handle_get_profile_outbounds(call: &MethodCall) -> Vec<u8> {
+    let path = call.arguments.as_str().unwrap_or("").to_string();
+    let future = async move {
+        let value = crate::runtime_state::raw_config_json_at(&path)
+            .or_else(|_| futures_block_on_raw())?;
+        let extract = |key: &str| -> Vec<serde_json::Value> {
+            value.get(key).and_then(|v| v.as_array()).map(|arr| arr.iter().map(|item| {
+                json!({
+                    "name": item.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                    "type": item.get("type").and_then(|v| v.as_str()).unwrap_or(""),
+                })
+            }).collect()).unwrap_or_default()
+        };
+        Ok::<_, String>(json!({
+            "proxies": extract("proxies"),
+            "proxy-groups": extract("proxy-groups"),
+        }))
+    };
+    match block_on(future) {
+        Ok(v) => ok(&call.id, v),
+        Err(e) => fallible_err(&call.id, &e),
+    }
+}
+
+fn handle_get_proxy_definition(call: &MethodCall) -> Vec<u8> {
+    let name = call.arguments.as_str().unwrap_or("").to_string();
+    let future = async move {
+        let value = match futures_block_on_raw() {
+            Ok(v) => v,
+            Err(e) => return fallible_err("", &e),
+        };
+        let find = |key: &str| -> Option<serde_json::Value> {
+            value.get(key).and_then(|v| v.as_array()).and_then(|arr| {
+                arr.iter().find(|item| item.get("name").and_then(|n| n.as_str()) == Some(&name)).cloned()
+            })
+        };
+        let result = find("proxies").or_else(|| find("proxy-groups")).unwrap_or(Value::Null);
+        Ok(result)
+    };
+    match block_on(future) {
+        Ok(v) => ok(&call.id, v),
+        Err(e) => fallible_err(&call.id, &e),
+    }
 }
 
 fn handle_external_providers(call: &MethodCall) -> Vec<u8> {
@@ -518,6 +644,27 @@ mod tests {
         }).to_string();
         let r = response(invoke(payload.as_bytes()));
         assert_eq!(r["result"]["changed"], true);
+    }
+
+    #[test]
+    fn get_config_and_profile_outbounds() {
+        let _guard = crate::runtime_state::TEST_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("skyward-cfg-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("c.yaml");
+        std::fs::write(&file, "proxies:\n  - {name: n1, type: ss, server: x, port: 1, cipher: aes-256-gcm, password: p}\nproxy-groups:\n  - {name: g1, type: select, proxies: [n1]}\nrules:\n  - MATCH,DIRECT\n").unwrap();
+        let path = file.to_string_lossy().to_string();
+
+        let payload = serde_json::json!({"method": "getConfig", "arguments": path}).to_string();
+        let r = response(invoke(payload.as_bytes()));
+        assert_eq!(r["error"], Value::Null);
+        assert!(r["result"]["proxies"].is_array());
+
+        let payload = serde_json::json!({"method": "getProfileOutbounds", "arguments": path}).to_string();
+        let r = response(invoke(payload.as_bytes()));
+        assert_eq!(r["result"]["proxies"][0]["name"], "n1");
+        assert_eq!(r["result"]["proxy-groups"][0]["name"], "g1");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -53,6 +53,24 @@ pub async fn traffic_snapshot() -> crate::common::TrafficSnapshot {
     traffic().snapshot()
 }
 
+pub async fn config_path() -> Option<PathBuf> {
+    CONFIG_PATH.read().await.clone()
+}
+
+/// Read the active config file and decode it to a JSON value (RawConfig shape).
+pub async fn raw_config_json() -> Result<serde_json::Value, String> {
+    let path = config_path().await.ok_or("no config applied")?;
+    let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let value: serde_json::Value = serde_yaml::from_str(&text).map_err(|e| e.to_string())?;
+    Ok(value)
+}
+
+/// Read a specific config file path and decode to JSON.
+pub fn raw_config_json_at(path: &str) -> Result<serde_json::Value, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    serde_yaml::from_str(&text).map_err(|e| e.to_string())
+}
+
 /// Test-only lock to serialize tests that mutate the global engine.
 #[cfg(test)]
 pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
