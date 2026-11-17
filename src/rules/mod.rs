@@ -10,6 +10,10 @@ use std::str::FromStr;
 use crate::common::TargetAddr;
 use crate::geo::GeoData;
 
+pub mod provider;
+
+use provider::ProviderRegistry;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleKind {
     Domain,
@@ -22,6 +26,7 @@ pub enum RuleKind {
     GeoIp,
     GeoSite,
     DstPort,
+    RuleSet,
     Match,
 }
 
@@ -35,6 +40,7 @@ pub struct Rule {
     net: Option<IpNet>,
     regex: Option<Regex>,
     port: Option<u16>,
+    provider: Option<String>,
 }
 
 fn wildcard_regex(pattern: &str) -> Option<Regex> {
@@ -80,6 +86,7 @@ impl Rule {
             "GEOIP" => RuleKind::GeoIp,
             "GEOSITE" => RuleKind::GeoSite,
             "DST-PORT" => RuleKind::DstPort,
+            "RULE-SET" => RuleKind::RuleSet,
             "MATCH" => RuleKind::Match,
             _ => return None,
         };
@@ -120,6 +127,7 @@ impl Rule {
             None
         };
 
+        let provider = if kind == RuleKind::RuleSet { Some(value.clone()) } else { None };
         Some(Self {
             kind,
             value,
@@ -129,10 +137,17 @@ impl Rule {
             net,
             regex,
             port,
+            provider,
         })
     }
 
-    pub fn matches(&self, addr: &TargetAddr, resolved: Option<IpAddr>, geo: Option<&GeoData>) -> bool {
+    pub fn matches(
+        &self,
+        addr: &TargetAddr,
+        resolved: Option<IpAddr>,
+        geo: Option<&GeoData>,
+        providers: Option<&ProviderRegistry>,
+    ) -> bool {
         match self.kind {
             RuleKind::Match => true,
             RuleKind::Domain => match addr {
@@ -192,6 +207,10 @@ impl Rule {
                 _ => false,
             },
             RuleKind::DstPort => self.port.map(|p| p == addr.port()).unwrap_or(false),
+            RuleKind::RuleSet => match (providers, geo, &self.provider) {
+                (Some(registry), Some(geo), Some(name)) => registry.matches(name, addr, resolved, geo),
+                _ => false,
+            },
         }
     }
 }
@@ -208,8 +227,14 @@ impl RuleSet {
         }
     }
 
-    pub fn find(&self, addr: &TargetAddr, resolved: Option<IpAddr>, geo: Option<&GeoData>) -> Option<&Rule> {
-        self.rules.iter().find(|r| r.matches(addr, resolved, geo))
+    pub fn find(
+        &self,
+        addr: &TargetAddr,
+        resolved: Option<IpAddr>,
+        geo: Option<&GeoData>,
+        providers: Option<&ProviderRegistry>,
+    ) -> Option<&Rule> {
+        self.rules.iter().find(|r| r.matches(addr, resolved, geo, providers))
     }
 }
 
@@ -224,9 +249,9 @@ mod tests {
             "MATCH,DIRECT".into(),
         ]);
         let hit = TargetAddr::Domain("cdn.example.com".into(), 443);
-        assert_eq!(set.find(&hit, None, None).unwrap().target, "proxy");
+        assert_eq!(set.find(&hit, None, None, None).unwrap().target, "proxy");
         let miss = TargetAddr::Domain("example.org".into(), 443);
-        assert_eq!(set.find(&miss, None, None).unwrap().target, "DIRECT");
+        assert_eq!(set.find(&miss, None, None, None).unwrap().target, "DIRECT");
     }
 
     #[test]
@@ -237,8 +262,8 @@ mod tests {
         ]);
         let ip: IpAddr = "192.168.1.20".parse().unwrap();
         let addr = TargetAddr::Domain("inside.local".into(), 80);
-        assert_eq!(set.find(&addr, Some(ip), None).unwrap().target, "DIRECT");
-        assert_eq!(set.find(&addr, None, None).unwrap().target, "REJECT");
+        assert_eq!(set.find(&addr, Some(ip), None, None).unwrap().target, "DIRECT");
+        assert_eq!(set.find(&addr, None, None, None).unwrap().target, "REJECT");
     }
 
     #[test]
@@ -256,11 +281,11 @@ mod tests {
             "MATCH,DIRECT".into(),
         ]);
         let a = TargetAddr::Domain("ads12.example.com".into(), 80);
-        assert_eq!(set.find(&a, None, None).unwrap().target, "REJECT");
+        assert_eq!(set.find(&a, None, None, None).unwrap().target, "REJECT");
         let b = TargetAddr::Domain("a.tracker.net".into(), 80);
-        assert_eq!(set.find(&b, None, None).unwrap().target, "REJECT");
+        assert_eq!(set.find(&b, None, None, None).unwrap().target, "REJECT");
         let c = TargetAddr::Domain("example.com".into(), 80);
-        assert_eq!(set.find(&c, None, None).unwrap().target, "DIRECT");
+        assert_eq!(set.find(&c, None, None, None).unwrap().target, "DIRECT");
     }
 
     #[test]
@@ -271,10 +296,10 @@ mod tests {
             "MATCH,REJECT".into(),
         ]);
         let port = TargetAddr::Domain("example.com".into(), 8080);
-        assert_eq!(set.find(&port, None, None).unwrap().target, "DIRECT");
+        assert_eq!(set.find(&port, None, None, None).unwrap().target, "DIRECT");
         let ip: IpAddr = "10.0.0.7".parse().unwrap();
         let addr = TargetAddr::Ip(ip, 443);
-        assert_eq!(set.find(&addr, None, None).unwrap().target, "proxy");
+        assert_eq!(set.find(&addr, None, None, None).unwrap().target, "proxy");
     }
 
     #[test]
@@ -282,8 +307,8 @@ mod tests {
         let set = RuleSet::new(&["GEOIP,lan,DIRECT".into(), "MATCH,REJECT".into()]);
         let lan: IpAddr = "192.168.1.1".parse().unwrap();
         let wan: IpAddr = "8.8.8.8".parse().unwrap();
-        assert_eq!(set.find(&TargetAddr::Ip(lan, 80), None, None).unwrap().target, "DIRECT");
-        assert_eq!(set.find(&TargetAddr::Ip(wan, 80), None, None).unwrap().target, "REJECT");
+        assert_eq!(set.find(&TargetAddr::Ip(lan, 80), None, None, None).unwrap().target, "DIRECT");
+        assert_eq!(set.find(&TargetAddr::Ip(wan, 80), None, None, None).unwrap().target, "REJECT");
     }
 
     fn pb_varint(mut v: u64) -> Vec<u8> {
@@ -322,7 +347,25 @@ mod tests {
         let data = GeoData::load(&dir);
         let set = RuleSet::new(&["GEOSITE,cn,proxy".into(), "MATCH,DIRECT".into()]);
         let target = TargetAddr::Domain("www.example.cn".into(), 80);
-        assert_eq!(set.find(&target, None, Some(&data)).unwrap().target, "proxy");
+        assert_eq!(set.find(&target, None, Some(&data), None).unwrap().target, "proxy");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rule_set_uses_provider_registry() {
+        use provider::{Behavior, ProviderRegistry, RuleProvider};
+
+        let mut registry = ProviderRegistry::default();
+        registry.insert(RuleProvider::new(
+            "ads".into(),
+            Behavior::Domain,
+            vec!["ads.example.com".into()],
+        ));
+        let geo = GeoData::default();
+        let set = RuleSet::new(&["RULE-SET,ads,REJECT".into(), "MATCH,DIRECT".into()]);
+        let target = TargetAddr::Domain("cdn.ads.example.com".into(), 80);
+        assert_eq!(set.find(&target, None, Some(&geo), Some(&registry)).unwrap().target, "REJECT");
+        let clean = TargetAddr::Domain("example.com".into(), 80);
+        assert_eq!(set.find(&clean, None, Some(&geo), Some(&registry)).unwrap().target, "DIRECT");
     }
 }

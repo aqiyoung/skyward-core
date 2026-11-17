@@ -61,7 +61,9 @@ CLI flags mirror the Go binary where practical:
   (CONNECT + absolute-form with origin-form rewrite), mixed port auto-detection.
 - **Rules** (`src/rules`): `DOMAIN`, `DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`,
   `DOMAIN-REGEX`, `DOMAIN-WILDCARD`, `IP-CIDR`/`IP-CIDR6`, `IP-SUFFIX`,
-  `DST-PORT`, `GEOIP` (incl. `lan`), `GEOSITE`, `MATCH`, with `no-resolve`.
+  `DST-PORT`, `GEOIP` (incl. `lan`), `GEOSITE`, `RULE-SET`, `MATCH`, with
+  `no-resolve`. Rule providers (`src/rules/provider.rs`) support file/inline/http(s)
+  vehicles, yaml/text payloads and the domain/ipcidr/classical behaviors.
 - **Geodata** (`src/geo`): self-contained protobuf decoder for mihomo's
   `geoip.dat` / `geosite.dat`, loaded from the config directory.
 - **DNS** (`src/dns`): cached async forward resolver used for IP-CIDR/GEOIP matching.
@@ -90,6 +92,7 @@ CLI flags mirror the Go binary where practical:
 | GET | `/configs` | config summary and counts |
 | GET | `/proxies` | outbound/group snapshot, including group selections |
 | GET | `/rules` | active rules |
+| GET | `/providers/rule` | loaded rule providers and entry counts |
 | GET | `/traffic` | cumulative `{up, down}` bytes |
 | PUT | `/mode?name=<rule\|direct\|global>` | switch mode |
 | PUT | `/proxies/<group>?name=<member>` | select a group member |

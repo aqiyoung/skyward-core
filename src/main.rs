@@ -116,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
 
     let traffic = Arc::new(TrafficStats::default());
     let data_dir = config_path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf();
-    let engine = Engine::new(config, traffic.clone(), &data_dir);
+    let engine = Engine::new(config, traffic.clone(), &data_dir).await;
     let state = Arc::new(AppState::new(engine, config_path.clone(), traffic));
 
     tracing::info!("skyward-core (rust) {} starting", VERSION);

@@ -80,6 +80,11 @@ async fn route(req: Request<Body>, state: Arc<AppState>) -> Response<Body> {
             json(StatusCode::OK, serde_json::json!(engine.outbounds.snapshot()))
         }
 
+        (Method::GET, "/providers/rule") => {
+            let engine = state.engine.read().await;
+            json(StatusCode::OK, serde_json::json!(engine.providers.snapshot()))
+        }
+
         (Method::GET, "/rules") => {
             let engine = state.engine.read().await;
             let rules: Vec<&str> = engine.rules.rules.iter().map(|r| r.raw.as_str()).collect();

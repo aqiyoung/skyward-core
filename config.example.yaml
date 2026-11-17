@@ -75,7 +75,25 @@ proxy-groups:
     url: "http://www.gstatic.com/generate_204"
     interval: 300
 
+rule-providers:
+  # Inline providers need no external file.
+  ads-inline:
+    type: inline
+    behavior: domain
+    payload:
+      - ads.example.com
+      - tracker.example.net
+  # file/http providers read a yaml (payload:) or text payload.
+  # remote-ads:
+  #   type: http
+  #   behavior: classical
+  #   format: yaml
+  #   url: https://example.com/ruleset.yaml
+  #   path: ./rulesets/remote-ads.yaml
+  #   interval: 86400
+
 rules:
+  - RULE-SET,ads-inline,REJECT
   # GEOIP/GEOSITE read geoip.dat / geosite.dat from the config directory.
   - GEOSITE,cn,DIRECT
   - GEOIP,lan,DIRECT

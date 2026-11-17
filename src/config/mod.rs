@@ -1,6 +1,7 @@
 //! Deserialization of the mihomo-compatible YAML configuration.
 
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::Path;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -27,6 +28,8 @@ pub struct Config {
     pub proxies: Vec<ProxyDef>,
     #[serde(rename = "proxy-groups")]
     pub proxy_groups: Vec<ProxyGroupDef>,
+    #[serde(rename = "rule-providers")]
+    pub rule_providers: HashMap<String, RuleProviderDef>,
     pub rules: Vec<String>,
     pub dns: Option<DnsConfig>,
 }
@@ -45,6 +48,7 @@ impl Default for Config {
             secret: String::new(),
             proxies: Vec::new(),
             proxy_groups: Vec::new(),
+            rule_providers: HashMap::new(),
             rules: Vec::new(),
             dns: None,
         }
@@ -77,6 +81,34 @@ pub struct ProxyGroupDef {
     pub proxies: Vec<String>,
     pub url: Option<String>,
     pub interval: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RuleProviderDef {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub behavior: String,
+    pub path: Option<String>,
+    pub url: Option<String>,
+    pub format: Option<String>,
+    pub interval: Option<u64>,
+    #[serde(default)]
+    pub payload: Vec<String>,
+}
+
+impl Default for RuleProviderDef {
+    fn default() -> Self {
+        Self {
+            kind: String::new(),
+            behavior: "classical".to_string(),
+            path: None,
+            url: None,
+            format: None,
+            interval: None,
+            payload: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

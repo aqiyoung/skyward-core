@@ -39,7 +39,10 @@ or `rustls`), a `TLS` connector abstraction, and a UUID/TLV codec layer.
 - [x] GEOIP / GEOSITE via mihomo's protobuf `geoip.dat` / `geosite.dat`
   (self-contained decoder in `src/geo`), including `GEOIP,lan`
 - [x] More rule types: `DOMAIN-REGEX`, `DOMAIN-WILDCARD`, `IP-SUFFIX`, `DST-PORT`
-- [ ] RULE-SET providers (yaml/text/mrs) and remote provider updates
+- [x] RULE-SET providers — file/inline/http(s), yaml/text payloads, three
+  behaviors (`src/rules/provider.rs`). MRS binary format and periodic refresh
+  are not implemented yet.
+- [ ] MRS provider format, periodic refresh and ETag
 - [ ] MMDB fallback for `GEOIP` when `.dat` files are absent
 - [ ] PROCESS-NAME / PROCESS-PATH, ASN and source-address rules (need metadata)
 - [ ] Logic rules (`AND`/`OR`/`NOT`), `SUB-RULE`, `REMATCH-NAME`

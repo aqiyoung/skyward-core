@@ -40,7 +40,7 @@ impl AppState {
         let path = self.config_path.read().await.clone();
         let config = Config::load(&path)?;
         let data_dir = path.parent().unwrap_or_else(|| Path::new("."));
-        *self.engine.write().await = Arc::new(Engine::new(config, self.traffic.clone(), data_dir));
+        *self.engine.write().await = Arc::new(Engine::new(config, self.traffic.clone(), data_dir).await);
         tracing::info!("configuration reloaded from {}", path.display());
         Ok(())
     }
