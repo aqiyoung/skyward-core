@@ -12,7 +12,7 @@ use std::ffi::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::ptr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
@@ -103,7 +103,7 @@ pub struct SkywardRuntime {
 /// Opaque handle returned by `skyward_create` and consumed by every other call.
 pub struct SkywardHandle(SkywardRuntime);
 
-fn with<F, R>(handle: *mut SkywardHandle, f: F) -> SkywardStatus
+fn with<F>(handle: *mut SkywardHandle, f: F) -> SkywardStatus
 where
     F: FnOnce(&SkywardRuntime) -> Result<(), SkywardStatus>,
 {
