@@ -1,0 +1,10 @@
+# Minimal config for the end-to-end smoke test. Ports are deliberately
+# unusual to avoid colliding with anything on the runner.
+port: 17890
+socks-port: 17891
+allow-lan: false
+mode: rule
+log-level: info
+external-controller: 127.0.0.1:19090
+rules:
+  - MATCH,DIRECT

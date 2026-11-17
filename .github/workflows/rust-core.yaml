@@ -13,6 +13,8 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "src/**"
+      - "tests/smoke/**"
+      - "scripts/smoke.sh"
       - ".github/workflows/rust-core.yaml"
   pull_request:
     branches:
@@ -55,6 +57,9 @@ jobs:
         run: |
           ./target/release/skyward-core --version
           ./target/release/skyward-core -c config.example.yaml -t
+
+      - name: End-to-end proxy smoke test
+        run: bash scripts/smoke.sh ./target/release/skyward-core
 
       - name: Upload release binary
         uses: actions/upload-artifact@v4

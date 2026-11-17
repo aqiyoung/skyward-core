@@ -30,5 +30,7 @@ rust/tools/                  appendix verification script
 
 Nothing is built locally. Pushes to this branch trigger
 [`.github/workflows/rust-core.yaml`](.github/workflows/rust-core.yaml), which runs
-tests, a locked release build and a CLI smoke test on a GitHub runner, then
-uploads the binary as an artifact.
+tests, a locked release build, and an end-to-end smoke test
+([`scripts/smoke.sh`](scripts/smoke.sh): real curl traffic through the SOCKS5 and
+HTTP inbounds plus REST endpoint checks) on a GitHub runner, then uploads the
+binary as an artifact.
