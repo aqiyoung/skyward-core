@@ -138,6 +138,15 @@ impl Engine {
         outbound.connect(target).await
     }
 
+    /// Dial a target through a specific outbound/group name (used by delay tests).
+    pub async fn dial_named(&self, name: &str, target: &TargetAddr) -> io::Result<BoxedStream> {
+        let final_name = self.outbounds.resolve(name).await;
+        let outbound = self.outbounds.outbound(&final_name).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("unknown outbound '{}'", final_name))
+        })?;
+        outbound.connect(target).await
+    }
+
     /// Drive a single inbound connection to completion. `prefix` carries bytes
     /// already consumed from the inbound during handshakes (e.g. an HTTP head).
     pub async fn handle(&self, target: TargetAddr, inbound: TcpStream, prefix: &[u8]) -> io::Result<()> {

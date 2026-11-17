@@ -92,11 +92,15 @@ pub fn invoke(data: &[u8]) -> Vec<u8> {
         "getMemoryStats" => ok(&call.id, json!({"inuse": 0, "oslimit": 0})),
         "getProxies" => handle_get_proxies(&call),
         "changeProxy" => handle_change_proxy(&call),
+        "asyncTestDelay" => handle_test_delay(&call),
         "getTraffic" => handle_get_traffic(&call, false),
         "getTotalTraffic" => handle_get_traffic(&call, true),
         "resetTraffic" => handle_reset_traffic(&call),
-        "getConnections" => ok(&call.id, json!({"connections": []})),
-        "getConnectionCount" => ok(&call.id, json!(0)),
+        "getConnections" => handle_get_connections(&call),
+        "getConnectionCount" => handle_connection_count(&call),
+        "closeConnections" => handle_close_connections(&call),
+        "resetConnections" => handle_close_connections(&call),
+        "closeConnection" => handle_close_connection(&call),
         "clearDnsCache" => ok(&call.id, Value::Bool(true)),
         "validateConfig" => handle_validate_config(&call),
         "setupConfig" => handle_setup_config(&call),
@@ -175,6 +179,93 @@ fn handle_change_proxy(call: &MethodCall) -> Vec<u8> {
     ok(&call.id, block_on(future).unwrap_or_else(|_| json!({"message": "error", "changed": false})))
 }
 
+fn handle_test_delay(call: &MethodCall) -> Vec<u8> {
+    #[derive(Deserialize, Default)]
+    struct Params {
+        #[serde(rename = "proxy-name")]
+        proxy_name: String,
+        #[serde(rename = "test-url")]
+        test_url: String,
+        timeout: i64,
+    }
+    let params: Params = serde_json::from_value(call.arguments.clone()).unwrap_or_default();
+    let name = params.proxy_name.clone();
+    let url = if params.test_url.is_empty() {
+        "http://www.gstatic.com/generate_204".to_string()
+    } else {
+        params.test_url.clone()
+    };
+    let timeout_ms = if params.timeout > 0 { params.timeout } else { 5000 };
+    let future = async move {
+        let engine = match crate::runtime_state::engine().await {
+            Some(e) => e,
+            None => {
+                return json!({"url": url, "name": name, "value": -2, "message": "not initialized"});
+            }
+        };
+        let delay = measure_delay(&engine, &name, &url, timeout_ms).await;
+        match delay {
+            Some(ms) => json!({"url": url, "name": name, "value": ms}),
+            None => json!({"url": url, "name": name, "value": -2, "message": "connect failed"}),
+        }
+    };
+    ok(&call.id, block_on(future).unwrap_or_else(|_| json!({"value": -2})))
+}
+
+async fn measure_delay(
+    engine: &std::sync::Arc<crate::tunnel::Engine>,
+    name: &str,
+    url: &str,
+    timeout_ms: i64,
+) -> Option<i32> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let rest = url.strip_prefix("http://")?;
+    let authority = rest.split('/').next()?;
+    let host = authority.split(':').next()?;
+    let port: u16 = authority.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(80);
+    let target = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => crate::common::TargetAddr::Ip(ip, port),
+        Err(_) => crate::common::TargetAddr::Domain(host.to_string(), port),
+    };
+    let path = format!("/{}", rest.split_once('/').map(|(_, p)| p).unwrap_or(""));
+
+    let dial = engine.dial_named(name, &target);
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms as u64),
+        dial,
+    )
+    .await
+    .ok()?
+    .ok()?;
+
+    let start = std::time::Instant::now();
+    let request = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", path, authority);
+    tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms as u64),
+        stream.write_all(request.as_bytes()),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms as u64),
+        stream.read(&mut buf),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if n == 0 {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&buf[..n]);
+    if text.contains(" 200 ") || text.contains(" 204 ") {
+        Some(start.elapsed().as_millis() as i32)
+    } else {
+        None
+    }
+}
+
 fn handle_get_traffic(call: &MethodCall, total: bool) -> Vec<u8> {
     let future = async move {
         let snap = crate::runtime_state::traffic_snapshot().await;
@@ -188,6 +279,48 @@ fn handle_get_traffic(call: &MethodCall, total: bool) -> Vec<u8> {
 
 fn handle_reset_traffic(call: &MethodCall) -> Vec<u8> {
     ok(&call.id, Value::Bool(true))
+}
+
+fn handle_get_connections(call: &MethodCall) -> Vec<u8> {
+    let future = async {
+        match crate::runtime_state::engine().await {
+            Some(engine) => engine.connections.snapshot_json().await,
+            None => json!({"uploadTotal": 0, "downloadTotal": 0, "connections": [], "memory": 0}),
+        }
+    };
+    ok(&call.id, block_on(future).unwrap_or_else(|_| json!({"connections": []})))
+}
+
+fn handle_connection_count(call: &MethodCall) -> Vec<u8> {
+    let future = async {
+        match crate::runtime_state::engine().await {
+            Some(engine) => engine.connections.count().await,
+            None => 0,
+        }
+    };
+    ok(&call.id, json!(block_on(future).unwrap_or(0)))
+}
+
+fn handle_close_connections(call: &MethodCall) -> Vec<u8> {
+    let future = async {
+        match crate::runtime_state::engine().await {
+            Some(engine) => { engine.connections.close_all().await; }
+            None => {}
+        }
+    };
+    let _ = block_on(future);
+    ok(&call.id, Value::Bool(true))
+}
+
+fn handle_close_connection(call: &MethodCall) -> Vec<u8> {
+    let id = call.arguments.as_str().unwrap_or("").to_string();
+    let future = async {
+        match crate::runtime_state::engine().await {
+            Some(engine) => engine.connections.close(&id).await,
+            None => false,
+        }
+    };
+    ok(&call.id, Value::Bool(block_on(future).unwrap_or(false)))
 }
 
 fn handle_setup_config(call: &MethodCall) -> Vec<u8> {
@@ -355,6 +488,15 @@ mod tests {
         }).to_string();
         let r = response(invoke(payload.as_bytes()));
         assert_eq!(r["result"]["changed"], true);
+    }
+
+    #[test]
+    fn get_connections_returns_snapshot_shape() {
+        let _guard = crate::runtime_state::TEST_LOCK.lock().unwrap();
+        let r = response(invoke(br#"{"method":"getConnections"}"#));
+        assert!(r["result"]["connections"].is_array());
+        assert!(r["result"].get("uploadTotal").is_some());
+        assert!(r["result"].get("downloadTotal").is_some());
     }
 
     #[test]

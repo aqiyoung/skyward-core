@@ -115,6 +115,36 @@ impl ConnectionTracker {
         items.sort_by_key(|i| i.start);
         items
     }
+
+    /// Go-compatible `statistic.Snapshot` shape for the App's connection page.
+    pub async fn snapshot_json(&self) -> serde_json::Value {
+        let items = self.snapshot().await;
+        let upload_total: u64 = items.iter().map(|i| i.upload).sum();
+        let download_total: u64 = items.iter().map(|i| i.download).sum();
+        serde_json::json!({
+            "uploadTotal": upload_total,
+            "downloadTotal": download_total,
+            "connections": items,
+            "memory": 0,
+        })
+    }
+
+    pub async fn count(&self) -> usize {
+        self.entries.read().await.len()
+    }
+
+    /// Close a connection by id. Returns false when it does not exist.
+    pub async fn close(&self, id: &str) -> bool {
+        let Ok(numeric) = id.parse::<u64>() else { return false };
+        self.entries.write().await.remove(&numeric).is_some()
+    }
+
+    pub async fn close_all(&self) -> usize {
+        let mut entries = self.entries.write().await;
+        let count = entries.len();
+        entries.clear();
+        count
+    }
 }
 
 #[cfg(test)]
