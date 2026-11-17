@@ -314,7 +314,7 @@ fn handle_close_connections(call: &MethodCall) -> Vec<u8> {
 
 fn handle_close_connection(call: &MethodCall) -> Vec<u8> {
     let id = call.arguments.as_str().unwrap_or("").to_string();
-    let future = async {
+    let future = async move {
         match crate::runtime_state::engine().await {
             Some(engine) => engine.connections.close(&id).await,
             None => false,
