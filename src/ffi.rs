@@ -331,6 +331,41 @@ pub extern "C" fn skyward_emit_event(handle: *mut SkywardHandle, json: *const u8
     });
 }
 
+/// Invoke a gomobile-style method call. Returns a heap-allocated JSON buffer
+/// that the caller must free with `skyward_free_buffer`. `out_len` receives the
+/// byte length.
+#[no_mangle]
+pub extern "C" fn skyward_invoke_method(
+    data: *const u8,
+    len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    if data.is_null() || out_len.is_null() {
+        return ptr::null_mut();
+    }
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let input = unsafe { std::slice::from_raw_parts(data, len) };
+        crate::mobile::invoke(input)
+    }));
+    let bytes = result.unwrap_or_else(|_| b"{}".to_vec());
+    unsafe { *out_len = bytes.len(); }
+    let mut boxed = bytes.into_boxed_slice();
+    let ptr = boxed.as_mut_ptr();
+    std::mem::forget(boxed);
+    ptr
+}
+
+/// Free a buffer returned by `skyward_invoke_method`.
+#[no_mangle]
+pub extern "C" fn skyward_free_buffer(ptr: *mut u8, len: usize) {
+    if ptr.is_null() {
+        return;
+    }
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+        drop(Vec::from_raw_parts(ptr, len, len));
+    }));
+}
+
 #[no_mangle]
 pub extern "C" fn skyward_destroy(handle: *mut SkywardHandle) {
     if handle.is_null() {
@@ -392,6 +427,20 @@ mod tests {
         );
 
         skyward_destroy(handle);
+    }
+
+    #[test]
+    fn invoke_method_roundtrip() {
+        let input = br#"{"id":"1","method":"coreVersion"}"#;
+        let mut len = 0usize;
+        let buf = skyward_invoke_method(input.as_ptr(), input.len(), &mut len);
+        assert!(!buf.is_null());
+        assert!(len > 0);
+        let text = unsafe { std::slice::from_raw_parts(buf, len) };
+        let value: serde_json::Value = serde_json::from_slice(text).unwrap();
+        assert_eq!(value["id"], "1");
+        assert!(value["result"].as_str().unwrap().starts_with("clash.meta/"));
+        skyward_free_buffer(buf, len);
     }
 
     #[test]

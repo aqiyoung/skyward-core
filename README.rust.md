@@ -89,6 +89,11 @@ CLI flags mirror the Go binary where practical:
   latency.
 - **Tunnel** (`src/tunnel`): mode dispatch (`rule`/`direct`/`global`), rule lookup,
   outbound resolution, bidirectional relay with upload/download counters.
+- **Mobile protocol** (`src/mobile`): gomobile-compatible `invokeMethod` JSON
+  protocol (`MethodCall`/`MethodResponse`), with stateless/lifecycle methods
+  implemented (`coreVersion`, `getIsInit`, `initClash`, `shutdown`, …) and a
+  structured `not_implemented` error for the rest. Exposed via
+  `skyward_invoke_method` for the App's JNI bridge.
 - **FFI** (`src/ffi`): C ABI (`cdylib`) with `skyward_create` / `apply_config` /
   `start_inbound` / `close_inbound` / `test_config` / `query_dns` / `set_hooks` /
   `destroy`. Every entry point catches panics; strings are `(ptr, len)`; the

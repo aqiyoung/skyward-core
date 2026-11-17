@@ -80,6 +80,10 @@ or `rustls`), a `TLS` connector abstraction, and a UUID/TLV codec layer.
 - [x] C ABI cdylib — create/apply_config/start/close/test_config/query_dns/
   set_hooks/destroy, panic-safe entries, `(ptr,len)` strings, Tokio runtime per
   handle (`src/ffi.rs`). TUN packet injection returns NotImplemented.
+- [ ] gomobile `invokeMethod` bridge for the Flutter App (`src/mobile.rs`):
+  [x] JSON protocol + stateless/lifecycle methods + `skyward_invoke_method` FFI;
+  [ ] remaining ~45 methods; [ ] JNI `Mobile` class + callbacks;
+  [ ] TUN (smoltcp) required before the App can fully run on the Rust core.
 
 ## Phase 6 — controller & operations
 
