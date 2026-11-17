@@ -211,7 +211,12 @@ fn resolve_path(path: &str, data_dir: &Path) -> std::path::PathBuf {
 fn parse_payload(raw: &[u8], format: &str) -> Vec<String> {
     let text = String::from_utf8_lossy(raw);
     if format == "text" {
-        return text.lines().map(str::to_string).collect();
+        return text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with("//"))
+            .map(str::to_string)
+            .collect();
     }
     let mut lines = Vec::new();
     let mut in_payload = false;
@@ -341,8 +346,7 @@ mod tests {
     fn parses_text_payload() {
         let raw = b"# comment\nexample.com\n// premium comment\n.ads.example.com\n\n";
         let lines = parse_payload(raw, "text");
-        assert_eq!(lines.len(), 4);
-        assert_eq!(lines[1], "example.com");
+        assert_eq!(lines, vec!["example.com", ".ads.example.com"]);
     }
 
     #[test]
