@@ -75,6 +75,12 @@ or `rustls`), a `TLS` connector abstraction, and a UUID/TLV codec layer.
 - [ ] Interface binding, routing marks, dialer options
 - [ ] Automatic iptables/nftables rule management
 
+## Phase 7 — FFI & application integration
+
+- [x] C ABI cdylib — create/apply_config/start/close/test_config/query_dns/
+  set_hooks/destroy, panic-safe entries, `(ptr,len)` strings, Tokio runtime per
+  handle (`src/ffi.rs`). TUN packet injection returns NotImplemented.
+
 ## Phase 6 — controller & operations
 
 - [x] `/connections` live listing and WebSocket `/traffic` stream (1 Hz)

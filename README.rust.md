@@ -89,6 +89,10 @@ CLI flags mirror the Go binary where practical:
   latency.
 - **Tunnel** (`src/tunnel`): mode dispatch (`rule`/`direct`/`global`), rule lookup,
   outbound resolution, bidirectional relay with upload/download counters.
+- **FFI** (`src/ffi`): C ABI (`cdylib`) with `skyward_create` / `apply_config` /
+  `start_inbound` / `close_inbound` / `test_config` / `query_dns` / `set_hooks` /
+  `destroy`. Every entry point catches panics; strings are `(ptr, len)`; the
+  handle owns a Tokio runtime. TUN packet injection returns `NotImplemented`.
 - **Hub** (`src/hub`): REST controller with optional bearer/token auth, `/connections`
   listing backed by a live connection registry, and a WebSocket `/traffic` stream
   (delta + cumulative bytes, 1 Hz) implemented with a minimal RFC 6455 server.

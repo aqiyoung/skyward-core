@@ -17,9 +17,9 @@ branch and is intentionally not present here.
 ## Layout
 
 ```
-Cargo.toml / Cargo.lock     Rust crate and locked dependencies
+Cargo.toml / Cargo.lock     Rust crate and locked dependencies (rlib + cdylib)
 src/                         kernel implementation (config, inbound, rules,
-                             dns, adapters, tunnel, REST hub)
+                             dns, adapters, tunnel, REST hub, C FFI)
 config.example.yaml          mihomo-compatible example configuration
 rust/docs/                   design and migration documents
 rust/tools/                  appendix verification script

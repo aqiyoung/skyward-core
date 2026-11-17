@@ -5,6 +5,10 @@ edition = "2021"
 description = "Rust rewrite of the skyward proxy kernel (mihomo-compatible core)"
 license = "GPL-3.0-only"
 
+[lib]
+name = "skyward_core"
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
