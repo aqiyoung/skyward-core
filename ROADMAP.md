@@ -27,7 +27,8 @@ Each protocol becomes an `Outbound` implementation in `src/adapter/`, keyed by
 - [x] Trojan over TLS — SHA-224 auth header, SNI override (`sni`)
 - [x] HTTP proxy outbound — CONNECT + optional Basic auth, optional TLS
 - [x] SOCKS5 proxy outbound — RFC 1928 + optional user/pass, optional TLS
-- [ ] Snell
+- [x] Snell v1–v3 — Argon2 KDF, shadowaead framing, CONNECT header/reply
+  (`src/adapter/snell.rs`). v4/v6 record layers and UDP remain out of scope.
 - [ ] Hysteria / Hysteria2, TUIC — UDP-capable transports
 - [ ] WireGuard / AmneziaWG (`adapter/outbound/wireguard`)
 

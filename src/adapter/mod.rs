@@ -21,6 +21,7 @@ use crate::config::{Config, ProxyDef};
 pub mod http_proxy;
 pub mod provider;
 pub mod shadowsocks;
+pub mod snell;
 pub mod socks5;
 pub mod tls;
 pub mod trojan;
@@ -29,6 +30,7 @@ pub mod vmess;
 
 use http_proxy::HttpOutbound;
 use shadowsocks::ShadowsocksOutbound;
+use snell::SnellOutbound;
 use socks5::Socks5Outbound;
 use trojan::TrojanOutbound;
 use vless::VlessOutbound;
@@ -188,6 +190,25 @@ pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
                         .unwrap_or_else(|| Arc::new(UnimplementedOutbound {
                             name: def.name.clone(),
                             kind: "socks5 (invalid config)".into(),
+                        }))
+                }
+                "snell" => {
+                    let made = match (def.server.as_deref(), def.port, def.psk.as_deref().or(def.password.as_deref())) {
+                        (Some(server), Some(port), Some(psk)) => SnellOutbound::try_new(
+                            &def.name,
+                            server,
+                            port,
+                            psk,
+                            def.version.unwrap_or(1),
+                            def.tls.unwrap_or(false),
+                            def.sni.as_deref().or(def.server_name.as_deref()),
+                        ),
+                        _ => None,
+                    };
+                    made.map(|o| Arc::new(o) as Arc<dyn Outbound>)
+                        .unwrap_or_else(|| Arc::new(UnimplementedOutbound {
+                            name: def.name.clone(),
+                            kind: "snell (invalid config or unsupported version)".into(),
                         }))
                 }
                 "ss" | "shadowsocks" => {

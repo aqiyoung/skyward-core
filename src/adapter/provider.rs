@@ -234,6 +234,8 @@ mod tests {
             port: None,
             cipher: None,
             password: None,
+            psk: None,
+            version: None,
             username: None,
             uuid: None,
             sni: None,

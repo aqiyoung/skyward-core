@@ -53,6 +53,12 @@ proxies:
     uuid: b831381d-6324-4d53-ad4f-8cda48b30811
     cipher: auto          # aes-128-gcm / chacha20-poly1305
     tls: true
+  - name: "snell-demo"
+    type: snell
+    server: example.com
+    port: 443
+    psk: "password"
+    version: 1            # 1 (chacha20), 2/3 (aes-128-gcm)
   - name: "http-demo"
     type: http
     server: proxy.example.com
