@@ -210,14 +210,16 @@ async fn http_probe(
     };
     let path = format!("/{}", rest.split_once('/').map(|(_, p)| p).unwrap_or(""));
     let engine = crate::runtime_state::engine().await?;
-    let dial = if name.is_empty() {
-        engine.dial(&target)
-    } else {
-        engine.dial_named(name, &target)
+    let dial_future = async {
+        if name.is_empty() {
+            engine.dial(&target).await
+        } else {
+            engine.dial_named(name, &target).await
+        }
     };
     let mut stream = tokio::time::timeout(
         std::time::Duration::from_millis(timeout_ms.max(1) as u64),
-        dial,
+        dial_future,
     )
     .await.ok()?.ok()?;
     let start = std::time::Instant::now();
