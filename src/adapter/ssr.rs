@@ -12,6 +12,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use aes::cipher::BlockEncrypt;
+use aes_gcm::KeyInit;
 use aes::{Aes128, Aes192, Aes256, Block};
 use async_trait::async_trait;
 use chacha20::cipher::{KeyIvInit, StreamCipher as _};
@@ -40,7 +41,7 @@ fn kdf(password: &[u8], key_len: usize) -> Vec<u8> {
     out
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CipherKind {
     Rc4Md5,
     Aes128Cfb,
@@ -273,19 +274,18 @@ impl AsyncRead for SsrStream {
             }
         }
 
-        let before = buf.remaining();
-        let unfilled = buf.initialize_unfilled();
-        match Pin::new(&mut this.inner).poll_read(cx, unfilled) {
+        // Allocate a temporary buffer, read into it, then decrypt into the
+        // caller's ReadBuf. Avoids aliasing between initialize_unfilled and
+        // filled_mut.
+        let mut scratch = vec![0u8; buf.remaining().max(1)];
+        let mut rb = ReadBuf::new(&mut scratch);
+        match Pin::new(&mut this.inner).poll_read(cx, &mut rb) {
             Poll::Ready(Ok(())) => {
-                let n = before - buf.remaining();
-                let filled = buf.filled_mut();
-                let start = filled.len() - n;
-                if start > 0 {
-                    filled.copy_within(start.., 0);
-                }
+                let n = rb.filled().len();
                 if let Some(dec) = &mut this.dec {
-                    dec.apply(&mut filled[..n]);
+                    dec.apply(&mut scratch[..n]);
                 }
+                buf.put_slice(&scratch[..n]);
                 Poll::Ready(Ok(()))
             }
             other => other,
