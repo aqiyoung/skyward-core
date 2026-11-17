@@ -90,8 +90,8 @@ pub fn device_from_fd(fd: i32, mtu: usize) -> io::Result<TunDevice<OwnedFd>> {
     Ok(TunDevice::new(owned, mtu))
 }
 
-struct FdRx(Vec<u8>);
-struct FdTx<T>(T);
+pub struct FdRx(pub Vec<u8>);
+pub struct FdTx<T>(pub T);
 
 impl RxToken for FdRx {
     fn consume<R, F>(mut self, f: F) -> R
