@@ -25,6 +25,8 @@ Each protocol becomes an `Outbound` implementation in `src/adapter/`, keyed by
 - [x] VMess AEAD — AES-128-GCM / ChaCha20-Poly1305, nested-HMAC KDF, encrypted
   header/body (`src/adapter/vmess.rs`). Legacy auth, UDP, WS/H2 wrappers remain out.
 - [x] Trojan over TLS — SHA-224 auth header, SNI override (`sni`)
+- [x] HTTP proxy outbound — CONNECT + optional Basic auth, optional TLS
+- [x] SOCKS5 proxy outbound — RFC 1928 + optional user/pass, optional TLS
 - [ ] Snell
 - [ ] Hysteria / Hysteria2, TUIC — UDP-capable transports
 - [ ] WireGuard / AmneziaWG (`adapter/outbound/wireguard`)

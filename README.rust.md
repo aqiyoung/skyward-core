@@ -69,7 +69,9 @@ CLI flags mirror the Go binary where practical:
   over TLS (SHA-224 password hash, CRLF header, SNI override via `sni`), and
   `VLESS` (UUID request header, optional `tls`, SNI via `sni`/`server-name`),
   and `VMess` AEAD (`aes-128-gcm` / `chacha20-poly1305`, nested-HMAC KDF,
-  AuthID, encrypted header and body chunks). Proxy groups:
+  AuthID, encrypted header and body chunks), plus `http` (CONNECT with optional
+  Basic auth) and `socks5` (RFC 1928 with optional user/pass) outbounds, both
+  with optional TLS. Proxy groups:
   `select`, `load-balance`, `url-test`/`fallback` (TCP-connect latency probe,
   cached 60 s), plus synthetic `GLOBAL`.
 - **Tunnel** (`src/tunnel`): mode dispatch (`rule`/`direct`/`global`), rule lookup,
@@ -115,9 +117,9 @@ or `?token=<secret>`.
 
 ## Known limitations
 
-- Beyond Shadowsocks AEAD, Trojan, VLESS and VMess, other `proxies` entries are
-  parsed and listed in `/proxies`, but selecting one returns a clear "not
-  implemented" error. Shadowsocks plugins/2022 ciphers, Trojan WebSocket/obfs,
+- Beyond Shadowsocks AEAD, Trojan, VLESS, VMess, HTTP and SOCKS5, other `proxies`
+  entries are parsed and listed in `/proxies`, but selecting one returns a clear
+  "not implemented" error. Shadowsocks plugins/2022 ciphers, Trojan WebSocket/obfs,
   VLESS XTLS/REALITY, and legacy (non-AEAD) VMess are not supported.
 - TLS uses webpki-roots; `skip-cert-verify` and client certificates are not supported.
 - No TUN/TPROXY, no GEOIP/GEOSITE, no process-name rules, no rule providers.

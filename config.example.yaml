@@ -53,6 +53,18 @@ proxies:
     uuid: b831381d-6324-4d53-ad4f-8cda48b30811
     cipher: auto          # aes-128-gcm / chacha20-poly1305
     tls: true
+  - name: "http-demo"
+    type: http
+    server: proxy.example.com
+    port: 8080
+    # username: user
+    # password: pass
+  - name: "socks5-demo"
+    type: socks5
+    server: proxy.example.com
+    port: 1080
+    # username: user
+    # password: pass
 
 proxy-groups:
   - name: "auto"

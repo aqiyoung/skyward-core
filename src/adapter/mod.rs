@@ -18,13 +18,17 @@ use tokio::time::timeout;
 use crate::common::TargetAddr;
 use crate::config::Config;
 
+pub mod http_proxy;
 pub mod shadowsocks;
+pub mod socks5;
 pub mod tls;
 pub mod trojan;
 pub mod vless;
 pub mod vmess;
 
+use http_proxy::HttpOutbound;
 use shadowsocks::ShadowsocksOutbound;
+use socks5::Socks5Outbound;
 use trojan::TrojanOutbound;
 use vless::VlessOutbound;
 use vmess::VmessOutbound;
@@ -153,6 +157,44 @@ impl OutboundManager {
             let outbound: Arc<dyn Outbound> = match def.kind.as_str() {
                 "direct" => Arc::new(DirectOutbound::new(def.name.clone())),
                 "reject" => Arc::new(RejectOutbound::new(def.name.clone())),
+                "http" => {
+                    let made = match (def.server.as_deref(), def.port) {
+                        (Some(server), Some(port)) => HttpOutbound::try_new(
+                            &def.name,
+                            server,
+                            port,
+                            def.username.as_deref(),
+                            def.password.as_deref(),
+                            def.tls.unwrap_or(false),
+                            def.sni.as_deref().or(def.server_name.as_deref()),
+                        ),
+                        _ => None,
+                    };
+                    made.map(|o| Arc::new(o) as Arc<dyn Outbound>)
+                        .unwrap_or_else(|| Arc::new(UnimplementedOutbound {
+                            name: def.name.clone(),
+                            kind: "http (invalid config)".into(),
+                        }))
+                }
+                "socks5" => {
+                    let made = match (def.server.as_deref(), def.port) {
+                        (Some(server), Some(port)) => Socks5Outbound::try_new(
+                            &def.name,
+                            server,
+                            port,
+                            def.username.as_deref(),
+                            def.password.as_deref(),
+                            def.tls.unwrap_or(false),
+                            def.sni.as_deref().or(def.server_name.as_deref()),
+                        ),
+                        _ => None,
+                    };
+                    made.map(|o| Arc::new(o) as Arc<dyn Outbound>)
+                        .unwrap_or_else(|| Arc::new(UnimplementedOutbound {
+                            name: def.name.clone(),
+                            kind: "socks5 (invalid config)".into(),
+                        }))
+                }
                 "ss" | "shadowsocks" => {
                     let made = match (def.server.as_deref(), def.port, def.cipher.as_deref(), def.password.as_deref()) {
                         (Some(server), Some(port), Some(cipher), Some(password)) => {
