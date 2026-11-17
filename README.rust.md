@@ -78,7 +78,10 @@ CLI flags mirror the Go binary where practical:
   Basic auth) and `socks5` (RFC 1928 with optional user/pass) outbounds, both
   with optional TLS. Proxy groups:
   `select`, `load-balance`, `url-test`/`fallback` (TCP-connect latency probe,
-  cached 60 s), plus synthetic `GLOBAL`.
+  cached 60 s), plus synthetic `GLOBAL`. Proxy providers (`src/adapter/provider.rs`)
+  load subscriptions from file/inline/http(s), filter nodes and run initial
+  HTTP health checks; group `use:` entries expand to provider nodes ordered by
+  latency.
 - **Tunnel** (`src/tunnel`): mode dispatch (`rule`/`direct`/`global`), rule lookup,
   outbound resolution, bidirectional relay with upload/download counters.
 - **Hub** (`src/hub`): REST controller with optional bearer/token auth.
@@ -93,6 +96,7 @@ CLI flags mirror the Go binary where practical:
 | GET | `/proxies` | outbound/group snapshot, including group selections |
 | GET | `/rules` | active rules |
 | GET | `/providers/rule` | loaded rule providers and entry counts |
+| GET | `/providers/proxies` | loaded proxy providers, node counts and alive counts |
 | GET | `/traffic` | cumulative `{up, down}` bytes |
 | PUT | `/mode?name=<rule\|direct\|global>` | switch mode |
 | PUT | `/proxies/<group>?name=<member>` | select a group member |

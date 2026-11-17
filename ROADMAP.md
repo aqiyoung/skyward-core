@@ -53,14 +53,22 @@ or `rustls`), a `TLS` connector abstraction, and a UUID/TLV codec layer.
 - [ ] fake-ip and redir-host modes
 - [ ] DNS hijack / sniffing (TLS ALPN, HTTP Host)
 
-## Phase 4 — network stack
+## Phase 4 — groups and providers
+
+- [x] Proxy providers — file/inline/http(s) subscriptions, proxy filtering,
+  initial HTTP health checks with latency (`src/adapter/provider.rs`)
+- [x] Group `use:` entries expand to provider nodes; nodes ordered by latency
+- [ ] Periodic provider refresh, ETag, `override`, persistent selections
+- [ ] `relay` group, full fallback semantics
+
+## Phase 5 — network stack
 
 - [ ] TUN inbound (system + gvisor-like userspace stack)
 - [ ] TPROXY / REDIR (Linux netfilter), `iptables` integration
 - [ ] UDP full-cone NAT for all UDP-capable protocols
 - [ ] Interface binding, routing marks, dialer options
 
-## Phase 5 — controller & operations
+## Phase 6 — controller & operations
 
 - [ ] Full REST API parity (connections, WebSocket traffic stream, config PUT)
 - [ ] Geo data auto-update, rule/provider health checks

@@ -10,6 +10,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 
+use crate::adapter::provider::ProxyProviderRegistry;
 use crate::adapter::OutboundManager;
 use crate::common::{SharedTraffic, TargetAddr};
 use crate::config::Config;
@@ -65,17 +66,37 @@ pub struct Engine {
     pub mode: RwLock<String>,
     pub geo: Arc<GeoData>,
     pub providers: Arc<ProviderRegistry>,
+    pub proxy_providers: Arc<ProxyProviderRegistry>,
 }
 
 impl Engine {
     pub async fn new(config: Config, traffic: SharedTraffic, data_dir: &Path) -> Self {
         let rules = RuleSet::new(&config.rules);
         let resolver = Resolver::new(config.dns.clone().unwrap_or_default());
-        let outbounds = OutboundManager::new(&config);
+        let proxy_providers = Arc::new(ProxyProviderRegistry::load(&config, data_dir).await);
+        let mut outbounds = OutboundManager::new(&config);
+
+        // Provider nodes become first-class outbounds so groups and rules can
+        // refer to them by name.
+        let provider_nodes = proxy_providers.all_outbounds();
+        for (name, outbound) in &provider_nodes {
+            outbounds.register(name.clone(), outbound.clone());
+        }
+        for g in &config.proxy_groups {
+            if !g.use_providers.is_empty() {
+                let mut members = g.proxies.clone();
+                members.extend(proxy_providers.member_names(&g.use_providers));
+                outbounds.set_group_members(&g.name, members);
+            }
+        }
+        if let Some(global) = outbounds.groups.get_mut("GLOBAL") {
+            global.members.extend(provider_nodes.into_iter().map(|(name, _)| name));
+        }
+
         let mode = RwLock::new(config.mode.clone());
         let geo = Arc::new(GeoData::load(data_dir));
         let providers = Arc::new(ProviderRegistry::load(&config, data_dir).await);
-        Self { config, rules, resolver, outbounds, traffic, mode, geo, providers }
+        Self { config, rules, resolver, outbounds, traffic, mode, geo, providers, proxy_providers }
     }
 
     /// Choose a rule target based on the active mode and the rule set.

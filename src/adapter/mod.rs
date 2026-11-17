@@ -16,9 +16,10 @@ use tokio::sync::RwLock;
 use tokio::time::timeout;
 
 use crate::common::TargetAddr;
-use crate::config::Config;
+use crate::config::{Config, ProxyDef};
 
 pub mod http_proxy;
+pub mod provider;
 pub mod shadowsocks;
 pub mod socks5;
 pub mod tls;
@@ -147,14 +148,8 @@ pub struct OutboundManager {
     health: RwLock<HashMap<String, (Instant, String)>>,
 }
 
-impl OutboundManager {
-    pub fn new(config: &Config) -> Self {
-        let mut outbounds: HashMap<String, Arc<dyn Outbound>> = HashMap::new();
-        outbounds.insert("DIRECT".into(), Arc::new(DirectOutbound::new("DIRECT")));
-        outbounds.insert("REJECT".into(), Arc::new(RejectOutbound::new("REJECT")));
-
-        for def in &config.proxies {
-            let outbound: Arc<dyn Outbound> = match def.kind.as_str() {
+pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
+    match def.kind.as_str() {
                 "direct" => Arc::new(DirectOutbound::new(def.name.clone())),
                 "reject" => Arc::new(RejectOutbound::new(def.name.clone())),
                 "http" => {
@@ -266,7 +261,17 @@ impl OutboundManager {
                     name: def.name.clone(),
                     kind: def.kind.clone(),
                 }),
-            };
+            }
+}
+
+impl OutboundManager {
+    pub fn new(config: &Config) -> Self {
+        let mut outbounds: HashMap<String, Arc<dyn Outbound>> = HashMap::new();
+        outbounds.insert("DIRECT".into(), Arc::new(DirectOutbound::new("DIRECT")));
+        outbounds.insert("REJECT".into(), Arc::new(RejectOutbound::new("REJECT")));
+
+        for def in &config.proxies {
+            let outbound = build_outbound(def);
             outbounds.insert(def.name.clone(), outbound);
         }
 
@@ -355,6 +360,16 @@ impl OutboundManager {
 
     pub fn outbound(&self, name: &str) -> Option<Arc<dyn Outbound>> {
         self.outbounds.get(name).cloned()
+    }
+
+    pub fn register(&mut self, name: String, outbound: Arc<dyn Outbound>) {
+        self.outbounds.insert(name, outbound);
+    }
+
+    pub fn set_group_members(&mut self, name: &str, members: Vec<String>) {
+        if let Some(group) = self.groups.get_mut(name) {
+            group.members = members;
+        }
     }
 
     pub fn snapshot(&self) -> Vec<ProxyInfo> {

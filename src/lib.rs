@@ -4,6 +4,7 @@ pub mod adapter;
 pub mod common;
 pub mod config;
 pub mod dns;
+pub mod fetch;
 pub mod geo;
 pub mod hub;
 pub mod inbound;

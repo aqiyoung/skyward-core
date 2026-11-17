@@ -80,6 +80,11 @@ async fn route(req: Request<Body>, state: Arc<AppState>) -> Response<Body> {
             json(StatusCode::OK, serde_json::json!(engine.outbounds.snapshot()))
         }
 
+        (Method::GET, "/providers/proxies") => {
+            let engine = state.engine.read().await;
+            json(StatusCode::OK, serde_json::json!(engine.proxy_providers.snapshot()))
+        }
+
         (Method::GET, "/providers/rule") => {
             let engine = state.engine.read().await;
             json(StatusCode::OK, serde_json::json!(engine.providers.snapshot()))

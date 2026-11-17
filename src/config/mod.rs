@@ -30,6 +30,8 @@ pub struct Config {
     pub proxy_groups: Vec<ProxyGroupDef>,
     #[serde(rename = "rule-providers")]
     pub rule_providers: HashMap<String, RuleProviderDef>,
+    #[serde(rename = "proxy-providers")]
+    pub proxy_providers: HashMap<String, ProxyProviderDef>,
     pub rules: Vec<String>,
     pub dns: Option<DnsConfig>,
 }
@@ -49,6 +51,7 @@ impl Default for Config {
             proxies: Vec::new(),
             proxy_groups: Vec::new(),
             rule_providers: HashMap::new(),
+            proxy_providers: HashMap::new(),
             rules: Vec::new(),
             dns: None,
         }
@@ -79,6 +82,9 @@ pub struct ProxyGroupDef {
     pub kind: String,
     #[serde(default)]
     pub proxies: Vec<String>,
+    /// Provider names whose proxies should be included as members (`use:`).
+    #[serde(rename = "use", default)]
+    pub use_providers: Vec<String>,
     pub url: Option<String>,
     pub interval: Option<u64>,
 }
@@ -106,6 +112,61 @@ impl Default for RuleProviderDef {
             url: None,
             format: None,
             interval: None,
+            payload: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct HealthCheckConfig {
+    pub enable: bool,
+    pub url: Option<String>,
+    pub interval: Option<u64>,
+    #[serde(rename = "expected-status")]
+    pub expected_status: Option<String>,
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            url: Some("http://www.gstatic.com/generate_204".to_string()),
+            interval: Some(300),
+            expected_status: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ProxyProviderDef {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub path: Option<String>,
+    pub url: Option<String>,
+    pub interval: Option<u64>,
+    pub filter: Option<String>,
+    #[serde(rename = "exclude-filter")]
+    pub exclude_filter: Option<String>,
+    #[serde(rename = "exclude-type")]
+    pub exclude_type: Option<String>,
+    #[serde(rename = "health-check")]
+    pub health_check: HealthCheckConfig,
+    pub payload: Vec<ProxyDef>,
+}
+
+impl Default for ProxyProviderDef {
+    fn default() -> Self {
+        Self {
+            kind: String::new(),
+            path: None,
+            url: None,
+            interval: None,
+            filter: None,
+            exclude_filter: None,
+            exclude_type: None,
+            health_check: HealthCheckConfig::default(),
             payload: Vec::new(),
         }
     }
