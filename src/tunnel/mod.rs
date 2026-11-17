@@ -3,8 +3,11 @@
 use std::io;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+
+pub mod connection;
 
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -19,16 +22,19 @@ use crate::geo::GeoData;
 use crate::rules::provider::ProviderRegistry;
 use crate::rules::RuleSet;
 
+use connection::{ConnectionTracker, Network};
+
 /// AsyncWrite wrapper that feeds bytes moved through it into the traffic counters.
 struct CountingWriter<W> {
     inner: W,
+    counter: Arc<AtomicU64>,
     traffic: SharedTraffic,
     upload: bool,
 }
 
 impl<W> CountingWriter<W> {
-    fn new(inner: W, traffic: SharedTraffic, upload: bool) -> Self {
-        Self { inner, traffic, upload }
+    fn new(inner: W, counter: Arc<AtomicU64>, traffic: SharedTraffic, upload: bool) -> Self {
+        Self { inner, counter, traffic, upload }
     }
 }
 
@@ -37,6 +43,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CountingWriter<W> {
         let this = self.get_mut();
         match Pin::new(&mut this.inner).poll_write(cx, buf) {
             Poll::Ready(Ok(n)) => {
+                this.counter.fetch_add(n as u64, Ordering::Relaxed);
                 if this.upload {
                     this.traffic.add_upload(n as u64);
                 } else {
@@ -67,6 +74,7 @@ pub struct Engine {
     pub geo: Arc<GeoData>,
     pub providers: Arc<ProviderRegistry>,
     pub proxy_providers: Arc<ProxyProviderRegistry>,
+    pub connections: Arc<ConnectionTracker>,
 }
 
 impl Engine {
@@ -96,7 +104,8 @@ impl Engine {
         let mode = RwLock::new(config.mode.clone());
         let geo = Arc::new(GeoData::load(data_dir));
         let providers = Arc::new(ProviderRegistry::load(&config, data_dir).await);
-        Self { config, rules, resolver, outbounds, traffic, mode, geo, providers, proxy_providers }
+        let connections = Arc::new(ConnectionTracker::new());
+        Self { config, rules, resolver, outbounds, traffic, mode, geo, providers, proxy_providers, connections }
     }
 
     /// Choose a rule target based on the active mode and the rule set.
@@ -130,27 +139,37 @@ impl Engine {
             "establish"
         );
 
-        let outbound = self.outbounds.outbound(&final_name).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("unknown outbound '{}'", final_name))
-        })?;
-        let mut remote = outbound.connect(&target).await?;
-        if !prefix.is_empty() {
-            remote.write_all(prefix).await?;
-        }
+        let (id, up_counter, down_counter) = self.connections
+            .add(&target, &rule_target, vec![final_name.clone(), rule_target.clone()], Network::Tcp)
+            .await;
 
-        let (mut rin, mut win) = tokio::io::split(inbound);
-        let (mut rout, mut wout) = tokio::io::split(remote);
-        let mut up = CountingWriter::new(&mut wout, self.traffic.clone(), true);
-        let mut down = CountingWriter::new(&mut win, self.traffic.clone(), false);
-
-        let result = tokio::select! {
-            r = tokio::io::copy(&mut rin, &mut up) => r.map(|_| ()),
-            r = tokio::io::copy(&mut rout, &mut down) => r.map(|_| ()),
+        let outbound = self.outbounds.outbound(&final_name);
+        let result = match outbound {
+            Some(outbound) => {
+                match outbound.connect(&target).await {
+                    Ok(mut remote) => {
+                        if !prefix.is_empty() {
+                            remote.write_all(prefix).await?;
+                        }
+                        let (mut rin, mut win) = tokio::io::split(inbound);
+                        let (mut rout, mut wout) = tokio::io::split(remote);
+                        let mut up = CountingWriter::new(&mut wout, up_counter, self.traffic.clone(), true);
+                        let mut down = CountingWriter::new(&mut win, down_counter, self.traffic.clone(), false);
+                        let result = tokio::select! {
+                            r = tokio::io::copy(&mut rin, &mut up) => r.map(|_| ()),
+                            r = tokio::io::copy(&mut rout, &mut down) => r.map(|_| ()),
+                        };
+                        let _ = wout.shutdown().await;
+                        let _ = win.shutdown().await;
+                        result
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            None => Err(io::Error::new(io::ErrorKind::NotFound, format!("unknown outbound '{}'", final_name))),
         };
 
-        // Best-effort: signal EOF to the other side; ignore errors on teardown.
-        let _ = wout.shutdown().await;
-        let _ = win.shutdown().await;
+        self.connections.remove(&id).await;
         result
     }
 }

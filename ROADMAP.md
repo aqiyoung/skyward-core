@@ -73,7 +73,8 @@ or `rustls`), a `TLS` connector abstraction, and a UUID/TLV codec layer.
 
 ## Phase 6 — controller & operations
 
-- [ ] Full REST API parity (connections, WebSocket traffic stream, config PUT)
+- [x] `/connections` live listing and WebSocket `/traffic` stream (1 Hz)
+- [ ] Full REST API parity (45 routes, config GET/PUT, `/logs`, DoH, `/ui`)
 - [ ] Geo data auto-update, rule/provider health checks
 - [ ] TLS for the external controller, unix socket / named pipe listeners
 - [ ] `convert-ruleset`, `generate`, `age` subcommands

@@ -11,6 +11,9 @@ pub mod inbound;
 pub mod rules;
 pub mod tunnel;
 
+// Re-export for the REST controller.
+pub use tunnel::connection::{ConnectionInfo, Network};
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

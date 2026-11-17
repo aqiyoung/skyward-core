@@ -86,7 +86,9 @@ CLI flags mirror the Go binary where practical:
   latency.
 - **Tunnel** (`src/tunnel`): mode dispatch (`rule`/`direct`/`global`), rule lookup,
   outbound resolution, bidirectional relay with upload/download counters.
-- **Hub** (`src/hub`): REST controller with optional bearer/token auth.
+- **Hub** (`src/hub`): REST controller with optional bearer/token auth, `/connections`
+  listing backed by a live connection registry, and a WebSocket `/traffic` stream
+  (delta + cumulative bytes, 1 Hz) implemented with a minimal RFC 6455 server.
 
 ### REST endpoints
 
@@ -100,6 +102,9 @@ CLI flags mirror the Go binary where practical:
 | GET | `/providers/rule` | loaded rule providers and entry counts |
 | GET | `/providers/proxies` | loaded proxy providers, node counts and alive counts |
 | GET | `/traffic` | cumulative `{up, down}` bytes |
+| GET/WS | `/traffic` | WebSocket: 1 Hz `{up, down, upTotal, downTotal}` |
+| GET | `/connections` | live connections (`{"connections": [...]}`) |
+| DELETE | `/connections` | (reserved) close connections |
 | PUT | `/mode?name=<rule\|direct\|global>` | switch mode |
 | PUT | `/proxies/<group>?name=<member>` | select a group member |
 | PUT | `/configs` | reload config from disk (same as SIGHUP) |

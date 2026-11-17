@@ -7,6 +7,8 @@ use std::sync::Arc;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
 
+pub mod websocket;
+
 use crate::common::VERSION;
 use crate::AppState;
 
@@ -40,6 +42,33 @@ async fn route(req: Request<Body>, state: Arc<AppState>) -> Response<Body> {
 
     if path != "/" && !authorized(&req, &secret, query.as_deref()) {
         return json(StatusCode::UNAUTHORIZED, serde_json::json!({ "error": "unauthorized" }));
+    }
+
+    // WebSocket upgrade must be handled before consuming the body.
+    if path == "/traffic" && is_websocket_upgrade(&req) {
+        let key = req.headers().get("sec-websocket-key")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let upgrade = hyper::upgrade::on(req);
+        let traffic = state.engine.read().await.traffic.clone();
+        tokio::spawn(async move {
+            match upgrade.await {
+                Ok(upgraded) => stream_traffic(upgraded, traffic).await,
+                Err(e) => tracing::debug!("traffic ws upgrade failed: {}", e),
+            }
+        });
+        return Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .header("upgrade", "websocket")
+            .header("connection", "Upgrade")
+            .header("sec-websocket-accept", ws_accept(&key))
+            .body(Body::empty())
+            .unwrap();
+    }
+
+    if is_websocket_upgrade(&req) {
+        return json(StatusCode::NOT_FOUND, serde_json::json!({ "error": "not found" }));
     }
 
     let (_, body) = req.into_parts();
@@ -99,6 +128,15 @@ async fn route(req: Request<Body>, state: Arc<AppState>) -> Response<Body> {
         (Method::GET, "/traffic") => {
             let snap = state.engine.read().await.traffic.snapshot();
             json(StatusCode::OK, serde_json::json!({ "up": snap.up, "down": snap.down }))
+        }
+
+        (Method::GET, "/connections") => {
+            let items = state.engine.read().await.connections.snapshot().await;
+            json(StatusCode::OK, serde_json::json!({ "connections": items }))
+        }
+
+        (Method::DELETE, "/connections") => {
+            json(StatusCode::OK, serde_json::json!({ "status": "ok" }))
         }
 
         (Method::PUT, "/configs") => match state.reload().await {
@@ -167,4 +205,43 @@ fn json(status: StatusCode, value: serde_json::Value) -> Response<Body> {
         .header("content-type", "application/json")
         .body(Body::from(value.to_string()))
         .unwrap()
+}
+
+fn is_websocket_upgrade(req: &Request<Body>) -> bool {
+    req.headers().get("upgrade").and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false)
+}
+
+fn ws_accept(key: &str) -> String {
+    let response = websocket::Websocket::accept(key);
+    let text = String::from_utf8_lossy(&response);
+    text.lines()
+        .find_map(|line| line.strip_prefix("Sec-WebSocket-Accept: "))
+        .unwrap_or("")
+        .to_string()
+}
+
+async fn stream_traffic(upgraded: hyper::upgrade::Upgraded, traffic: crate::common::SharedTraffic) {
+    let mut ws = websocket::Websocket::new(upgraded);
+    let mut previous = traffic.snapshot();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        let current = traffic.snapshot();
+        let payload = serde_json::json!({
+            "up": current.up.saturating_sub(previous.up),
+            "down": current.down.saturating_sub(previous.down),
+            "upTotal": current.up,
+            "downTotal": current.down,
+        });
+        if ws.send_text(&payload.to_string()).await.is_err() {
+            break;
+        }
+        // Keep reading so we notice a client close frame.
+        match tokio::time::timeout(std::time::Duration::from_millis(100), ws.recv_frame()).await {
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {}
+            Ok(Ok(Some(_))) => {}
+        }
+        previous = current;
+    }
 }
