@@ -78,7 +78,11 @@ fn encode(map: &Map<String, Value>) -> String {
             format!("trojan://{}@{}{}#{}", pct(&s(map, "password")), host_port(map), suffix, pct(&s(map, "name")))
         }
         "socks5" | "http" => {
-            let scheme = if s(map, "type") == "http" && flag(map, "tls") { "https" } else { s(map, "type") };
+            let scheme = if s(map, "type") == "http" && flag(map, "tls") {
+                "https".to_string()
+            } else {
+                s(map, "type")
+            };
             let user = s(map, "username");
             let auth = if user.is_empty() { String::new() } else { format!("{}:{}@", pct(&user), pct(&s(map, "password"))) };
             format!("{}://{}{}#{}", scheme, auth, host_port(map), pct(&s(map, "name")))
