@@ -96,6 +96,9 @@ pub fn invoke(data: &[u8]) -> Vec<u8> {
         "getTraffic" => handle_get_traffic(&call, false),
         "getTotalTraffic" => handle_get_traffic(&call, true),
         "resetTraffic" => handle_reset_traffic(&call),
+        "getExternalProviders" => handle_external_providers(&call),
+        "getExternalProvider" => handle_external_provider(&call),
+        "updateDns" => handle_update_dns(&call),
         "getConnections" => handle_get_connections(&call),
         "getConnectionCount" => handle_connection_count(&call),
         "closeConnections" => handle_close_connections(&call),
@@ -278,6 +281,33 @@ fn handle_get_traffic(call: &MethodCall, total: bool) -> Vec<u8> {
 }
 
 fn handle_reset_traffic(call: &MethodCall) -> Vec<u8> {
+    ok(&call.id, Value::Bool(true))
+}
+
+fn handle_external_providers(call: &MethodCall) -> Vec<u8> {
+    let future = async {
+        match crate::runtime_state::engine().await {
+            Some(engine) => engine.proxy_providers.external_provider_json(),
+            None => json!([]),
+        }
+    };
+    ok(&call.id, block_on(future).unwrap_or_else(|_| json!([])))
+}
+
+fn handle_external_provider(call: &MethodCall) -> Vec<u8> {
+    let name = call.arguments.as_str().unwrap_or("").to_string();
+    let future = async move {
+        match crate::runtime_state::engine().await {
+            Some(engine) => engine.proxy_providers.external_provider_named(&name)
+                .unwrap_or(Value::Null),
+            None => Value::Null,
+        }
+    };
+    ok(&call.id, block_on(future).unwrap_or(Value::Null))
+}
+
+fn handle_update_dns(call: &MethodCall) -> Vec<u8> {
+    // DNS reload is a no-op in this slice (the resolver cache is per-engine).
     ok(&call.id, Value::Bool(true))
 }
 
@@ -488,6 +518,13 @@ mod tests {
         }).to_string();
         let r = response(invoke(payload.as_bytes()));
         assert_eq!(r["result"]["changed"], true);
+    }
+
+    #[test]
+    fn get_external_providers_returns_array() {
+        let _guard = crate::runtime_state::TEST_LOCK.lock().unwrap();
+        let r = response(invoke(br#"{"method":"getExternalProviders"}"#));
+        assert!(r["result"].is_array());
     }
 
     #[test]

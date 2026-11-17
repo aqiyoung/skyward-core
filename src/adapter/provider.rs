@@ -182,6 +182,34 @@ impl ProxyProviderRegistry {
         items.sort_by(|a, b| a.name.cmp(&b.name));
         items
     }
+
+    /// Go-compatible ExternalProvider shape for the App's provider page.
+    pub fn external_provider_json(&self) -> serde_json::Value {
+        let items: Vec<serde_json::Value> = self.snapshot().into_iter().map(|p| {
+            serde_json::json!({
+                "name": p.name,
+                "type": "Proxy",
+                "vehicle-type": p.kind,
+                "count": p.count,
+                "path": "",
+                "update-at": "0001-01-01T00:00:00Z",
+                "subscription-info": null,
+            })
+        }).collect();
+        serde_json::Value::Array(items)
+    }
+
+    pub fn external_provider_named(&self, name: &str) -> Option<serde_json::Value> {
+        self.providers.get(name).map(|p| serde_json::json!({
+            "name": p.name,
+            "type": "Proxy",
+            "vehicle-type": p.kind,
+            "count": p.len(),
+            "path": "",
+            "update-at": "0001-01-01T00:00:00Z",
+            "subscription-info": null,
+        }))
+    }
 }
 
 #[derive(serde::Serialize)]
