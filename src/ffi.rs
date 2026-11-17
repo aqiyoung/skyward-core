@@ -60,6 +60,7 @@ pub struct DnsAnswer {
 
 /// Callback table. Every callback receives `user_data` as its last argument.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct SkywardHooks {
     /// JSON connection event: {"event":"add|remove","id":"...","host":"..."}
     pub connection: Option<extern "C" fn(*const u8, usize, *mut std::ffi::c_void)>,
@@ -269,7 +270,8 @@ pub extern "C" fn skyward_query_dns(
             .to_str().map_err(|_| SkywardStatus::InvalidUtf8)?.to_string();
         let state = rt.state.lock().map_err(|_| SkywardStatus::RuntimeError)?
             .as_ref().cloned().ok_or(SkywardStatus::NotInitialized)?;
-        let resolver = state.engine.blocking_read().resolver.clone();
+        let config = state.engine.blocking_read().config.dns.clone().unwrap_or_default();
+        let resolver = crate::dns::Resolver::new(config);
         let addrs = rt.tokio.block_on(resolver.resolve(&host))
             .map_err(|_| SkywardStatus::RuntimeError)?;
         let chosen = addrs.into_iter().find(|ip| match qtype {
