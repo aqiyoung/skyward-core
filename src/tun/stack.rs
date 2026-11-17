@@ -6,9 +6,9 @@
 //! real tun device (tests use a UnixStream pair).
 
 use smoltcp::iface::{Config, Interface, SocketSet};
-use smoltcp::socket::tcp;
+use smoltcp::socket::{tcp, AnySocket};
 use smoltcp::time::{Duration, Instant};
-use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, Ipv4Address};
+use smoltcp::wire::IpCidr;
 
 use super::TunConfig;
 
@@ -29,10 +29,9 @@ impl<'a> Stack<'a> {
 
         // Configure the first IPv4 address from the address list, if any.
         if let Some(addr) = config.addresses.first().and_then(|s| s.split('/').next()) {
-            if let Ok(ip) = addr.parse::<std::net::Ipv4Addr>() {
-                let ip = Ipv4Address::from_bytes(&ip.octets());
+            if let Ok(ip) = addr.parse::<smoltcp::wire::Ipv4Address>() {
                 iface.update_ip_addrs(|addrs| {
-                    let _ = addrs.push(IpCidr::new(IpAddress::V4(ip), 24));
+                    let _ = addrs.push(IpCidr::new(ip.into(), 24));
                 });
             }
         }
@@ -58,7 +57,7 @@ impl<'a> Stack<'a> {
     pub fn active_tcp_count(&self) -> usize {
         self.sockets
             .iter()
-            .filter_map(|s| s.downcast_ref::<tcp::Socket>())
+            .filter_map(|(_handle, socket)| tcp::Socket::downcast(socket))
             .filter(|s| s.is_active())
             .count()
     }
