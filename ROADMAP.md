@@ -29,6 +29,9 @@ Each protocol becomes an `Outbound` implementation in `src/adapter/`, keyed by
 - [x] SOCKS5 proxy outbound — RFC 1928 + optional user/pass, optional TLS
 - [x] Snell v1–v3 — Argon2 KDF, shadowaead framing, CONNECT header/reply
   (`src/adapter/snell.rs`). v4/v6 record layers and UDP remain out of scope.
+- [x] ShadowsocksR stream-cipher subset — MD5 KDF, AES-CFB/RC4-MD5/ChaCha20,
+  origin protocol + plain obfs (`src/adapter/ssr.rs`). auth_* protocols and
+  http/tls obfs remain out of scope.
 - [ ] Hysteria / Hysteria2, TUIC — UDP-capable transports
 - [ ] WireGuard / AmneziaWG (`adapter/outbound/wireguard`)
 

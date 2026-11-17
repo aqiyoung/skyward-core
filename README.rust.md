@@ -77,7 +77,9 @@ CLI flags mirror the Go binary where practical:
   `VLESS` (UUID request header, optional `tls`, SNI via `sni`/`server-name`),
   and `VMess` AEAD (`aes-128-gcm` / `chacha20-poly1305`, nested-HMAC KDF,
   AuthID, encrypted header and body chunks), `Snell` v1–v3 (Argon2 KDF,
-  shadowaead framing, CONNECT header + reply), plus `http` (CONNECT with optional
+  shadowaead framing, CONNECT header + reply), `ShadowsocksR` v1 stream-cipher
+  subset (MD5 KDF, AES-CFB/RC4-MD5/ChaCha20, origin protocol + plain obfs),
+  plus `http` (CONNECT with optional
   Basic auth) and `socks5` (RFC 1928 with optional user/pass) outbounds, both
   with optional TLS. Proxy groups:
   `select`, `load-balance`, `url-test`/`fallback` (TCP-connect latency probe,
@@ -126,6 +128,7 @@ or `?token=<secret>`.
 | `component/geodata/`, `rules/common/{geoip,geosite}.go` | `src/geo` | implemented (protobuf subset) |
 | `adapter/`, `adapter/outboundgroup/` | `src/adapter` | DIRECT/REJECT + groups |
 | `adapter/outbound/shadowsocks.go`, `transport/shadowsocks/shadowaead/` | `src/adapter/shadowsocks.rs` | implemented (AEAD subset) |
+| `adapter/outbound/shadowsocksr.go`, `transport/ssr/` | `src/adapter/ssr.rs` | implemented (stream-cipher subset) |
 | `adapter/outbound/trojan.go`, `transport/trojan/` | `src/adapter/trojan.rs`, `src/adapter/tls.rs` | implemented (TCP over TLS subset) |
 | `adapter/outbound/vless.go`, `transport/vless/` | `src/adapter/vless.rs` | implemented (TCP, no XTLS/REALITY) |
 | `adapter/outbound/vmess.go`, `transport/vmess/` | `src/adapter/vmess.rs` | implemented (AEAD TCP subset) |
@@ -154,11 +157,12 @@ ip route add local 0.0.0.0/0 dev lo table 100
 
 ## Known limitations
 
-- Beyond Shadowsocks AEAD, Trojan, VLESS, VMess, Snell (v1–v3), HTTP and SOCKS5,
-  other `proxies` entries are parsed and listed in `/proxies`, but selecting one
-  returns a clear "not implemented" error. Shadowsocks plugins/2022 ciphers,
-  Trojan WebSocket/obfs, VLESS XTLS/REALITY, Snell v4/v6, and legacy VMess are not
-  supported.
+- Beyond Shadowsocks AEAD, Trojan, VLESS, VMess, Snell (v1–v3), ShadowsocksR
+  (stream-cipher subset), HTTP and SOCKS5, other `proxies` entries are parsed and
+  listed in `/proxies`, but selecting one returns a clear "not implemented" error.
+  Shadowsocks plugins/2022 ciphers, SSR auth protocols (auth_sha1_v4, auth_aes128_*,
+  auth_chain_*) and obfs variants (http_simple, tls1.2_ticket_auth), Trojan
+  WebSocket/obfs, VLESS XTLS/REALITY, Snell v4/v6, and legacy VMess are not supported.
 - TLS uses webpki-roots; `skip-cert-verify` and client certificates are not supported.
 - Transparent proxy is Linux/IPv4 only; the kernel does not install iptables/nftables
   rules automatically, and there is no UDP NAT or TUN/smoltcp stack yet.

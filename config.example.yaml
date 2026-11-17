@@ -59,6 +59,14 @@ proxies:
     port: 443
     psk: "password"
     version: 1            # 1 (chacha20), 2/3 (aes-128-gcm)
+  - name: "ssr-demo"
+    type: ssr
+    server: example.com
+    port: 8388
+    cipher: aes-256-cfb
+    password: "password"
+    protocol: origin     # only origin supported
+    obfs: plain          # only plain supported
   - name: "http-demo"
     type: http
     server: proxy.example.com
