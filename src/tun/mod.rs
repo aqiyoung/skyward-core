@@ -83,13 +83,14 @@ impl<T> TunDevice<T> {
 /// Wrap a raw file descriptor into an owned handle. The caller transfers
 /// ownership; closing happens when the device is dropped.
 #[cfg(unix)]
-pub fn device_from_fd(fd: i32, mtu: usize) -> io::Result<TunDevice<OwnedFd>> {
+pub fn device_from_fd(fd: i32, mtu: usize) -> io::Result<TunDevice<std::fs::File>> {
     if fd <= 0 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "no tun descriptor"));
     }
     // SAFETY: the caller (VpnService via JNI) transfers ownership of fd to us.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    Ok(TunDevice::new(owned, mtu))
+    // File wraps a raw fd and implements Read/Write; needed by the runtime loop.
+    Ok(TunDevice::new(std::fs::File::from(owned), mtu))
 }
 
 pub struct FdRx(pub Vec<u8>);

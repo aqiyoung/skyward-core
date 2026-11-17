@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use smoltcp::iface::{Interface, SocketSet};
+use smoltcp::iface::{Interface, SocketHandle, SocketSet};
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
 use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, Ipv4Address};
@@ -22,7 +22,7 @@ pub fn build_stack<'a, D>(
     device: &mut D,
     config: &TunConfig,
     tcp_pool: usize,
-) -> (Interface, SocketSet<'a>, udp::SocketHandle)
+) -> (Interface, SocketSet<'a>, SocketHandle)
 where
     D: smoltcp::phy::Device,
 {
@@ -103,7 +103,7 @@ pub async fn run<D>(
     }
 }
 
-fn handle_dns(sockets: &mut SocketSet<'_>, handle: udp::SocketHandle, engine: &Engine, now: SmolInstant) {
+fn handle_dns(sockets: &mut SocketSet<'_>, handle: SocketHandle, engine: &Engine, now: SmolInstant) {
     let socket = sockets.get_mut::<udp::Socket>(handle);
     if !socket.is_open() {
         return;
@@ -124,11 +124,11 @@ fn handle_dns(sockets: &mut SocketSet<'_>, handle: udp::SocketHandle, engine: &E
     let resolver = engine.resolver.clone();
     let name_owned = name.clone();
     let answer_ip = match futures_block_on(async move { resolver.resolve(&name_owned).await }) {
-        Ok(addrs) => addrs.into_iter().find(|ip| match qtype {
+        Ok(Ok(addrs)) => addrs.into_iter().find(|ip| match qtype {
             28 => ip.is_ipv6(),
             _ => ip.is_ipv4(),
         }),
-        Err(_) => None,
+        _ => None,
     };
 
     let response = build_dns_response(&packet, answer_ip);
