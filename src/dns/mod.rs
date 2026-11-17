@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config::DnsConfig;
@@ -15,9 +15,9 @@ struct Entry {
     addrs: Vec<IpAddr>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Resolver {
-    cache: Mutex<HashMap<String, Entry>>,
+    cache: Arc<Mutex<HashMap<String, Entry>>>,
     ttl: Duration,
     #[allow(dead_code)]
     config: DnsConfig,
@@ -26,7 +26,7 @@ pub struct Resolver {
 impl Resolver {
     pub fn new(config: DnsConfig) -> Self {
         Self {
-            cache: Mutex::new(HashMap::new()),
+            cache: Arc::new(Mutex::new(HashMap::new())),
             ttl: Duration::from_secs(60),
             config,
         }

@@ -93,7 +93,11 @@ CLI flags mirror the Go binary where practical:
   raw-fd `Device` (Medium::Ip), `StartTun` argument parsing, interface + TCP
   socket pool, and a `SessionManager` that dials each TUN TCP connection through
   the kernel's outbound pipeline and shuttles bytes via byte queues + Notify
-  (`tun/relay.rs`). The outer runtime loop still needs to drive `poll_with_sessions`.
+  (`tun/relay.rs`), and an async runtime loop (`tun/runtime.rs`) that owns the
+  device, drives the stack with `poll_at`-based timing, and answers DNS queries
+  hijacked to port 53 via the kernel resolver. `startTun` spawns this loop on a
+  dedicated Tokio runtime. Still pending: wiring the real config (currently a
+  default engine) and half-close handling.
 - **JNI bridge** (`src/jni` + `jni/java/`): hand-written replacement for the
   gomobile-generated `com.follow.clash.core.mobile.Mobile` class. Implements all
   16 native methods `Core.kt` calls, plus `ResultHandler`/`TunHandler` callbacks

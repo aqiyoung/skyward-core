@@ -6,7 +6,7 @@
 //! All entries use `extern "system"` with a `catch_unwind` guard. The JNIEnv
 //! lifetime is tied to the native method call; global refs outlive it.
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use jni::objects::{GlobalRef, JByteArray, JObject, JString, JValue};
 use jni::sys::{jboolean, jint, jstring, JNI_FALSE, JNI_TRUE};
@@ -17,6 +17,19 @@ use crate::mobile;
 static JAVA_VM: OnceLock<JavaVM> = OnceLock::new();
 static EVENT_LISTENER: Mutex<Option<GlobalRef>> = Mutex::new(None);
 static TUN_SESSION: Mutex<Option<(i32, crate::tun::TunConfig)>> = Mutex::new(None);
+static TOKIO_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static TUN_WAKE: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
+
+fn tokio_runtime() -> Option<&'static tokio::runtime::Runtime> {
+    TOKIO_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .expect("build jni tokio runtime")
+    });
+    TOKIO_RUNTIME.get()
+}
 
 fn vm() -> Option<&'static JavaVM> {
     JAVA_VM.get()
@@ -181,16 +194,23 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
     };
 
     // TUN device creation takes ownership of fd only once the config is valid.
-    match crate::tun::device_from_fd(fd, config.options.mtu) {
+    let mtu = config.options.mtu;
+    match crate::tun::device_from_fd(fd, mtu) {
         Ok(device) => {
-            tracing::info!(
-                "TUN session started: fd={} stack={} mtu={}",
-                fd, config.stack, config.options.mtu
-            );
-            // Keep the config for the relay loop; the device is owned by the
-            // session task once the stack is fully wired (next slice).
-            drop(device);
-            *TUN_SESSION.lock().unwrap() = Some((fd, config));
+            tracing::info!("TUN session started: fd={} stack={} mtu={}", fd, config.stack, mtu);
+            let rt = match tokio_runtime() {
+                Some(rt) => rt,
+                None => return JNI_FALSE,
+            };
+            let engine = rt.block_on(build_default_engine());
+            let wake = TUN_WAKE
+                .get_or_init(|| Arc::new(tokio::sync::Notify::new()))
+                .clone();
+            *TUN_SESSION.lock().unwrap() = Some((fd, config.clone()));
+            rt.spawn(async move {
+                crate::tun::runtime::run(device, config, engine, wake).await;
+                tracing::warn!("TUN runtime exited for fd {}", fd);
+            });
             JNI_TRUE
         }
         Err(e) => {
@@ -198,6 +218,14 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
             JNI_FALSE
         }
     }
+}
+
+/// Build a minimal engine for the relay loop. Once `setupConfig` is ported it
+/// will build from the real config; this keeps the TUN path runnable now.
+async fn build_default_engine() -> Arc<crate::tunnel::Engine> {
+    let config = crate::config::Config::default();
+    let traffic = Arc::new(crate::common::TrafficStats::default());
+    Arc::new(crate::tunnel::Engine::new(config, traffic, std::path::Path::new(".")).await)
 }
 
 fn traffic_json(total: bool) -> String {
