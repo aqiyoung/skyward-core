@@ -153,14 +153,18 @@ fn handle_setup_config(call: &MethodCall) -> Vec<u8> {
     let path_owned = path.to_string();
     let future = async move { crate::runtime_state::apply_config_from_path(&path_owned).await };
     match block_on(future) {
-        Ok(()) => ok(&call.id, Value::String(String::new())),
+        Ok(Ok(())) => ok(&call.id, Value::String(String::new())),
+        Ok(Err(e)) => ok(&call.id, Value::String(e)),
         Err(e) => ok(&call.id, Value::String(e)),
     }
 }
 
 /// Inline block_on for the small setup futures (they run on a dedicated thread
 /// in the JNI path; this keeps `invoke` synchronous as gomobile expects).
-fn block_on<F: std::future::Future>(future: F) -> Result<F::Output, String> {
+fn block_on<F: std::future::Future + Send + 'static>(future: F) -> Result<F::Output, String>
+where
+    F::Output: Send + 'static,
+{
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
