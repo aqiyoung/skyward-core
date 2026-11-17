@@ -142,8 +142,8 @@ pub fn sequence() -> u64 {
 mod tests {
     use super::*;
 
-    fn response(data: &[u8]) -> Value {
-        serde_json::from_slice(data).unwrap()
+    fn response(data: Vec<u8>) -> Value {
+        serde_json::from_slice(&data).unwrap()
     }
 
     #[test]
