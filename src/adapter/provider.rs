@@ -17,7 +17,6 @@ use crate::common::TargetAddr;
 use crate::config::{Config, ProxyDef, ProxyProviderDef};
 use crate::fetch::fetch_url;
 
-#[derive(Debug)]
 pub struct ProviderProxy {
     pub def: ProxyDef,
     pub outbound: Arc<dyn Outbound>,
@@ -25,7 +24,6 @@ pub struct ProviderProxy {
     pub latency: Option<Duration>,
 }
 
-#[derive(Debug)]
 pub struct ProxyProvider {
     pub name: String,
     pub kind: String,
@@ -51,7 +49,7 @@ impl ProxyProvider {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ProxyProviderRegistry {
     providers: HashMap<String, ProxyProvider>,
 }
@@ -211,7 +209,7 @@ async fn check_proxy(outbound: &Arc<dyn Outbound>, url: &str) -> Option<Duration
     };
 
     let started = Instant::now();
-    let mut stream = timeout(Duration::from_secs(5), outbound.connect(&target)).await.ok()??;
+    let mut stream = timeout(Duration::from_secs(5), outbound.connect(&target)).await.ok()?.ok()?;
     let request = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", path, host);
     timeout(Duration::from_secs(5), stream.write_all(request.as_bytes())).await.ok()?.ok()?;
     let mut response = [0u8; 64];
