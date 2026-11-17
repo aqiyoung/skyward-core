@@ -37,17 +37,11 @@ impl SessionManager {
         let handles: Vec<SocketHandle> = sockets.iter().map(|(h, _)| h).collect();
         for handle in handles {
             let target = {
-                let socket = match sockets.get::<tcp::Socket>(handle) {
-                    Some(s) => s,
-                    None => {
-                        self.sessions.remove(&handle);
-                        continue;
-                    }
-                };
+                let socket = sockets.get::<tcp::Socket>(handle);
                 match socket.state() {
                     tcp::State::SynSent | tcp::State::Established => socket
                         .remote_endpoint()
-                        .map(|ep| endpoint_to_target(ep)),
+                        .map(endpoint_to_target),
                     tcp::State::Closed => {
                         self.sessions.remove(&handle);
                         continue;
@@ -66,9 +60,8 @@ impl SessionManager {
             }
 
             // Shuttle bytes using a scoped mutable borrow per socket.
-            if let (Some(socket), Some(bridges)) =
-                (sockets.get_mut::<tcp::Socket>(handle), self.sessions.get(&handle))
-            {
+            if let Some(bridges) = self.sessions.get(&handle) {
+                let socket = sockets.get_mut::<tcp::Socket>(handle);
                 if socket.can_send() && socket.state() == tcp::State::Established {
                     let mut buf = [0u8; 8192];
                     let n = bridges.from_net.pop(&mut buf);
@@ -106,10 +99,10 @@ fn endpoint_to_target(endpoint: smoltcp::wire::IpEndpoint) -> TargetAddr {
             octets.copy_from_slice(v4.as_bytes());
             TargetAddr::Ip(std::net::IpAddr::V4(std::net::Ipv4Addr::from(octets)), port)
         }
-        IpAddress::Ipv6(v6) => {
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(v6.as_bytes());
-            TargetAddr::Ip(std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets)), port)
+        other => {
+            // IPv6 targets require the proto-ipv6 feature; route them by their
+            // string form as a domain-like target until that feature is enabled.
+            TargetAddr::Domain(other.to_string(), port)
         }
     }
 }
