@@ -59,7 +59,8 @@ mod tests {
 
     #[tokio::test]
     async fn applies_config_and_exposes_engine() {
-        assert!(engine().await.is_none());
+        // Global state is shared across tests in one process; don't assume it
+        // starts empty — just verify an applied engine is retrievable.
         let config = Config::from_str("mode: rule\nrules:\n  - MATCH,DIRECT\n").unwrap();
         let e = apply_config(config, PathBuf::from("c.yaml"), PathBuf::from(".")).await;
         assert!(Arc::ptr_eq(&e, &engine().await.unwrap()));
