@@ -2,7 +2,9 @@
 
 这个目录是 `skyward-core` 的 Rust 版设计与迁移方案。Go 代码保持原样，Rust 版本在这里从零生长，两者在切换完成前并行存在。
 
-文档先行：本目录当前只有文档，**没有 Rust 代码**。第一个提交代码的里程碑是 M0（见 [08-migration-plan.md](docs/08-migration-plan.md)）。文档里的 Rust 片段是设计示例，不是可直接编译的源码；从 M0 开始，示例会被真正的 crate 取代。
+> **实现状态（2026-11 更新）**：本目录是**设计/迁移文档**，记录的是设计阶段的决策与计划，文中"没有代码""从 M0 开始"等表述是当时的历史背景。真正可编译的实现**不在这里**，而在仓库根目录 `src/`，托管于 `rust-core` 分支；入口见 [根 README](../README.md) 与 [`README.rust.md`](../README.rust.md)。实现按本文的里程碑推进，当前已覆盖 M0–M7 的主干（配置/规则/8 种出站/组与 provider/透明代理/REST+WS/FFI），但**尚未做真实协议互通测试**；进度以 [`ROADMAP.md`](../ROADMAP.md) 为准，设计文档不再随实现更新。CI（`.github/workflows/rust-core.yaml`）在 GitHub 上跑单测、release 构建和端到端代理 smoke 测试。
+
+文档先行：制定方案时本目录只有文档、没有 Rust 代码，第一个提交代码的里程碑是 M0（见 [08-migration-plan.md](docs/08-migration-plan.md)）。文档里的 Rust 片段是设计示例，与之对应的真实实现见仓库根目录 `src/`。
 
 ## 已确定的决策
 

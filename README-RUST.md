@@ -1,6 +1,8 @@
 # Rust 重写：设计与迁移方案
 
-`rust/` 目录是 `skyward-core` 的 Rust 版方案，与 Go 代码并列存在。目前只有文档，没有 Rust 代码；第一个交付代码的里程碑是 M0。
+`rust/` 目录是 `skyward-core` 的 Rust 版**设计/迁移方案**，与 Go 代码并列存在。设计阶段这里只有文档、没有代码，第一个交付代码的里程碑是 M0。
+
+> **实现状态（2026-11 更新）**：可编译的实现在仓库根目录 `src/`（`rust-core` 分支），已覆盖 M0–M7 主干；本目录文档记录设计决策，不再随实现更新。入口 [`README.md`](README.md) · [`README.rust.md`](README.rust.md) · 进度 [`ROADMAP.md`](ROADMAP.md)。
 
 - 入口：[`rust/README.md`](rust/README.md)
 - 现状盘点与重写边界：[`rust/docs/00-overview.md`](rust/docs/00-overview.md)
