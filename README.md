@@ -19,7 +19,8 @@ branch and is intentionally not present here.
 ```
 Cargo.toml / Cargo.lock     Rust crate and locked dependencies (rlib + cdylib)
 src/                         kernel implementation (config, inbound, rules,
-                             dns, adapters, tunnel, REST hub, C FFI)
+                             dns, adapters, tunnel, REST hub, C FFI, JNI bridge)
+jni/java/                    hand-written Mobile/ResultHandler/TunHandler JNI classes
 config.example.yaml          mihomo-compatible example configuration
 rust/docs/                   design and migration documents
 rust/tools/                  appendix verification script

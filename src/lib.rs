@@ -9,6 +9,7 @@ pub mod fetch;
 pub mod geo;
 pub mod hub;
 pub mod inbound;
+pub mod jni;
 pub mod mobile;
 pub mod rules;
 pub mod tunnel;

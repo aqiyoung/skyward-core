@@ -58,6 +58,19 @@ jobs:
           ./target/release/skyward-core --version
           ./target/release/skyward-core -c config.example.yaml -t
 
+      - name: Verify JNI symbols in cdylib
+        run: |
+          SO=target/release/libskyward_core.so
+          echo "checking exported JNI symbols in $SO"
+          for sym in \
+            Java_com_follow_clash_core_mobile_Mobile_invokeMethod \
+            Java_com_follow_clash_core_mobile_Mobile_setEventListener \
+            Java_com_follow_clash_core_mobile_Mobile_getTraffic \
+            Java_com_follow_clash_core_mobile_Mobile_startTun; do
+            nm -D "$SO" | grep -q " T $sym" || { echo "missing JNI symbol: $sym"; exit 1; }
+          done
+          echo "all required JNI symbols present"
+
       - name: End-to-end proxy smoke test
         run: bash scripts/smoke.sh ./target/release/skyward-core
 

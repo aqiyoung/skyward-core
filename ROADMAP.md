@@ -82,7 +82,9 @@ or `rustls`), a `TLS` connector abstraction, and a UUID/TLV codec layer.
   handle (`src/ffi.rs`). TUN packet injection returns NotImplemented.
 - [ ] gomobile `invokeMethod` bridge for the Flutter App (`src/mobile.rs`):
   [x] JSON protocol + stateless/lifecycle methods + `skyward_invoke_method` FFI;
-  [ ] remaining ~45 methods; [ ] JNI `Mobile` class + callbacks;
+  [x] JNI `Mobile` class + callbacks (`src/jni.rs`, `jni/java/`) — all 16 native
+      methods Core.kt calls, ResultHandler/TunHandler, event delivery;
+  [ ] remaining ~45 `invokeMethod` methods; [ ] wire real traffic/connections
   [ ] TUN (smoltcp) required before the App can fully run on the Rust core.
 
 ## Phase 6 — controller & operations

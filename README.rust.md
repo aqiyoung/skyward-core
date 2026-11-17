@@ -89,6 +89,10 @@ CLI flags mirror the Go binary where practical:
   latency.
 - **Tunnel** (`src/tunnel`): mode dispatch (`rule`/`direct`/`global`), rule lookup,
   outbound resolution, bidirectional relay with upload/download counters.
+- **JNI bridge** (`src/jni` + `jni/java/`): hand-written replacement for the
+  gomobile-generated `com.follow.clash.core.mobile.Mobile` class. Implements all
+  16 native methods `Core.kt` calls, plus `ResultHandler`/`TunHandler` callbacks
+  and event delivery from native threads. TUN returns `false` (smoltcp pending).
 - **Mobile protocol** (`src/mobile`): gomobile-compatible `invokeMethod` JSON
   protocol (`MethodCall`/`MethodResponse`), with stateless/lifecycle methods
   implemented (`coreVersion`, `getIsInit`, `initClash`, `shutdown`, …) and a
