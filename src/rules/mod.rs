@@ -175,11 +175,14 @@ impl Rule {
                 TargetAddr::Ip(ip, _) => Some(*ip),
                 _ => None,
             }) {
-                Some(ip) => match geo {
-                    Some(_) if self.value.eq_ignore_ascii_case("lan") => GeoData::geoip_is_lan(ip),
-                    Some(g) => g.geoip.contains(&self.value, ip),
-                    None => false,
-                },
+                Some(ip) => {
+                    if self.value.eq_ignore_ascii_case("lan") {
+                        // The built-in LAN shortcut needs no geodata file.
+                        GeoData::geoip_is_lan(ip)
+                    } else {
+                        geo.map(|g| g.geoip.contains(&self.value, ip)).unwrap_or(false)
+                    }
+                }
                 None => false,
             },
             RuleKind::GeoSite => match addr {
@@ -248,7 +251,7 @@ mod tests {
     #[test]
     fn domain_regex_and_wildcard() {
         let set = RuleSet::new(&[
-            "DOMAIN-REGEX,^ads[0-9]+\\.example\\..com$,REJECT".into(),
+            "DOMAIN-REGEX,^ads[0-9]+\\.example\\.com$,REJECT".into(),
             "DOMAIN-WILDCARD,*.tracker.*,REJECT".into(),
             "MATCH,DIRECT".into(),
         ]);
