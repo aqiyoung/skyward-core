@@ -137,10 +137,16 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_quickSetup(
     mut env: JNIEnv,
     _class: JObject,
     _init_params: JString,
-    _setup_params: JString,
+    setup_params: JString,
     handler: JObject,
 ) {
-    let result = mobile::invoke(br#"{"method":"setupConfig","arguments":{}}"#);
+    let setup_text = java_string(&mut env, &setup_params);
+    // Build a MethodCall around setupConfig so the existing handler does the work.
+    let payload = format!(
+        "{{\"method\":\"setupConfig\",\"arguments\":{}}}",
+        if setup_text.trim().is_empty() { "{}".to_string() } else { setup_text }
+    );
+    let result = mobile::invoke(payload.as_bytes());
     if let Err(e) = fire_result(&mut env, &handler, &result) {
         let _ = env.throw_new("java/lang/RuntimeException", format!("quickSetup callback: {}", e));
     }
@@ -202,7 +208,11 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
                 Some(rt) => rt,
                 None => return JNI_FALSE,
             };
-            let engine = rt.block_on(build_default_engine());
+            // Use the active engine if the App already applied a config;
+            // otherwise fall back to a default DIRECT-only engine.
+            let engine = rt
+                .block_on(crate::runtime_state::engine())
+                .unwrap_or_else(|| rt.block_on(build_default_engine()));
             let wake = TUN_WAKE
                 .get_or_init(|| Arc::new(tokio::sync::Notify::new()))
                 .clone();
@@ -228,14 +238,12 @@ async fn build_default_engine() -> Arc<crate::tunnel::Engine> {
     Arc::new(crate::tunnel::Engine::new(config, traffic, std::path::Path::new(".")).await)
 }
 
-fn traffic_json(total: bool) -> String {
-    let method = if total { "getTotalTraffic" } else { "getTraffic" };
-    let payload = format!("{{\"method\":\"{}\"}}", method);
-    let response = mobile::invoke(payload.as_bytes());
-    match serde_json::from_slice::<serde_json::Value>(&response) {
-        Ok(v) => v["result"].to_string(),
-        Err(_) => "{\"up\":0,\"down\":0}".to_string(),
+fn traffic_json(_total: bool) -> String {
+    if let Some(rt) = tokio_runtime() {
+        let snap = rt.block_on(crate::runtime_state::traffic_snapshot());
+        return serde_json::json!({"up": snap.up, "down": snap.down}).to_string();
     }
+    "{\"up\":0,\"down\":0}".to_string()
 }
 
 #[no_mangle]

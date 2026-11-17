@@ -96,8 +96,9 @@ CLI flags mirror the Go binary where practical:
   (`tun/relay.rs`), and an async runtime loop (`tun/runtime.rs`) that owns the
   device, drives the stack with `poll_at`-based timing, and answers DNS queries
   hijacked to port 53 via the kernel resolver. `startTun` spawns this loop on a
-  dedicated Tokio runtime. Still pending: wiring the real config (currently a
-  default engine) and half-close handling.
+  dedicated Tokio runtime. `setupConfig`/`updateConfig` load the App's config
+  from `base.path` into a global engine (`runtime_state.rs`) that the TUN loop
+  and traffic API use, so VPN traffic follows the selected proxies.
 - **JNI bridge** (`src/jni` + `jni/java/`): hand-written replacement for the
   gomobile-generated `com.follow.clash.core.mobile.Mobile` class. Implements all
   16 native methods `Core.kt` calls, plus `ResultHandler`/`TunHandler` callbacks

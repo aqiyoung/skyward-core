@@ -89,9 +89,10 @@ or `rustls`), a `TLS` connector abstraction, and a UUID/TLV codec layer.
   skeleton (`src/tun.rs`); [x] TCP session relay from smoltcp sockets to outbound
   adapters via byte queues (`tun/relay.rs`, `Engine::dial`); [x] outer async
   runtime loop + DNS hijack (`tun/runtime.rs`), wired from JNI `startTun`;
-  [ ] wire the real config into the TUN engine (currently default), half-close
-  handling, and end-to-end validation on a real device before the App VPN can
-  actually carry traffic.
+  [x] `setupConfig`/`updateConfig` load the App config into a global engine
+  (`runtime_state.rs`) used by the TUN loop and traffic API;
+  [ ] half-close handling, selected-map/provider hooks, and end-to-end validation
+  on a real device before the App VPN can actually carry traffic.
 
 ## Phase 6 — controller & operations
 

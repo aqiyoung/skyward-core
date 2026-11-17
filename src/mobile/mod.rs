@@ -98,6 +98,8 @@ pub fn invoke(data: &[u8]) -> Vec<u8> {
         "getConnectionCount" => ok(&call.id, json!(0)),
         "clearDnsCache" => ok(&call.id, Value::Bool(true)),
         "validateConfig" => handle_validate_config(&call),
+        "setupConfig" => handle_setup_config(&call),
+        "updateConfig" => handle_setup_config(&call),
         "message" => ok(&call.id, Value::Null),
         other => err(&call.id, "not_implemented", format!("unknown method: {}", other)),
     }
@@ -119,6 +121,63 @@ fn handle_init_clash(call: &MethodCall) -> Vec<u8> {
     let _ = HOME_DIR.set(params.home_dir);
     IS_INIT.store(true, Ordering::Relaxed);
     ok(&call.id, Value::Bool(true))
+}
+
+fn handle_setup_config(call: &MethodCall) -> Vec<u8> {
+    // Arguments: {"base":{"path":"..."},"test-url":"...","selected-map":{...}}
+    let path = call
+        .arguments
+        .get("base")
+        .and_then(|b| b.get("path"))
+        .and_then(|p| p.as_str())
+        .or_else(|| call.arguments.get("path").and_then(|p| p.as_str()));
+
+    let Some(path) = path else {
+        // No path supplied: apply an empty config so the engine exists and the
+        // TUN relay can at least start with DIRECT routing.
+        let future = async {
+            let config = crate::config::Config::default();
+            crate::runtime_state::apply_config(
+                config,
+                std::path::PathBuf::from("config.yaml"),
+                std::path::PathBuf::from("."),
+            )
+            .await;
+        };
+        return match block_on(future) {
+            Ok(()) => ok(&call.id, Value::String(String::new())),
+            Err(e) => ok(&call.id, Value::String(e)),
+        };
+    };
+
+    let path_owned = path.to_string();
+    let future = async move { crate::runtime_state::apply_config_from_path(&path_owned).await };
+    match block_on(future) {
+        Ok(()) => ok(&call.id, Value::String(String::new())),
+        Err(e) => ok(&call.id, Value::String(e)),
+    }
+}
+
+/// Inline block_on for the small setup futures (they run on a dedicated thread
+/// in the JNI path; this keeps `invoke` synchronous as gomobile expects).
+fn block_on<F: std::future::Future>(future: F) -> Result<F::Output, String> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string());
+        match rt {
+            Ok(rt) => {
+                let out = rt.block_on(future);
+                let _ = tx.send(Ok(out));
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e));
+            }
+        }
+    });
+    rx.recv().map_err(|_| "setup task failed".to_string())?
 }
 
 fn handle_validate_config(call: &MethodCall) -> Vec<u8> {
@@ -181,5 +240,27 @@ mod tests {
     fn malformed_call_is_reported() {
         let r = response(invoke(b"not json"));
         assert_eq!(r["error"]["code"], "invalid_arguments");
+    }
+
+    #[test]
+    fn setup_config_without_path_succeeds() {
+        let r = response(invoke(br#"{"method":"setupConfig","arguments":{}}"#));
+        assert_eq!(r["error"], Value::Null);
+        assert_eq!(r["result"], "");
+    }
+
+    #[test]
+    fn setup_config_from_file() {
+        let dir = std::env::temp_dir().join(format!("skyward-setup-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("config.yaml");
+        std::fs::write(&file, "mode: direct\nrules:\n  - MATCH,DIRECT\n").unwrap();
+        let payload = format!(
+            "{{\"method\":\"setupConfig\",\"arguments\":{{\"base\":{{\"path\":\"{}\"}}}}}}}",
+            file.to_string_lossy()
+        );
+        let r = response(invoke(payload.as_bytes()));
+        assert_eq!(r["result"], "");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
