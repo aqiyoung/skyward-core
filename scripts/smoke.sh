@@ -49,11 +49,23 @@ if [[ "$ready" != 1 ]]; then
   exit 1
 fi
 
+fail() {
+  echo "FAIL $1" >&2
+  echo "--- core.log ---" >&2
+  cat "$TMP/core.log" >&2 || true
+  echo "--- server.log ---" >&2
+  cat "$TMP/server.log" >&2 || true
+  exit 1
+}
+
 expect() {
   local label="$1" got="$2"
   if [[ "$got" != "SKYWARD_SMOKE_OK" ]]; then
     echo "FAIL $label: got '$got'" >&2
-    cat "$TMP/core.log" >&2
+    echo "--- core.log ---" >&2
+    cat "$TMP/core.log" >&2 || true
+    echo "--- server.log ---" >&2
+    cat "$TMP/server.log" >&2 || true
     exit 1
   fi
   echo "PASS $label"
@@ -64,11 +76,11 @@ expect() {
 unset no_proxy NO_PROXY || true
 
 got="$(curl -s --max-time 5 --socks5-hostname 127.0.0.1:17891 \
-  "http://localhost:${TARGET_PORT}/index.html")"
+  "http://localhost:${TARGET_PORT}/index.html")" || fail "socks5 curl exited $?"
 expect "socks5 inbound" "$got"
 
 got="$(curl -s --max-time 5 -x "http://127.0.0.1:17890" \
-  "http://localhost:${TARGET_PORT}/index.html")"
+  "http://localhost:${TARGET_PORT}/index.html")" || fail "http curl exited $?"
 expect "http inbound" "$got"
 
 curl -s --max-time 5 http://127.0.0.1:19090/traffic | grep -q '"up"' \
