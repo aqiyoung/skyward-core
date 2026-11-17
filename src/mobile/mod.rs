@@ -91,10 +91,13 @@ pub fn invoke(data: &[u8]) -> Vec<u8> {
         }
         "startListener" => ok(&call.id, Value::Bool(true)),
         "stopListener" => ok(&call.id, Value::Bool(true)),
-        "getMemoryStats" => ok(&call.id, json!({"inuse": 0, "oslimit": 0})),
         "getProxies" => handle_get_proxies(&call),
         "changeProxy" => handle_change_proxy(&call),
         "asyncTestDelay" => handle_test_delay(&call),
+        "probe" => handle_probe(&call),
+        "outboundIp" => handle_outbound_ip(&call),
+        "getMemoryStats" => handle_memory_stats(&call),
+        "validateProxies" => handle_validate_proxies(&call),
         "getTraffic" => handle_get_traffic(&call, false),
         "getTotalTraffic" => handle_get_traffic(&call, true),
         "resetTraffic" => handle_reset_traffic(&call),
@@ -188,6 +191,147 @@ fn handle_change_proxy(call: &MethodCall) -> Vec<u8> {
         json!({"message": "", "changed": before != after})
     };
     ok(&call.id, block_on(future).unwrap_or_else(|_| json!({"message": "error", "changed": false})))
+}
+
+/// Minimal HTTP GET through a named outbound; returns (status, body, delay_ms).
+async fn http_probe(
+    name: &str,
+    url: &str,
+    timeout_ms: i64,
+) -> Option<(u16, String, i64)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let rest = url.strip_prefix("http://")?;
+    let authority = rest.split('/').next()?;
+    let host = authority.split(':').next()?;
+    let port: u16 = authority.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(80);
+    let target = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => crate::common::TargetAddr::Ip(ip, port),
+        Err(_) => crate::common::TargetAddr::Domain(host.to_string(), port),
+    };
+    let path = format!("/{}", rest.split_once('/').map(|(_, p)| p).unwrap_or(""));
+    let engine = crate::runtime_state::engine().await?;
+    let dial = if name.is_empty() {
+        engine.dial(&target)
+    } else {
+        engine.dial_named(name, &target)
+    };
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms.max(1) as u64),
+        dial,
+    )
+    .await.ok()?.ok()?;
+    let start = std::time::Instant::now();
+    let request = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", path, authority);
+    tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms.max(1) as u64),
+        stream.write_all(request.as_bytes()),
+    ).await.ok()?.ok()?;
+    let mut body = Vec::new();
+    loop {
+        let mut buf = [0u8; 4096];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms.max(1) as u64),
+            stream.read(&mut buf),
+        ).await.ok()?.ok()?;
+        if n == 0 { break; }
+        body.extend_from_slice(&buf[..n]);
+        if body.len() > 64 * 1024 { break; }
+    }
+    let delay = start.elapsed().as_millis() as i64;
+    let head_end = body.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+    let head = String::from_utf8_lossy(&body[..head_end]);
+    let status = head.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let body_text = String::from_utf8_lossy(&body[head_end..]).into_owned();
+    Some((status, body_text, delay))
+}
+
+fn handle_probe(call: &MethodCall) -> Vec<u8> {
+    #[derive(Deserialize, Default)]
+    struct Params {
+        url: String,
+        #[serde(rename = "proxy-name")]
+        proxy_name: String,
+        timeout: i64,
+    }
+    let params: Params = serde_json::from_value(call.arguments.clone()).unwrap_or_default();
+    let url = if params.url.is_empty() { "http://www.gstatic.com/generate_204".to_string() } else { params.url.clone() };
+    let future = async move {
+        match http_probe(&params.proxy_name, &url, params.timeout).await {
+            Some((status, body, delay)) => json!({
+                "status-code": status, "delay": delay, "body": body, "url": url,
+                "chains": [], "rule": "", "rule-payload": "",
+            }),
+            None => json!({
+                "status-code": 0, "delay": -2i64, "body": "", "url": url,
+                "chains": [], "rule": "", "rule-payload": "",
+                "error": "connect failed", "message": "connect failed",
+            }),
+        }
+    };
+    ok(&call.id, block_on(future).unwrap_or_else(|_| json!({"status-code": 0, "delay": -2})))
+}
+
+fn handle_outbound_ip(call: &MethodCall) -> Vec<u8> {
+    #[derive(Deserialize, Default)]
+    struct Params {
+        #[serde(rename = "proxy-name")]
+        proxy_name: String,
+        urls: Vec<String>,
+        timeout: i64,
+    }
+    let params: Params = serde_json::from_value(call.arguments.clone()).unwrap_or_default();
+    let urls = if params.urls.is_empty() {
+        vec!["https://api.ipify.org".to_string()]
+    } else {
+        params.urls.clone()
+    };
+    let future = async move {
+        // First URL that answers wins (Dart supplies the parsers).
+        for url in &urls {
+            let probe_url = if url.starts_with("http://") || url.starts_with("https://") {
+                url.replace("https://", "http://")
+            } else {
+                format!("http://{}", url)
+            };
+            if let Some((status, body, delay)) = http_probe(&params.proxy_name, &probe_url, params.timeout).await {
+                if status >= 200 && status < 400 {
+                    return json!({"url": url, "body": body, "delay": delay, "chains": []});
+                }
+            }
+        }
+        json!({"url": urls.first().cloned().unwrap_or_default(), "body": "", "delay": -2i64, "chains": [], "error": "probe failed"})
+    };
+    ok(&call.id, block_on(future).unwrap_or_else(|_| json!({"error": "probe failed"})))
+}
+
+fn handle_memory_stats(call: &MethodCall) -> Vec<u8> {
+    // Rust process RSS via /proc/self/statm (pages); remaining fields are 0 as
+    // the runtime does not expose Go-style heap buckets.
+    let rss = std::fs::read_to_string("/proc/self/statm").ok().and_then(|s| {
+        let pages: Vec<&str> = s.split_whitespace().collect();
+        pages.get(1).and_then(|p| p.parse::<u64>().ok()).map(|p| p * 4096)
+    }).unwrap_or(0);
+    ok(&call.id, json!({
+        "rss": rss, "heapInuse": 0u64, "heapIdle": 0u64, "stackInuse": 0u64,
+        "runtimeOther": 0u64, "budget": 0i64, "gcPercent": 0i32, "deviceTotal": 0u64,
+    }))
+}
+
+fn handle_validate_proxies(call: &MethodCall) -> Vec<u8> {
+    let mappings = call.arguments.as_array().cloned().unwrap_or_default();
+    let results: Vec<String> = mappings.iter().map(|m| {
+        let obj = match m.as_object() { Some(o) => o, None => return "invalid proxy".to_string() };
+        let kind = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let supported = matches!(kind, "direct" | "reject" | "ss" | "shadowsocks" | "ssr" | "vmess" | "vless" | "trojan" | "snell" | "http" | "socks5");
+        if !supported {
+            return format!("unsupported proxy type: {}", kind);
+        }
+        if obj.get("name").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+            return "proxy name is required".to_string();
+        }
+        String::new()
+    }).collect();
+    ok(&call.id, json!(results))
 }
 
 fn handle_test_delay(call: &MethodCall) -> Vec<u8> {
@@ -634,6 +778,32 @@ mod tests {
         }).to_string();
         let r = response(invoke(payload.as_bytes()));
         assert_eq!(r["result"]["changed"], true);
+    }
+
+    #[test]
+    fn memory_stats_has_all_fields() {
+        let r = response(invoke(br#"{"method":"getMemoryStats"}"#));
+        assert!(r["result"].get("rss").is_some());
+        assert!(r["result"].get("heapInuse").is_some());
+        assert!(r["result"].get("deviceTotal").is_some());
+    }
+
+    #[test]
+    fn validate_proxies_reports_errors() {
+        let payload = serde_json::json!({
+            "method": "validateProxies",
+            "arguments": [
+                {"type": "ss", "name": "ok", "server": "x", "port": 1, "cipher": "aes-256-gcm", "password": "p"},
+                {"type": "bogus", "name": "bad"},
+                {"type": "ss"}
+            ]
+        }).to_string();
+        let r = response(invoke(payload.as_bytes()));
+        let arr = r["result"].as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0], "");
+        assert!(arr[1].as_str().unwrap().contains("bogus"));
+        assert!(arr[2].as_str().unwrap().contains("name"));
     }
 
     #[test]
