@@ -338,6 +338,14 @@ mod tests {
 
     #[test]
     fn change_proxy_updates_selection() {
+        // Set up an engine with a group first (tests share global state).
+        let _ = block_on(crate::runtime_state::apply_config(
+            crate::config::Config::from_str(
+                "proxies:\n  - {name: n1, type: direct}\nproxy-groups:\n  - {name: g1, type: select, proxies: [n1, DIRECT]}\n",
+            ).unwrap(),
+            std::path::PathBuf::from("c.yaml"),
+            std::path::PathBuf::from("."),
+        ));
         let payload = serde_json::json!({
             "method": "changeProxy",
             "arguments": {"group-name": "g1", "proxy-name": "DIRECT"}
