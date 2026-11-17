@@ -71,6 +71,16 @@ pub fn raw_config_json_at(path: &str) -> Result<serde_json::Value, String> {
     serde_yaml::from_str(&text).map_err(|e| e.to_string())
 }
 
+/// Read raw config JSON from an optional path, falling back to the active one.
+pub async fn read_raw_config(path: Option<&str>) -> Result<serde_json::Value, String> {
+    if let Some(p) = path {
+        if !p.is_empty() {
+            return raw_config_json_at(p);
+        }
+    }
+    raw_config_json().await
+}
+
 /// Test-only lock to serialize tests that mutate the global engine.
 #[cfg(test)]
 pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

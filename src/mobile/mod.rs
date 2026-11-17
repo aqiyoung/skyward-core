@@ -290,26 +290,8 @@ fn handle_reset_traffic(call: &MethodCall) -> Vec<u8> {
 
 fn handle_get_config(call: &MethodCall) -> Vec<u8> {
     let path = call.arguments.as_str().map(str::to_string);
-    let future = async move {
-        crate::runtime_state::raw_config_json_at(&path.unwrap_or_default())
-            .or_else(|_| futures_block_on_raw())
-    };
-    // withFallible shape: result on success, error string on failure.
-    match block_on(future) {
-        Ok(Ok(value)) => ok(&call.id, value),
-        Ok(Err(e)) => fallible_err(&call.id, &e),
-        Err(e) => fallible_err(&call.id, &e),
-    }
-}
-
-fn futures_block_on_raw() -> Result<serde_json::Value, String> {
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let out = rt.block_on(crate::runtime_state::raw_config_json());
-        let _ = tx.send(out);
-    });
-    rx.recv().map_err(|_| "config read failed".to_string())?
+    let future = async move { crate::runtime_state::read_raw_config(path.as_deref()).await };
+    finish_fallible(&call.id, block_on(future))
 }
 
 fn fallible_err(id: &str, message: &str) -> Vec<u8> {
@@ -324,28 +306,31 @@ fn fallible_err(id: &str, message: &str) -> Vec<u8> {
     })
 }
 
+/// Collapse the nested Result from block_on into a withFallible response.
+fn finish_fallible(id: &str, result: Result<Result<Value, String>, String>) -> Vec<u8> {
+    match result {
+        Ok(Ok(value)) => ok(id, value),
+        Ok(Err(e)) => fallible_err(id, &e),
+        Err(e) => fallible_err(id, &e),
+    }
+}
+
 fn handle_get_profile_base(call: &MethodCall) -> Vec<u8> {
-    let path = call.arguments.as_str().unwrap_or("").to_string();
+    let path = call.arguments.as_str().map(str::to_string);
     let future = async move {
-        let value = crate::runtime_state::raw_config_json_at(&path)
-            .or_else(|_| futures_block_on_raw())?;
-        let digest = sha256_hex(&value.to_string().into_bytes());
-        let proxies = value.get("proxies").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-        let groups = value.get("proxy-groups").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-        let rules = value.get("rules").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+        let value = crate::runtime_state::read_raw_config(path.as_deref()).await?;
+        let digest = sha256_hex(value.to_string().as_bytes());
+        let count = |key: &str| value.get(key).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
         Ok::<_, String>(json!({
             "config": value,
             "digest": digest,
             "match-rules": [],
-            "proxies": proxies,
-            "proxy-groups": groups,
-            "rules": rules,
+            "proxies": count("proxies"),
+            "proxy-groups": count("proxy-groups"),
+            "rules": count("rules"),
         }))
     };
-    match block_on(future) {
-        Ok(v) => ok(&call.id, v),
-        Err(e) => fallible_err(&call.id, &e),
-    }
+    finish_fallible(&call.id, block_on(future))
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -366,10 +351,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn handle_get_profile_outbounds(call: &MethodCall) -> Vec<u8> {
-    let path = call.arguments.as_str().unwrap_or("").to_string();
+    let path = call.arguments.as_str().map(str::to_string);
     let future = async move {
-        let value = crate::runtime_state::raw_config_json_at(&path)
-            .or_else(|_| futures_block_on_raw())?;
+        let value = crate::runtime_state::read_raw_config(path.as_deref()).await?;
         let extract = |key: &str| -> Vec<serde_json::Value> {
             value.get(key).and_then(|v| v.as_array()).map(|arr| arr.iter().map(|item| {
                 json!({
@@ -383,31 +367,21 @@ fn handle_get_profile_outbounds(call: &MethodCall) -> Vec<u8> {
             "proxy-groups": extract("proxy-groups"),
         }))
     };
-    match block_on(future) {
-        Ok(v) => ok(&call.id, v),
-        Err(e) => fallible_err(&call.id, &e),
-    }
+    finish_fallible(&call.id, block_on(future))
 }
 
 fn handle_get_proxy_definition(call: &MethodCall) -> Vec<u8> {
     let name = call.arguments.as_str().unwrap_or("").to_string();
     let future = async move {
-        let value = match futures_block_on_raw() {
-            Ok(v) => v,
-            Err(e) => return fallible_err("", &e),
-        };
+        let value = crate::runtime_state::read_raw_config(None).await.unwrap_or(Value::Null);
         let find = |key: &str| -> Option<serde_json::Value> {
             value.get(key).and_then(|v| v.as_array()).and_then(|arr| {
                 arr.iter().find(|item| item.get("name").and_then(|n| n.as_str()) == Some(&name)).cloned()
             })
         };
-        let result = find("proxies").or_else(|| find("proxy-groups")).unwrap_or(Value::Null);
-        Ok(result)
+        Ok(find("proxies").or_else(|| find("proxy-groups")).unwrap_or(Value::Null))
     };
-    match block_on(future) {
-        Ok(v) => ok(&call.id, v),
-        Err(e) => fallible_err(&call.id, &e),
-    }
+    finish_fallible(&call.id, block_on(future))
 }
 
 fn handle_external_providers(call: &MethodCall) -> Vec<u8> {
