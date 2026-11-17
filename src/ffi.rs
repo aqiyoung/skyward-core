@@ -147,10 +147,12 @@ fn home_dir_from_options(opts: *const SkywardOptions) -> Result<PathBuf, Skyward
 
 // ---- exported functions ----------------------------------------------------
 
+/// NUL-terminated copy of VERSION for the C ABI (Rust &str is not NUL-terminated).
+static VERSION_C: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "-alpha.1\0").as_bytes();
+
 #[no_mangle]
 pub extern "C" fn skyward_version() -> *const c_char {
-    // VERSION is 'static, so a pointer to its bytes stays valid forever.
-    VERSION.as_ptr() as *const c_char
+    VERSION_C.as_ptr() as *const c_char
 }
 
 #[no_mangle]
