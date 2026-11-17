@@ -118,7 +118,7 @@ impl Rc4 {
 /// Stateful XOR stream cipher for one direction.
 enum StreamCipher {
     Rc4(Rc4),
-    Cfb128 { block: AesKind, register: [u8; 16] },
+    Cfb128 { block: AesKind, register: [u8; 16], encrypt: bool },
     ChaCha(Box<dyn chacha20::cipher::StreamCipher + Send>),
 }
 
@@ -139,7 +139,7 @@ impl AesKind {
 }
 
 impl StreamCipher {
-    fn new(kind: CipherKind, key: &[u8], iv: &[u8]) -> io::Result<Self> {
+    fn new(kind: CipherKind, key: &[u8], iv: &[u8], encrypt: bool) -> io::Result<Self> {
         match kind {
             CipherKind::Rc4Md5 => {
                 let mut h = Md5::new();
@@ -160,7 +160,7 @@ impl StreamCipher {
                 };
                 let mut register = [0u8; 16];
                 register.copy_from_slice(&iv[..16]);
-                Ok(Self::Cfb128 { block, register })
+                Ok(Self::Cfb128 { block, register, encrypt })
             }
             CipherKind::ChaCha20 | CipherKind::ChaCha20Ietf | CipherKind::XChaCha20 => {
                 let cipher: Box<dyn chacha20::cipher::StreamCipher + Send> = match kind {
@@ -195,21 +195,30 @@ impl StreamCipher {
         match self {
             Self::Rc4(c) => c.apply_keystream(buf),
             Self::ChaCha(c) => c.apply_keystream(buf),
-            Self::Cfb128 { block, register } => {
-                // CFB-128: encrypt the shift register, XOR with plaintext,
-                // then feed the resulting ciphertext back into the register.
+            Self::Cfb128 { block, register, encrypt } => {
+                // CFB-128: keystream = AES(register); the feedback register is
+                // always the ciphertext block. When encrypting the ciphertext
+                // is the post-XOR output; when decrypting it is the pre-XOR
+                // input.
                 for chunk in buf.chunks_mut(16) {
                     let mut stream = Block::default();
                     stream.copy_from_slice(register);
                     block.encrypt_block(&mut stream);
-                    for (out, &ks) in chunk.iter_mut().zip(stream.iter()) {
-                        *out ^= ks;
+                    let ciphertext: Vec<u8> = if *encrypt {
+                        chunk.iter_mut().zip(stream.iter()).map(|(out, &ks)| {
+                            *out ^= ks;
+                            *out
+                        }).collect()
+                    } else {
+                        let input = chunk.to_vec();
+                        for (out, &ks) in chunk.iter_mut().zip(stream.iter()) {
+                            *out ^= ks;
+                        }
+                        input
+                    };
+                    if ciphertext.len() == 16 {
+                        register.copy_from_slice(&ciphertext);
                     }
-                    if chunk.len() == 16 {
-                        register.copy_from_slice(chunk);
-                    }
-                    // A partial final block does not update the register,
-                    // which is fine because it is the last block of the stream.
                 }
             }
         }
@@ -268,7 +277,7 @@ impl AsyncRead for SsrStream {
                     }
                 }
             }
-            match StreamCipher::new(this.cipher, &this.key, &this.read_iv) {
+            match StreamCipher::new(this.cipher, &this.key, &this.read_iv, false) {
                 Ok(c) => this.dec = Some(c),
                 Err(e) => return Poll::Ready(Err(e)),
             }
@@ -377,7 +386,7 @@ impl Outbound for SsrOutbound {
         // shadowstream + origin protocol layering.
         tcp.write_all(&iv).await?;
 
-        let enc = StreamCipher::new(self.cipher, &self.key, &iv)?;
+        let enc = StreamCipher::new(self.cipher, &self.key, &iv, true)?;
         let mut stream = SsrStream::new(tcp, enc, self.key.clone(), self.cipher);
 
         let header = encode_socks_target(target);
@@ -428,8 +437,8 @@ mod tests {
     fn rc4_md5_roundtrip() {
         let key = kdf(b"password", 16);
         let iv = [3u8; 16];
-        let mut a = StreamCipher::new(CipherKind::Rc4Md5, &key, &iv).unwrap();
-        let mut b = StreamCipher::new(CipherKind::Rc4Md5, &key, &iv).unwrap();
+        let mut a = StreamCipher::new(CipherKind::Rc4Md5, &key, &iv, true).unwrap();
+        let mut b = StreamCipher::new(CipherKind::Rc4Md5, &key, &iv, false).unwrap();
         let original = b"hello world";
         let mut buf = original.to_vec();
         a.apply(&mut buf);
@@ -442,8 +451,8 @@ mod tests {
     fn aes_cfb_roundtrip() {
         let key = kdf(b"password", 16);
         let iv = [5u8; 16];
-        let mut a = StreamCipher::new(CipherKind::Aes128Cfb, &key, &iv).unwrap();
-        let mut b = StreamCipher::new(CipherKind::Aes128Cfb, &key, &iv).unwrap();
+        let mut a = StreamCipher::new(CipherKind::Aes128Cfb, &key, &iv, true).unwrap();
+        let mut b = StreamCipher::new(CipherKind::Aes128Cfb, &key, &iv, false).unwrap();
         let mut buf = vec![0x42u8; 100]; // spans multiple 16-byte blocks
         let original = buf.clone();
         a.apply(&mut buf);
