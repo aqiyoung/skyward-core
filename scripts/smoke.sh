@@ -34,10 +34,26 @@ HTTP_PID=$!
 "$BIN" -c "$CONFIG" > "$TMP/core.log" 2>&1 &
 CORE_PID=$!
 
+# Wait for the target HTTP server first: the proxy resolves connections as
+# soon as the controller is up, so a slow target would cause connection resets.
+target_ready=0
+for _ in $(seq 1 40); do
+  if curl -s --noproxy '*' --max-time 1 "http://127.0.0.1:${TARGET_PORT}/index.html" >/dev/null 2>&1; then
+    target_ready=1
+    break
+  fi
+  sleep 0.25
+done
+if [[ "$target_ready" != 1 ]]; then
+  echo "target http server did not become ready" >&2
+  cat "$TMP/server.log" >&2 || true
+  exit 1
+fi
+
 # Wait for the controller to come up.
 ready=0
 for _ in $(seq 1 40); do
-  if curl -s --max-time 1 http://127.0.0.1:19090/version >/dev/null 2>&1; then
+  if curl -s --noproxy '*' --max-time 1 http://127.0.0.1:19090/version >/dev/null 2>&1; then
     ready=1
     break
   fi
@@ -73,7 +89,7 @@ expect() {
 
 # no_proxy may be set in the environment; clear it so curl actually uses the
 # explicitly supplied proxy. Use a hostname in the URL to exercise domain rules.
-unset no_proxy NO_PROXY || true
+unset no_proxy NO_PROXY http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy || true
 
 got="$(curl -s --max-time 5 --socks5-hostname 127.0.0.1:17891 \
   "http://localhost:${TARGET_PORT}/index.html")" || fail "socks5 curl exited $?"
