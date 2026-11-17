@@ -53,6 +53,21 @@ impl<'a> Stack<'a> {
         let _ = self.iface.poll(now, device, &mut self.sockets);
     }
 
+    /// Drive one cycle and, when an engine is available, pump TCP sessions so
+    /// smoltcp sockets relay through the kernel's outbound adapters.
+    pub fn poll_with_sessions<D>(
+        &mut self,
+        device: &mut D,
+        now: Instant,
+        manager: &mut super::relay::SessionManager,
+        engine: &std::sync::Arc<crate::tunnel::Engine>,
+    ) where
+        D: smoltcp::phy::Device,
+    {
+        let _ = self.iface.poll(now, device, &mut self.sockets);
+        manager.pump(&mut self.sockets, engine);
+    }
+
     /// Number of active TCP sockets currently listening/connected.
     pub fn active_tcp_count(&self) -> usize {
         self.sockets

@@ -14,6 +14,7 @@ use serde::Deserialize;
 use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 
+pub mod relay;
 pub mod stack;
 
 #[derive(Debug, Clone, Deserialize)]

@@ -14,7 +14,7 @@ use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 
 use crate::adapter::provider::ProxyProviderRegistry;
-use crate::adapter::OutboundManager;
+use crate::adapter::{BoxedStream, OutboundManager};
 use crate::common::{SharedTraffic, TargetAddr};
 use crate::config::Config;
 use crate::dns::Resolver;
@@ -124,6 +124,18 @@ impl Engine {
                     .unwrap_or_else(|| "DIRECT".to_string())
             }
         }
+    }
+
+    /// Dial a target through the rule/outbound pipeline without relaying.
+    /// Used by the TUN stack, which drives the socket itself and only needs a
+    /// connected stream to bridge bytes into.
+    pub async fn dial(&self, target: &TargetAddr) -> io::Result<BoxedStream> {
+        let rule_target = self.decide(target).await;
+        let final_name = self.outbounds.resolve(&rule_target).await;
+        let outbound = self.outbounds.outbound(&final_name).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("unknown outbound '{}'", final_name))
+        })?;
+        outbound.connect(target).await
     }
 
     /// Drive a single inbound connection to completion. `prefix` carries bytes
