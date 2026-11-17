@@ -16,6 +16,7 @@ use std::sync::OnceLock;
 
 use crate::common::VERSION;
 
+pub mod log_bridge;
 pub mod share_links;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -98,6 +99,12 @@ pub fn invoke(data: &[u8]) -> Vec<u8> {
         "outboundIp" => handle_outbound_ip(&call),
         "getMemoryStats" => handle_memory_stats(&call),
         "validateProxies" => handle_validate_proxies(&call),
+        "startLog" => handle_start_log(&call),
+        "stopLog" => handle_stop_log(&call),
+        "watchRoute" => handle_watch_route(&call),
+        "clearEffect" => handle_clear_effect(&call),
+        "updateExternalProvider" => handle_update_external_provider(&call),
+        "sideLoadExternalProvider" => handle_update_external_provider(&call),
         "getTraffic" => handle_get_traffic(&call, false),
         "getTotalTraffic" => handle_get_traffic(&call, true),
         "resetTraffic" => handle_reset_traffic(&call),
@@ -317,6 +324,46 @@ fn handle_memory_stats(call: &MethodCall) -> Vec<u8> {
         "rss": rss, "heapInuse": 0u64, "heapIdle": 0u64, "stackInuse": 0u64,
         "runtimeOther": 0u64, "budget": 0i64, "gcPercent": 0i32, "deviceTotal": 0u64,
     }))
+}
+
+fn handle_start_log(call: &MethodCall) -> Vec<u8> {
+    log_bridge::start();
+    ok(&call.id, Value::Bool(true))
+}
+
+fn handle_stop_log(call: &MethodCall) -> Vec<u8> {
+    log_bridge::stop();
+    ok(&call.id, Value::Bool(true))
+}
+
+fn handle_watch_route(call: &MethodCall) -> Vec<u8> {
+    let future = async {
+        let picks = match crate::runtime_state::engine().await {
+            Some(engine) => {
+                let mut map = serde_json::Map::new();
+                for (name, group) in &engine.outbounds.groups {
+                    if let Some(sel) = group.selected() {
+                        map.insert(name.clone(), Value::String(sel));
+                    }
+                }
+                map
+            }
+            None => serde_json::Map::new(),
+        };
+        json!({"core-epoch": 0, "picks-version": 0, "picks": picks})
+    };
+    ok(&call.id, block_on(future).unwrap_or_else(|_| json!({"picks": {}})))
+}
+
+fn handle_clear_effect(call: &MethodCall) -> Vec<u8> {
+    // No persistent provider cache in this slice; acknowledged.
+    ok(&call.id, Value::String(String::new()))
+}
+
+fn handle_update_external_provider(call: &MethodCall) -> Vec<u8> {
+    // Provider reload would re-fetch the subscription; in this slice the data
+    // is loaded once at config time. Acknowledge so the UI does not hang.
+    ok(&call.id, Value::String(String::new()))
 }
 
 fn handle_validate_proxies(call: &MethodCall) -> Vec<u8> {
@@ -780,6 +827,23 @@ mod tests {
         }).to_string();
         let r = response(invoke(payload.as_bytes()));
         assert_eq!(r["result"]["changed"], true);
+    }
+
+    #[test]
+    fn log_and_route_methods() {
+        let r = response(invoke(br#"{"method":"startLog"}"#));
+        assert_eq!(r["result"], true);
+        let r = response(invoke(br#"{"method":"watchRoute"}"#));
+        assert!(r["result"].get("picks").is_some());
+        assert!(r["result"].get("core-epoch").is_some());
+        let r = response(invoke(br#"{"method":"stopLog"}"#));
+        assert_eq!(r["result"], true);
+    }
+
+    #[test]
+    fn provider_update_is_acknowledged() {
+        let r = response(invoke(br#"{"method":"updateExternalProvider","arguments":"p1"}"#));
+        assert_eq!(r["result"], "");
     }
 
     #[test]
