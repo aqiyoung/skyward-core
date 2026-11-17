@@ -259,10 +259,11 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let file = dir.join("config.yaml");
         std::fs::write(&file, "mode: direct\nrules:\n  - MATCH,DIRECT\n").unwrap();
-        let payload = format!(
-            "{{\"method\":\"setupConfig\",\"arguments\":{{\"base\":{{\"path\":\"{}\"}}}}}}}",
-            file.to_string_lossy()
-        );
+        let payload = serde_json::json!({
+            "method": "setupConfig",
+            "arguments": { "base": { "path": file.to_string_lossy() } }
+        })
+        .to_string();
         let r = response(invoke(payload.as_bytes()));
         assert_eq!(r["result"], "");
         let _ = std::fs::remove_dir_all(&dir);
