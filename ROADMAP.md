@@ -63,10 +63,13 @@ or `rustls`), a `TLS` connector abstraction, and a UUID/TLV codec layer.
 
 ## Phase 5 — network stack
 
-- [ ] TUN inbound (system + gvisor-like userspace stack)
-- [ ] TPROXY / REDIR (Linux netfilter), `iptables` integration
+- [x] Linux transparent proxy inbounds — REDIRECT (`SO_ORIGINAL_DST`) and
+  TPROXY (`IP_TRANSPARENT`) TCP, feeding the existing tunnel
+  (`src/inbound/transparent.rs`). Firewall rules are operator-managed.
+- [ ] TUN inbound (system + smoltcp userspace stack)
 - [ ] UDP full-cone NAT for all UDP-capable protocols
 - [ ] Interface binding, routing marks, dialer options
+- [ ] Automatic iptables/nftables rule management
 
 ## Phase 6 — controller & operations
 

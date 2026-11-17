@@ -58,7 +58,9 @@ CLI flags mirror the Go binary where practical:
   `allow-lan`, `mode`, `log-level`, `external-controller`, `secret`, `proxies`,
   `proxy-groups`, `rules`, `dns`. Validates mode and duplicate names.
 - **Inbound** (`src/inbound`): SOCKS5 (IPv4/IPv6/domain, CONNECT), HTTP proxy
-  (CONNECT + absolute-form with origin-form rewrite), mixed port auto-detection.
+  (CONNECT + absolute-form with origin-form rewrite), mixed port auto-detection,
+  and Linux transparent proxy (`redir-port` via `SO_ORIGINAL_DST`, `tproxy-port`
+  via `IP_TRANSPARENT`).
 - **Rules** (`src/rules`): `DOMAIN`, `DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`,
   `DOMAIN-REGEX`, `DOMAIN-WILDCARD`, `IP-CIDR`/`IP-CIDR6`, `IP-SUFFIX`,
   `DST-PORT`, `GEOIP` (incl. `lan`), `GEOSITE`, `RULE-SET`, `MATCH`, with
@@ -112,6 +114,7 @@ or `?token=<secret>`.
 | `main.go` | `src/main.rs` | implemented (subset of flags) |
 | `config/` | `src/config` | implemented (subset of keys) |
 | `listener/` (socks, http, mixed) | `src/inbound` | implemented |
+| `listener/redir`, `listener/tproxy` | `src/inbound/transparent.rs` | implemented (Linux) |
 | `rules/` | `src/rules` | subset implemented |
 | `component/dns` | `src/dns` | simplified resolver |
 | `component/geodata/`, `rules/common/{geoip,geosite}.go` | `src/geo` | implemented (protobuf subset) |
@@ -126,6 +129,23 @@ or `?token=<secret>`.
 | `transport/`, `adapter/outbound/*` | — | not ported (see ROADMAP) |
 | `listener/tun/` | — | not ported |
 
+## Transparent proxy setup (Linux)
+
+The listeners recover the original destination but **do not install firewall
+rules**. Run the core as root (or with `CAP_NET_ADMIN` / `CAP_NET_RAW`), then set
+up the rules yourself, for example:
+
+```bash
+# REDIRECT (redir-port 7895)
+iptables -t nat -A PREROUTING -p tcp -j REDIRECT --to-ports 7895
+
+# TPROXY (tproxy-port 7896)
+iptables -t mangle -A PREROUTING -p tcp -j TPROXY \
+  --on-port 7896 --tproxy-mark 0x1/0x1
+ip rule add fwmark 1 lookup 100
+ip route add local 0.0.0.0/0 dev lo table 100
+```
+
 ## Known limitations
 
 - Beyond Shadowsocks AEAD, Trojan, VLESS, VMess, HTTP and SOCKS5, other `proxies`
@@ -133,6 +153,8 @@ or `?token=<secret>`.
   "not implemented" error. Shadowsocks plugins/2022 ciphers, Trojan WebSocket/obfs,
   VLESS XTLS/REALITY, and legacy (non-AEAD) VMess are not supported.
 - TLS uses webpki-roots; `skip-cert-verify` and client certificates are not supported.
+- Transparent proxy is Linux/IPv4 only; the kernel does not install iptables/nftables
+  rules automatically, and there is no UDP NAT or TUN/smoltcp stack yet.
 - No TUN/TPROXY, no GEOIP/GEOSITE, no process-name rules, no rule providers.
 - DNS uses the system forward resolver with a 60 s cache — no DoH/DoT or fake-ip.
 - The REST controller does not implement the full mihomo API (no WebSocket traffic

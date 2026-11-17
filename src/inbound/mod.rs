@@ -1,4 +1,6 @@
-//! Inbound listeners: SOCKS5 (RFC 1928) and HTTP proxy (CONNECT + absolute-form).
+//! Inbound listeners: SOCKS5 (RFC 1928), HTTP proxy and Linux transparent proxy.
+
+pub mod transparent;
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};

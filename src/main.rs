@@ -102,16 +102,12 @@ async fn main() -> anyhow::Result<()> {
     // Snapshot everything needed to start listeners before moving the config
     // into the engine.
     let host = if config.allow_lan { "0.0.0.0" } else { "127.0.0.1" };
-    let mut listeners: Vec<(&'static str, String)> = Vec::new();
-    if let Some(p) = config.socks_port {
-        listeners.push(("socks5", format!("{}:{}", host, p)));
-    }
-    if let Some(p) = config.port {
-        listeners.push(("http", format!("{}:{}", host, p)));
-    }
-    if let Some(p) = config.mixed_port {
-        listeners.push(("mixed", format!("{}:{}", host, p)));
-    }
+    let mut listeners: Vec<(&'static str, u16)> = Vec::new();
+    if let Some(p) = config.socks_port { listeners.push(("socks5", p)); }
+    if let Some(p) = config.port { listeners.push(("http", p)); }
+    if let Some(p) = config.mixed_port { listeners.push(("mixed", p)); }
+    if let Some(p) = config.redir_port { listeners.push(("redir", p)); }
+    if let Some(p) = config.tproxy_port { listeners.push(("tproxy", p)); }
     let controller = config.external_controller.clone();
 
     let traffic = Arc::new(TrafficStats::default());
@@ -125,14 +121,25 @@ async fn main() -> anyhow::Result<()> {
         state.engine.read().await.rules.rules.len(),
         state.engine.read().await.outbounds.outbounds.len());
 
-    for (kind, addr) in &listeners {
-        match skyward_core::inbound::bind(addr).await {
+    for (kind, port) in &listeners {
+        let transparent = *kind == "redir" || *kind == "tproxy";
+        let addr = format!("{}:{}", if transparent { "0.0.0.0" } else { host }, port);
+        let bound = if *kind == "redir" {
+            skyward_core::inbound::transparent::bind_redir(*port).await
+        } else if *kind == "tproxy" {
+            skyward_core::inbound::transparent::bind_tproxy(*port).await
+        } else {
+            skyward_core::inbound::bind(&addr).await
+        };
+        match bound {
             Ok(listener) => {
                 tracing::info!("{} inbound listening on {}", kind, addr);
                 let st = state.clone();
                 match *kind {
                     "socks5" => { tokio::spawn(skyward_core::inbound::serve_socks(listener, st)); }
                     "http" => { tokio::spawn(skyward_core::inbound::serve_http(listener, st)); }
+                    "redir" => { tokio::spawn(skyward_core::inbound::transparent::serve_redir(listener, st)); }
+                    "tproxy" => { tokio::spawn(skyward_core::inbound::transparent::serve_tproxy(listener, st)); }
                     _ => { tokio::spawn(skyward_core::inbound::serve_mixed(listener, st)); }
                 }
             }
@@ -140,7 +147,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     if listeners.is_empty() {
-        tracing::warn!("no inbound ports configured; set socks-port, port, or mixed-port");
+        tracing::warn!("no inbound ports configured; set socks-port, port, mixed-port, redir-port or tproxy-port");
     }
 
     if let Some(addr) = &controller {

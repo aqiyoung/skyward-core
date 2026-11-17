@@ -15,6 +15,10 @@ pub struct Config {
     /// Combined HTTP + SOCKS5 port.
     #[serde(rename = "mixed-port")]
     pub mixed_port: Option<u16>,
+    #[serde(rename = "redir-port")]
+    pub redir_port: Option<u16>,
+    #[serde(rename = "tproxy-port")]
+    pub tproxy_port: Option<u16>,
     #[serde(rename = "allow-lan")]
     pub allow_lan: bool,
     pub mode: String,
@@ -42,6 +46,8 @@ impl Default for Config {
             port: None,
             socks_port: None,
             mixed_port: None,
+            redir_port: None,
+            tproxy_port: None,
             allow_lan: false,
             mode: "rule".to_string(),
             log_level: "info".to_string(),
