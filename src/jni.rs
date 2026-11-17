@@ -16,6 +16,7 @@ use crate::mobile;
 
 static JAVA_VM: OnceLock<JavaVM> = OnceLock::new();
 static EVENT_LISTENER: Mutex<Option<GlobalRef>> = Mutex::new(None);
+static TUN_SESSION: Mutex<Option<(i32, crate::tun::TunConfig)>> = Mutex::new(None);
 
 fn vm() -> Option<&'static JavaVM> {
     JAVA_VM.get()
@@ -159,16 +160,44 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_stopTun(
 pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
     mut env: JNIEnv,
     _class: JObject,
-    _fd: jint,
+    fd: jint,
     _handler: JObject,
-    _stack: JString,
-    _address: JString,
-    _dns: JString,
-    _options: JString,
+    stack: JString,
+    address: JString,
+    dns: JString,
+    options: JString,
 ) -> jboolean {
-    // TUN (smoltcp) is not ported yet; report failure rather than pretending.
-    let _ = &mut env;
-    JNI_FALSE
+    let stack_text = java_string(&mut env, &stack);
+    let address_text = java_string(&mut env, &address);
+    let dns_text = java_string(&mut env, &dns);
+    let options_text = java_string(&mut env, &options);
+
+    let config = match crate::tun::TunConfig::parse(&stack_text, &address_text, &dns_text, &options_text) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("startTun: invalid config: {}", e);
+            return JNI_FALSE;
+        }
+    };
+
+    // TUN device creation takes ownership of fd only once the config is valid.
+    match crate::tun::device_from_fd(fd, config.options.mtu) {
+        Ok(device) => {
+            tracing::info!(
+                "TUN session started: fd={} stack={} mtu={}",
+                fd, config.stack, config.options.mtu
+            );
+            // Keep the config for the relay loop; the device is owned by the
+            // session task once the stack is fully wired (next slice).
+            drop(device);
+            *TUN_SESSION.lock().unwrap() = Some((fd, config));
+            JNI_TRUE
+        }
+        Err(e) => {
+            tracing::error!("startTun: device from fd failed: {}", e);
+            JNI_FALSE
+        }
+    }
 }
 
 fn traffic_json(total: bool) -> String {
@@ -215,6 +244,17 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert!(value.get("up").is_some());
         assert!(value.get("down").is_some());
+    }
+
+    #[test]
+    fn tun_session_starts_with_valid_config() {
+        assert!(TUN_SESSION.lock().unwrap().is_none());
+        let cfg = crate::tun::TunConfig::parse("gvisor", "10.0.0.2/30", "198.51.100.1", "").unwrap();
+        *TUN_SESSION.lock().unwrap() = Some((42, cfg));
+        let guard = TUN_SESSION.lock().unwrap();
+        assert_eq!(guard.as_ref().unwrap().0, 42);
+        drop(guard);
+        *TUN_SESSION.lock().unwrap() = None;
     }
 
     #[test]

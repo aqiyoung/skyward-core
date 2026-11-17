@@ -85,7 +85,9 @@ or `rustls`), a `TLS` connector abstraction, and a UUID/TLV codec layer.
   [x] JNI `Mobile` class + callbacks (`src/jni.rs`, `jni/java/`) — all 16 native
       methods Core.kt calls, ResultHandler/TunHandler, event delivery;
   [ ] remaining ~45 `invokeMethod` methods; [ ] wire real traffic/connections
-  [ ] TUN (smoltcp) required before the App can fully run on the Rust core.
+- [ ] TUN (smoltcp) — [x] raw-fd Device + config parsing + interface/socket-pool
+  skeleton (`src/tun.rs`); [ ] TCP session relay from smoltcp sockets to our
+  outbound adapters (needed before the App VPN can actually carry traffic).
 
 ## Phase 6 — controller & operations
 

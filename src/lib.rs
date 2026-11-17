@@ -13,6 +13,7 @@ pub mod jni;
 pub mod mobile;
 pub mod rules;
 pub mod tunnel;
+pub mod tun;
 
 // Re-export for the REST controller.
 pub use tunnel::connection::{ConnectionInfo, Network};
