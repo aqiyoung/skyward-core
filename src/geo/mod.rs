@@ -155,7 +155,7 @@ enum Field<'a> {
     Bytes(&'a [u8]),
 }
 
-fn next_field(r: &mut Reader<'_>) -> Result<Option<(u32, Field<'_>)>, String> {
+fn next_field<'a>(r: &mut Reader<'a>) -> Result<Option<(u32, Field<'a>)>, String> {
     if r.done() {
         return Ok(None);
     }

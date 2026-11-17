@@ -4,6 +4,7 @@ use std::io;
 use std::net::IpAddr;
 
 use async_trait::async_trait;
+use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -51,7 +52,8 @@ impl HttpOutbound {
             "CONNECT {addr} HTTP/1.1\r\nHost: {addr}\r\nUser-Agent: Go-http-client/1.1\r\nProxy-Connection: Keep-Alive\r\n"
         );
         if !self.username.is_empty() || !self.password.is_empty() {
-            let auth = base64::encode(format!("{}:{}", self.username, self.password));
+            let auth = base64::engine::general_purpose::STANDARD
+                .encode(format!("{}:{}", self.username, self.password));
             headers.push_str(&format!("Proxy-Authorization: Basic {auth}\r\n"));
         }
         headers.push_str("\r\n");
