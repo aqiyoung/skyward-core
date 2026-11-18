@@ -230,7 +230,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             Err(_) => return,
         };
         tokio::spawn(async move {
-            let mut stream: BoxedStream = match tokio::select! {
+            let mut stream: BoxedStream = tokio::select! {
                 _ = cancel.notified() => return,
                 result = tokio::time::timeout(std::time::Duration::from_secs(10), engine.dial(&target)) => {
                     match result {
