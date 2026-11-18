@@ -232,13 +232,19 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
         tokio::spawn(async move {
             let mut stream: BoxedStream = match tokio::select! {
                 _ = cancel.notified() => return,
-                result = engine.dial(&target) => result,
-            } {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("TUN flow {} dial failed: {}", addr, e);
-                    diag(format!("flow {} dial failed: {}", addr, e));
-                    return;
+                result = tokio::time::timeout(std::time::Duration::from_secs(10), engine.dial(&target)) => {
+                    match result {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(e)) => {
+                            tracing::warn!("TUN flow {} dial failed: {}", addr, e);
+                            diag(format!("flow {} dial failed: {}", addr, e));
+                            return;
+                        }
+                        Err(_) => {
+                            diag(format!("flow {} dial timed out", addr));
+                            return;
+                        }
+                    }
                 }
             };
             let mut read_buf = vec![0u8; 16 * 1024];
@@ -278,6 +284,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
         let mut io = self.io.lock().unwrap();
         if let Err(e) = io.write_all(&packet) {
             tracing::warn!("TUN write failed: {}", e);
+            diag(format!("TUN write failed: {}", e));
         }
     }
 }

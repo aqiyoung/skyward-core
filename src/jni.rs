@@ -42,7 +42,13 @@ pub fn protect_fd(fd: i32) -> bool {
     };
     let result = env.call_method(handler.as_obj(), "protect", "(I)Z", &[JValue::Int(fd)]);
     match result {
-        Ok(v) => v.z().unwrap_or(false),
+        Ok(v) => {
+            let ok = v.z().unwrap_or(false);
+            if !ok {
+                protect_diag(&format!("protect({}) returned false", fd));
+            }
+            ok
+        }
         Err(e) => {
             protect_diag(&format!("protect({}) failed: {}", fd, e));
             false

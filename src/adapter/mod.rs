@@ -8,12 +8,8 @@ use std::io;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::RwLock;
-use tokio::time::timeout;
 
 use crate::common::TargetAddr;
 use crate::config::{Config, ProxyDef};
@@ -149,7 +145,6 @@ pub struct ProxyInfo {
 pub struct OutboundManager {
     pub outbounds: HashMap<String, Arc<dyn Outbound>>,
     pub groups: HashMap<String, GroupState>,
-    health: RwLock<HashMap<String, (Instant, String)>>,
 }
 
 pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
@@ -338,7 +333,7 @@ impl OutboundManager {
             cursor: AtomicUsize::new(0),
         });
 
-        Self { outbounds, groups, health: RwLock::new(HashMap::new()) }
+        Self { outbounds, groups }
     }
 
     /// Resolve a rule target down to a concrete outbound name.
@@ -360,43 +355,15 @@ impl OutboundManager {
                 let i = group.cursor.fetch_add(1, Ordering::Relaxed) % candidates.len();
                 candidates[i].clone()
             }
-            "url-test" | "fallback" => self.pick_healthiest(group, &candidates).await,
+            // Never block the data path on health probes: probing every
+            // candidate (hundreds of nodes at up to 800ms each) stalled every
+            // connection for minutes. Use the current selection, which the
+            // App's delay tests keep up to date.
+            "url-test" | "fallback" => group
+                .selected()
+                .filter(|name| candidates.contains(name))
+                .unwrap_or_else(|| candidates[0].clone()),
             _ => group.selected().unwrap_or_else(|| candidates[0].clone()),
-        }
-    }
-
-    async fn pick_healthiest(&self, group: &GroupState, candidates: &[String]) -> String {
-        {
-            let cache = self.health.read().await;
-            if let Some((at, name)) = cache.get(&group.name) {
-                if at.elapsed() < Duration::from_secs(60) && candidates.contains(name) {
-                    return name.clone();
-                }
-            }
-        }
-
-        let mut best: Option<(Duration, String)> = None;
-        for name in candidates {
-            if let Some(d) = self.probe(name).await {
-                if best.as_ref().map(|(bd, _)| d < *bd).unwrap_or(true) {
-                    best = Some((d, name.clone()));
-                }
-            }
-        }
-        let chosen = best.map(|(_, n)| n).unwrap_or_else(|| candidates[0].clone());
-        self.health.write().await.insert(group.name.clone(), (Instant::now(), chosen.clone()));
-        chosen
-    }
-
-    /// Measure how long a TCP connect through an outbound takes. Unimplemented
-    /// outbounds fail the probe and are therefore never selected.
-    async fn probe(&self, name: &str) -> Option<Duration> {
-        let outbound = self.outbounds.get(name)?;
-        let target = TargetAddr::Domain("www.gstatic.com".into(), 80);
-        let started = Instant::now();
-        match timeout(Duration::from_millis(800), outbound.connect(&target)).await {
-            Ok(Ok(_)) => Some(started.elapsed()),
-            _ => None,
         }
     }
 
