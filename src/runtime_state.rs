@@ -110,7 +110,7 @@ pub async fn apply_config_from_path(path: &str) -> Result<(), String> {
     // The App normally downloads these via updateGeoData, but that may not have
     // happened yet (e.g. first run), so fetch on demand here.
     let needs_geo = config.rules.iter().any(|r| {
-        let u = r.raw.to_ascii_uppercase();
+        let u = r.to_ascii_uppercase();
         u.starts_with("GEOIP,") || u.starts_with("GEOSITE,") || u.starts_with("RULE-SET,")
     });
     if needs_geo {
