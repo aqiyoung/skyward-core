@@ -57,6 +57,14 @@ pub async fn run<T>(
     }
 }
 
+/// Rate-limited diagnostics for the DNS path.
+fn diag(message: String) {
+    static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
+        crate::jni::emit_log_event(&format!("[rust-core] {}", message));
+    }
+}
+
 fn handle_packet<T: Read + Write + Send + 'static>(
     packet: &[u8],
     tcp: &mut TcpManager<T>,
@@ -93,6 +101,7 @@ fn handle_dns_packet<T: Read + Write + Send + 'static>(
     let payload = &udp[8..end];
     let Some((qname, qtype)) = parse_dns_question(payload) else { return };
     let name = String::from_utf8_lossy(&qname).into_owned();
+    diag(format!("DNS query {} type {}", name, qtype));
 
     let resolver = engine.resolver.clone();
     let io = io.clone();

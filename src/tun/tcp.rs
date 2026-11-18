@@ -29,6 +29,15 @@ const ACK: u8 = 0x10;
 
 const WINDOW: u16 = 65535;
 
+/// Rate-limited diagnostics for the TUN data path, so one log export can show
+/// whether packets arrive and whether the outbound dial works.
+fn diag(message: String) {
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) < 20 {
+        crate::jni::emit_log_event(&format!("[rust-core] {}", message));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FlowKey {
     pub client_ip: Ipv4Addr,
@@ -107,6 +116,10 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                 done: Arc::new(AtomicBool::new(false)),
             };
             self.send(key, isn, flow.client_next, SYN | ACK, &[]);
+            diag(format!(
+                "TCP SYN {}:{} -> {}:{}",
+                key.client_ip, key.client_port, key.target_ip, key.target_port
+            ));
             self.flows.insert(key, flow);
             self.spawn_flow(key);
             return;
@@ -224,6 +237,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!("TUN flow {} dial failed: {}", addr, e);
+                    diag(format!("flow {} dial failed: {}", addr, e));
                     return;
                 }
             };

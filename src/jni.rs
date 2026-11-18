@@ -29,18 +29,33 @@ static TUN_WAKE: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
 pub fn protect_fd(fd: i32) -> bool {
     let handler = TUN_HANDLER.lock().unwrap();
     let Some(handler) = handler.as_ref() else {
+        protect_diag("no protect handler registered");
         return false;
     };
     let Some(vm) = JAVA_VM.get() else {
+        protect_diag("no JavaVM for protect");
         return false;
     };
     let Ok(mut env) = vm.attach_current_thread() else {
+        protect_diag("attach_current_thread failed for protect");
         return false;
     };
-    env.call_method(handler.as_obj(), "protect", "(I)Z", &[JValue::Int(fd)])
-        .ok()
-        .and_then(|v| v.z().ok())
-        .unwrap_or(false)
+    let result = env.call_method(handler.as_obj(), "protect", "(I)Z", &[JValue::Int(fd)]);
+    match result {
+        Ok(v) => v.z().unwrap_or(false),
+        Err(e) => {
+            protect_diag(&format!("protect({}) failed: {}", fd, e));
+            false
+        }
+    }
+}
+
+/// Report protect() problems, but only the first few so the log stays readable.
+fn protect_diag(message: &str) {
+    static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
+        emit_log_event(&format!("[rust-core] protect: {}", message));
+    }
 }
 
 fn tokio_runtime() -> Option<&'static tokio::runtime::Runtime> {
@@ -254,7 +269,10 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
 
     // Keep the Java protect() callback alive for the lifetime of the tunnel.
     match env.new_global_ref(handler) {
-        Ok(global) => *TUN_HANDLER.lock().unwrap() = Some(global),
+        Ok(global) => {
+            *TUN_HANDLER.lock().unwrap() = Some(global);
+            emit_log_event("[rust-core] protect handler installed");
+        }
         Err(e) => emit_log_event(&format!("[rust-core] unable to retain protect handler: {}", e)),
     }
 
