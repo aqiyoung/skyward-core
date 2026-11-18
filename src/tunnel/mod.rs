@@ -77,6 +77,15 @@ pub struct Engine {
     pub connections: Arc<ConnectionTracker>,
 }
 
+/// Rate-limited diagnostics for connection routing, so the log shows which
+/// rule/outbound a connection used.
+fn dial_diag(message: String) {
+    static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 25 {
+        crate::jni::emit_log_event(&format!("[rust-core] {}", message));
+    }
+}
+
 impl Engine {
     pub async fn new(config: Config, traffic: SharedTraffic, data_dir: &Path) -> Self {
         let t0 = std::time::Instant::now();
@@ -143,6 +152,12 @@ impl Engine {
     pub async fn dial(&self, target: &TargetAddr) -> io::Result<BoxedStream> {
         let rule_target = self.decide(target).await;
         let final_name = self.outbounds.resolve(&rule_target).await;
+        dial_diag(format!(
+            "dial {} -> rule={} outbound={}",
+            target.address(),
+            rule_target,
+            final_name
+        ));
         let outbound = self.outbounds.outbound(&final_name).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("unknown outbound '{}'", final_name))
         })?;

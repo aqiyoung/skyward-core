@@ -29,6 +29,14 @@ const ACK: u8 = 0x10;
 
 const WINDOW: u16 = 65535;
 
+/// Rate-limited diagnostics for flow establishment.
+fn flow_diag(message: String) {
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) < 25 {
+        crate::jni::emit_log_event(&format!("[rust-core] {}", message));
+    }
+}
+
 /// Rate-limited diagnostics for the TUN data path, so one log export can show
 /// whether packets arrive and whether the outbound dial works.
 fn diag(message: String) {
@@ -234,7 +242,10 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                 _ = cancel.notified() => return,
                 result = tokio::time::timeout(std::time::Duration::from_secs(10), engine.dial(&target)) => {
                     match result {
-                        Ok(Ok(s)) => s,
+                        Ok(Ok(s)) => {
+                            flow_diag(format!("flow {} connected", addr));
+                            s
+                        }
                         Ok(Err(e)) => {
                             tracing::warn!("TUN flow {} dial failed: {}", addr, e);
                             diag(format!("flow {} dial failed: {}", addr, e));
