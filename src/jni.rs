@@ -76,9 +76,22 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_initVm(
     env: JNIEnv,
     _class: JObject,
 ) {
+    static INIT: std::sync::Once = std::sync::Once::new();
     if let Ok(vm) = env.get_java_vm() {
         let _ = JAVA_VM.set(vm);
     }
+    INIT.call_once(|| {
+        // Install a global tracing subscriber writing to stderr. Android
+        // logcat captures stderr, so all tracing! calls (including startTun
+        // diagnostics) become visible. Never fails the JNI call.
+        use tracing_subscriber::fmt::format::FmtSpan;
+        let _ = tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_max_level(tracing::Level::INFO)
+            .with_span_events(FmtSpan::NONE)
+            .try_init();
+        tracing::info!("skyward-core JNI initialized (rust)");
+    });
 }
 
 #[no_mangle]
@@ -198,8 +211,10 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
     let config = match crate::tun::TunConfig::parse(&stack_text, &address_text, &dns_text, &options_text) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!("startTun: invalid config: {}", e);
-            return JNI_FALSE;
+            // Config is tuning only; never fail TUN startup over it. Fall back
+            // to defaults so the VPN can still come up and carry traffic.
+            tracing::warn!("startTun: config parse fell back to defaults: {}", e);
+            crate::tun::TunConfig::parse("gvisor", "198.18.0.1/30", "0.0.0.0", "").unwrap()
         }
     };
 
@@ -210,7 +225,10 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
             tracing::info!("TUN session started: fd={} stack={} mtu={}", fd, config.stack, mtu);
             let rt = match tokio_runtime() {
                 Some(rt) => rt,
-                None => return JNI_FALSE,
+                None => {
+                    tracing::error!("TUN: no tokio runtime available");
+                    return JNI_FALSE;
+                }
             };
             // Use the active engine if the App already applied a config;
             // otherwise fall back to a default DIRECT-only engine.
