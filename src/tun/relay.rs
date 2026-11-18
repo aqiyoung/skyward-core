@@ -85,7 +85,7 @@ impl SessionManager {
 
     pub fn shutdown(&mut self) {
         for bridges in self.sessions.values() {
-            bridges.cancel.notify_one();
+        bridges.cancel.notify_one();
         }
         self.sessions.clear();
     }
@@ -202,12 +202,12 @@ pub fn spawn_session(engine: Arc<Engine>, target: TargetAddr, bridges: SessionBr
         loop {
             // Drain bytes destined for the network into the outbound.
             let n = bridges.to_net.pop(&mut buf);
-            if n > 0 && stream.write_all(&buf[..n]).await.is_err() {
-                break;
-            }
             tokio::select! {
                 _ = bridges.cancel.notified() => break,
                 _ = bridges.to_net.notified() => {},
+                result = async {
+                    if n == 0 { std::future::pending().await } else { stream.write_all(&buf[..n]).await }
+                } => if result.is_err() { break; },
                 result = stream.read(&mut buf) => match result {
                     Ok(0) | Err(_) => break,
                     Ok(n) => bridges.from_net.push(&buf[..n]),
