@@ -96,6 +96,7 @@ pub fn invoke(data: &[u8]) -> Vec<u8> {
         "changeProxy" => handle_change_proxy(&call),
         "asyncTestDelay" => handle_test_delay(&call),
         "probe" => handle_probe(&call),
+        "serviceCheck" => handle_service_check(&call),
         "outboundIp" => handle_outbound_ip(&call),
         "getMemoryStats" => handle_memory_stats(&call),
         "validateProxies" => handle_validate_proxies(&call),
@@ -359,16 +360,32 @@ fn handle_outbound_ip(call: &MethodCall) -> Vec<u8> {
 }
 
 fn handle_memory_stats(call: &MethodCall) -> Vec<u8> {
-    // Rust process RSS via /proc/self/statm (pages); remaining fields are 0 as
-    // the runtime does not expose Go-style heap buckets.
-    let rss = std::fs::read_to_string("/proc/self/statm").ok().and_then(|s| {
-        let pages: Vec<&str> = s.split_whitespace().collect();
-        pages.get(1).and_then(|p| p.parse::<u64>().ok()).map(|p| p * 4096)
-    }).unwrap_or(0);
+    let rss = process_rss();
+    // Rust has no Go-style heap buckets; report RSS as the in-use figure so the
+    // dashboard shows the core's real footprint.
     ok(&call.id, json!({
-        "rss": rss, "heapInuse": 0u64, "heapIdle": 0u64, "stackInuse": 0u64,
+        "rss": rss, "heapInuse": rss, "heapIdle": 0u64, "stackInuse": 0u64,
         "runtimeOther": 0u64, "budget": 0i64, "gcPercent": 0i32, "deviceTotal": 0u64,
     }))
+}
+
+/// Resident set size of this process, in bytes.
+fn process_rss() -> u64 {
+    if let Ok(text) = std::fs::read_to_string("/proc/self/statm") {
+        if let Some(pages) = text.split_whitespace().nth(1).and_then(|p| p.parse::<u64>().ok()) {
+            return pages * 4096;
+        }
+    }
+    if let Ok(text) = std::fs::read_to_string("/proc/self/status") {
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                if let Some(kb) = rest.split_whitespace().next().and_then(|v| v.parse::<u64>().ok()) {
+                    return kb * 1024;
+                }
+            }
+        }
+    }
+    0
 }
 
 fn handle_start_log(call: &MethodCall) -> Vec<u8> {
@@ -579,6 +596,144 @@ async fn measure_delay(
         ));
         None
     }
+}
+
+/// URL each service check probes. The set matches the Go kernel's checkers.
+fn service_check_url(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "google" => "https://www.google.com/generate_204",
+        "github" => "https://github.com/",
+        "youtube" => "https://www.youtube.com/generate_204",
+        "chatgpt" => "https://chat.openai.com/",
+        "claude" => "https://claude.ai/",
+        "gemini" => "https://gemini.google.com/app",
+        "netflix" => "https://www.netflix.com/",
+        "disney-plus" => "https://www.disneyplus.com/",
+        "prime-video" => "https://www.primevideo.com/",
+        "spotify" => "https://www.spotify.com/",
+        "tiktok" => "https://www.tiktok.com/",
+        "discord" => "https://discord.com/",
+        "bilibili" => "https://www.bilibili.com/",
+        _ => return None,
+    })
+}
+
+enum ProbeError {
+    Timeout,
+    Other,
+}
+
+async fn timed<T>(
+    timeout: std::time::Duration,
+    fut: impl std::future::Future<Output = std::io::Result<T>>,
+) -> Result<T, ProbeError> {
+    match tokio::time::timeout(timeout, fut).await {
+        Err(_) => Err(ProbeError::Timeout),
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(_)) => Err(ProbeError::Other),
+    }
+}
+
+/// A reachability probe for one service. Region-specific parsing is not
+/// implemented; availability is reported from the HTTP status.
+async fn service_probe(
+    engine: &std::sync::Arc<crate::tunnel::Engine>,
+    proxy_name: &str,
+    url: &str,
+    timeout_ms: i64,
+) -> Result<(), ProbeError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (scheme, rest) = url.split_once("://").ok_or(ProbeError::Other)?;
+    let use_tls = scheme == "https";
+    let authority = rest.split('/').next().ok_or(ProbeError::Other)?;
+    let host = authority.split(':').next().ok_or(ProbeError::Other)?;
+    let port = authority
+        .split(':')
+        .nth(1)
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(if use_tls { 443 } else { 80 });
+    let target = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => crate::common::TargetAddr::Ip(ip, port),
+        Err(_) => crate::common::TargetAddr::Domain(host.to_string(), port),
+    };
+    let path = format!("/{}", rest.split_once('/').map(|(_, p)| p).unwrap_or(""));
+    let timeout = std::time::Duration::from_millis(timeout_ms as u64);
+
+    let stream = if proxy_name.is_empty() {
+        timed(timeout, engine.dial(&target)).await?
+    } else {
+        timed(timeout, engine.dial_named(proxy_name, &target)).await?
+    };
+    let mut stream = if use_tls {
+        timed(timeout, crate::adapter::tls::connect_tls_http1(host, stream, false)).await?
+    } else {
+        stream
+    };
+
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n",
+        path, authority
+    );
+    timed(timeout, stream.write_all(request.as_bytes())).await?;
+    let mut buf = [0u8; 256];
+    let n = timed(timeout, stream.read(&mut buf)).await?;
+    let text = String::from_utf8_lossy(&buf[..n]);
+    let ok = text
+        .split_whitespace()
+        .nth(1)
+        .map(|code| code.starts_with('2') || code.starts_with('3'))
+        .unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        Err(ProbeError::Other)
+    }
+}
+
+fn handle_service_check(call: &MethodCall) -> Vec<u8> {
+    #[derive(Deserialize, Default)]
+    struct Params {
+        #[serde(rename = "proxy-name", default)]
+        proxy_name: String,
+        #[serde(default)]
+        names: Vec<String>,
+        timeout: i64,
+    }
+    let params = serde_json::from_value(call.arguments.clone()).unwrap_or_default();
+    let timeout_ms = if params.timeout > 0 { params.timeout } else { 5000 };
+    let proxy_name = params.proxy_name.clone();
+    let names = params.names.clone();
+    let future = async move {
+        let engine = match crate::runtime_state::engine().await {
+            Some(e) => e,
+            None => return Value::Array(Vec::new()),
+        };
+        let mut items = Vec::new();
+        for name in names {
+            let Some(url) = service_check_url(&name) else { continue };
+            let started = std::time::Instant::now();
+            let (status, delay) = match service_probe(&engine, &proxy_name, url, timeout_ms).await {
+                Ok(()) => ("available", started.elapsed().as_millis() as i64),
+                Err(ProbeError::Timeout) => ("timeout", -1i64),
+                Err(ProbeError::Other) => ("unavailable", -1i64),
+            };
+            let checked_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            items.push(json!({
+                "name": name,
+                "status": status,
+                "delay": delay,
+                "chains": Vec::<String>::new(),
+                "checked-at": checked_at,
+                "core-epoch": 0,
+                "picks-version": 0,
+            }));
+        }
+        Value::Array(items)
+    };
+    ok(&call.id, block_on(future).unwrap_or(Value::Array(Vec::new())))
 }
 
 fn handle_get_traffic(call: &MethodCall, total: bool) -> Vec<u8> {

@@ -32,7 +32,7 @@ const WINDOW: u16 = 65535;
 /// Rate-limited diagnostics for flow establishment.
 fn flow_diag(message: String) {
     static COUNT: AtomicUsize = AtomicUsize::new(0);
-    if COUNT.fetch_add(1, Ordering::Relaxed) < 25 {
+    if COUNT.fetch_add(1, Ordering::Relaxed) < 200 {
         crate::jni::emit_log_event(&format!("[rust-core] {}", message));
     }
 }
@@ -41,7 +41,7 @@ fn flow_diag(message: String) {
 /// whether packets arrive and whether the outbound dial works.
 fn diag(message: String) {
     static COUNT: AtomicUsize = AtomicUsize::new(0);
-    if COUNT.fetch_add(1, Ordering::Relaxed) < 20 {
+    if COUNT.fetch_add(1, Ordering::Relaxed) < 200 {
         crate::jni::emit_log_event(&format!("[rust-core] {}", message));
     }
 }

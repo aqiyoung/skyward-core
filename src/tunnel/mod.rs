@@ -81,7 +81,7 @@ pub struct Engine {
 /// rule/outbound a connection used.
 fn dial_diag(message: String) {
     static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 25 {
+    if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
         crate::jni::emit_log_event(&format!("[rust-core] {}", message));
     }
 }

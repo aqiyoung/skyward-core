@@ -345,35 +345,43 @@ impl OutboundManager {
         Self { outbounds, groups }
     }
 
-    /// Resolve a rule target down to a concrete outbound name.
+    /// Resolve a rule target down to a concrete outbound name. A group's
+    /// selected member may itself be a group (the rule chain), so keep
+    /// following the chain until an outbound is reached, like mihomo.
     pub async fn resolve(&self, name: &str) -> String {
-        let group = match self.groups.get(name) {
-            Some(g) => g,
-            None => return name.to_string(),
-        };
-        let candidates: Vec<String> = group.members.iter()
-            .filter(|m| self.outbounds.contains_key(*m) || self.groups.contains_key(*m))
-            .cloned()
-            .collect();
-        if candidates.is_empty() {
-            return "DIRECT".to_string();
-        }
-
-        match group.kind.as_str() {
-            "load-balance" => {
-                let i = group.cursor.fetch_add(1, Ordering::Relaxed) % candidates.len();
-                candidates[i].clone()
+        let mut current = name.to_string();
+        for _ in 0..16 {
+            let Some(group) = self.groups.get(&current) else {
+                return current;
+            };
+            let candidates: Vec<String> = group.members.iter()
+                .filter(|m| self.outbounds.contains_key(*m) || self.groups.contains_key(*m))
+                .cloned()
+                .collect();
+            if candidates.is_empty() {
+                return "DIRECT".to_string();
             }
+
             // Never block the data path on health probes: probing every
             // candidate (hundreds of nodes at up to 800ms each) stalled every
             // connection for minutes. Use the current selection, which the
             // App's delay tests keep up to date.
-            "url-test" | "fallback" => group
-                .selected()
-                .filter(|name| candidates.contains(name))
-                .unwrap_or_else(|| candidates[0].clone()),
-            _ => group.selected().unwrap_or_else(|| candidates[0].clone()),
+            let next = match group.kind.as_str() {
+                "load-balance" => {
+                    let i = group.cursor.fetch_add(1, Ordering::Relaxed) % candidates.len();
+                    candidates[i].clone()
+                }
+                _ => group
+                    .selected()
+                    .filter(|name| candidates.contains(name))
+                    .unwrap_or_else(|| candidates[0].clone()),
+            };
+            if next == current {
+                return current;
+            }
+            current = next;
         }
+        current
     }
 
     pub fn outbound(&self, name: &str) -> Option<Arc<dyn Outbound>> {
@@ -416,3 +424,21 @@ impl OutboundManager {
 // Keep IpAddr referenced so the import stays meaningful for future IP rules.
 #[allow(dead_code)]
 fn _ip_marker(_: Option<IpAddr>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn resolve_follows_nested_groups() {
+        let config = crate::config::Config::from_str(
+            "proxies:\n  - {name: n1, type: direct}\nproxy-groups:\n  - {name: g2, type: select, proxies: [n1]}\n  - {name: g1, type: select, proxies: [g2]}\n",
+        ).unwrap();
+        let manager = OutboundManager::new(&config);
+        assert_eq!(manager.resolve("g1").await, "n1");
+        assert_eq!(manager.resolve("g2").await, "n1");
+        // A concrete outbound resolves to itself.
+        assert_eq!(manager.resolve("n1").await, "n1");
+        assert_eq!(manager.resolve("DIRECT").await, "DIRECT");
+    }
+}
