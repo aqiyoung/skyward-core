@@ -17,6 +17,7 @@ use smoltcp::time::Instant;
 pub mod relay;
 pub mod runtime;
 pub mod stack;
+pub mod tcp;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TunOptions {

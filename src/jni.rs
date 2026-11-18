@@ -19,8 +19,29 @@ static EVENT_LISTENER: Mutex<Option<GlobalRef>> = Mutex::new(None);
 static TUN_SESSION: Mutex<Option<(i32, crate::tun::TunConfig)>> = Mutex::new(None);
 static TUN_TASK: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
 static TUN_CANCEL: Mutex<Option<Arc<tokio::sync::Notify>>> = Mutex::new(None);
+static TUN_HANDLER: Mutex<Option<GlobalRef>> = Mutex::new(None);
 static TOKIO_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static TUN_WAKE: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
+
+/// Ask Android's VpnService to keep a socket out of the VPN tunnel. Every
+/// outbound connection the core makes must go through this, otherwise the
+/// kernel routes it back into our own TUN and nothing can connect.
+pub fn protect_fd(fd: i32) -> bool {
+    let handler = TUN_HANDLER.lock().unwrap();
+    let Some(handler) = handler.as_ref() else {
+        return false;
+    };
+    let Some(vm) = JAVA_VM.get() else {
+        return false;
+    };
+    let Ok(mut env) = vm.attach_current_thread() else {
+        return false;
+    };
+    env.call_method(handler.as_obj(), "protect", "(I)Z", &[JValue::Int(fd)])
+        .ok()
+        .and_then(|v| v.z().ok())
+        .unwrap_or(false)
+}
 
 fn tokio_runtime() -> Option<&'static tokio::runtime::Runtime> {
     TOKIO_RUNTIME.get_or_init(|| {
@@ -212,6 +233,7 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_stopTun(
         task.abort();
     }
     *TUN_SESSION.lock().unwrap() = None;
+    *TUN_HANDLER.lock().unwrap() = None;
 }
 
 #[no_mangle]
@@ -219,7 +241,7 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
     mut env: JNIEnv,
     _class: JObject,
     fd: jint,
-    _handler: JObject,
+    handler: JObject,
     stack: JString,
     address: JString,
     dns: JString,
@@ -229,6 +251,12 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
     let address_text = java_string(&mut env, &address);
     let dns_text = java_string(&mut env, &dns);
     let options_text = java_string(&mut env, &options);
+
+    // Keep the Java protect() callback alive for the lifetime of the tunnel.
+    match env.new_global_ref(handler) {
+        Ok(global) => *TUN_HANDLER.lock().unwrap() = Some(global),
+        Err(e) => emit_log_event(&format!("[rust-core] unable to retain protect handler: {}", e)),
+    }
 
     let diag = format!(
         "[rust-core] startTun called: fd={} stack='{}' address='{}' dns='{}' options='{}'",

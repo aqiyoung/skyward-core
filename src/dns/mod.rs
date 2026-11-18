@@ -4,10 +4,22 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::config::DnsConfig;
+
+static SHARED: OnceLock<Resolver> = OnceLock::new();
+
+/// Resolve through the core's protected DNS path. The system resolver must not
+/// be used here: once the VPN is up it forwards queries to the TUN address and
+/// the lookup loops back into the tunnel we are hosting.
+pub async fn resolve_host(host: &str) -> std::io::Result<Vec<IpAddr>> {
+    SHARED
+        .get_or_init(|| Resolver::new(DnsConfig::default()))
+        .resolve(host)
+        .await
+}
 
 #[derive(Debug)]
 struct Entry {
@@ -42,11 +54,17 @@ impl Resolver {
         }
 
         let mut addrs = Vec::new();
-        let lookup = tokio::net::lookup_host((host, 0)).await?;
-        for socket in lookup {
-            let ip = socket.ip();
-            if !addrs.contains(&ip) {
-                addrs.push(ip);
+        for server in self.upstreams() {
+            let Some(addr) = format!("{}:53", server).parse::<std::net::SocketAddr>().ok() else {
+                continue;
+            };
+            for qtype in [1u16, 28u16] {
+                if let Ok(mut found) = crate::net::dns_query(addr, host, qtype).await {
+                    addrs.append(&mut found);
+                }
+            }
+            if !addrs.is_empty() {
+                break;
             }
         }
         if addrs.is_empty() {
@@ -73,6 +91,16 @@ impl Resolver {
             .into_iter()
             .next()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "empty DNS answer"))
+    }
+
+    /// DNS servers to query, falling back to public resolvers when the config
+    /// does not name any.
+    fn upstreams(&self) -> Vec<String> {
+        if self.config.nameserver.is_empty() {
+            vec!["223.5.5.5".to_string(), "8.8.8.8".to_string()]
+        } else {
+            self.config.nameserver.clone()
+        }
     }
 
     fn cached(&self, host: &str) -> Option<Vec<IpAddr>> {

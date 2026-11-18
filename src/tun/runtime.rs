@@ -1,159 +1,117 @@
-//! Async runtime loop that owns the TUN device and drives the smoltcp stack.
+//! Async runtime loop that owns the TUN device.
 //!
-//! The loop polls the stack when the device has packets or when smoltcp's
-//! `poll_at` deadline expires, pumps TCP relay sessions, and answers DNS
-//! queries hijacked to the TUN's DNS address using the kernel's resolver.
+//! Incoming IP packets are dispatched by protocol: TCP is terminated by our own
+//! minimal state machine (see `tcp`), and DNS queries are answered directly.
+//! smoltcp cannot be used for the TUN's TCP because its sockets only accept
+//! connections matching a port that is already listening, which a transparent
+//! proxy cannot know in advance.
 
-use std::sync::Arc;
+use std::io::{self, Read, Write};
+use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use smoltcp::iface::{Interface, SocketHandle, SocketSet};
-use smoltcp::socket::{tcp, udp};
-use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
-use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, Ipv4Address};
 use tokio::sync::Notify;
 
-use super::relay::SessionManager;
+use super::tcp::TcpManager;
 use super::{TunConfig, TunDevice};
 use crate::tunnel::Engine;
 
-/// Build a fresh stack with a TCP pool and a DNS-hijack UDP socket on port 53.
-pub fn build_stack<'a, D>(
-    device: &mut D,
-    config: &TunConfig,
-    tcp_pool: usize,
-) -> (Interface, SocketSet<'a>, SocketHandle)
-where
-    D: smoltcp::phy::Device,
-{
-    use smoltcp::iface::Config as IfaceConfig;
-
-    let mut iface_config = IfaceConfig::new(smoltcp::wire::HardwareAddress::Ip);
-    iface_config.random_seed = 0x5eed;
-    let mut iface = Interface::new(iface_config, device, SmolInstant::now());
-
-    if let Some(addr) = config.addresses.first().and_then(|s| s.split('/').next()) {
-        if let Ok(ip) = addr.parse::<Ipv4Address>() {
-            iface.update_ip_addrs(|addrs| {
-                let _ = addrs.push(IpCidr::new(ip.into(), 24));
-            });
-        }
-    }
-    // smoltcp needs a default route to send replies back to the host.
-    iface.routes_mut().add_default_ipv4_route(Ipv4Address::UNSPECIFIED).ok();
-
-    let mut sockets = SocketSet::new(Vec::new());
-    for _ in 0..tcp_pool {
-        let rx = tcp::SocketBuffer::new(vec![0u8; 8192]);
-        let tx = tcp::SocketBuffer::new(vec![0u8; 8192]);
-        sockets.add(tcp::Socket::new(rx, tx));
-    }
-    let dns_socket = {
-        let rx = udp::PacketBuffer::new(
-            vec![udp::PacketMetadata::EMPTY; 8],
-            vec![0u8; 2048 * 8],
-        );
-        let tx = udp::PacketBuffer::new(
-            vec![udp::PacketMetadata::EMPTY; 8],
-            vec![0u8; 2048 * 8],
-        );
-        let mut socket = udp::Socket::new(rx, tx);
-        let _ = socket.bind(IpEndpoint::new(IpAddress::v4(0, 0, 0, 0), 53));
-        sockets.add(socket)
-    };
-    (iface, sockets, dns_socket)
-}
-
-/// Drive the stack forever. `wake` is notified by relay sessions when new bytes
-/// arrive from the network, so the loop need not spin at full speed.
-pub async fn run<D>(
-    mut device: TunDevice<D>,
+/// Drive the TUN device until `cancel` is notified.
+pub async fn run<T>(
+    device: TunDevice<T>,
     config: TunConfig,
     engine: Arc<Engine>,
     wake: Arc<Notify>,
     cancel: Arc<Notify>,
 ) where
-    D: std::io::Read + std::io::Write + Send + 'static,
+    T: Read + Write + Send + 'static,
 {
-    let (mut iface, mut sockets, dns_socket) = build_stack(&mut device, &config, 16);
-    let mut sessions = SessionManager::new();
-    let epoch = std::time::Instant::now();
+    let _ = &config;
+    let io = Arc::new(Mutex::new(device.io));
+    let mut tcp = TcpManager::new(engine.clone(), io.clone());
+    let mut buf = vec![0u8; 65536];
 
     loop {
-        let now = SmolInstant::from_millis(epoch.elapsed().as_millis() as i64);
-        // Poll at most once per wake cycle; compute when smoltcp next wants us.
-        let deadline = iface.poll_at(now, &sockets);
-        iface.poll(now, &mut device, &mut sockets);
+        let read = {
+            let mut guard = io.lock().unwrap();
+            guard.read(&mut buf)
+        };
+        match read {
+            Ok(0) => {}
+            Ok(n) => handle_packet(&buf[..n], &mut tcp, &engine, &io),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(_) => {}
+        }
 
-        // Pump TCP sessions into/out of the outbound relays.
-        sessions.pump(&mut sockets, &engine);
+        tcp.pump();
 
-        // Answer hijacked DNS queries.
-        handle_dns(&mut sockets, dns_socket, &engine, now);
-
-        // Sleep until the next protocol timer or an external wake, whichever
-        // comes first, with a small cap to keep latency bounded.
-        let wait = deadline
-            .map(|d| d.total_millis().max(0) as u64)
-            .map(|ms| Duration::from_millis(ms.min(250).max(1)))
-            .unwrap_or(Duration::from_millis(250));
         tokio::select! {
-            _ = tokio::time::sleep(wait) => {}
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
             _ = wake.notified() => {}
             _ = cancel.notified() => {
-                sessions.shutdown();
+                tcp.shutdown();
                 return;
-            },
+            }
         }
     }
 }
 
-fn handle_dns(sockets: &mut SocketSet<'_>, handle: SocketHandle, engine: &Engine, now: SmolInstant) {
-    let socket = sockets.get_mut::<udp::Socket>(handle);
-    if !socket.is_open() {
-        return;
+fn handle_packet<T: Read + Write + Send + 'static>(
+    packet: &[u8],
+    tcp: &mut TcpManager<T>,
+    engine: &Arc<Engine>,
+    io: &Arc<Mutex<T>>,
+) {
+    let Some(ip) = super::tcp::parse_ipv4(packet) else { return };
+    match ip.proto {
+        6 => tcp.handle_packet(packet),
+        17 => handle_dns_packet(packet, &ip, engine, io),
+        _ => {}
     }
-    let mut buf = [0u8; 2048];
-    let query = match socket.recv_slice(&mut buf) {
-        Ok((n, meta)) if n >= 12 => (buf[..n].to_vec(), meta.endpoint),
-        _ => return,
-    };
-    let (packet, endpoint) = query;
-
-    // Parse the first question (name + A/AAAA) and build a minimal response.
-    let Some((qname, qtype)) = parse_dns_question(&packet) else { return };
-    let name = String::from_utf8_lossy(&qname).into_owned();
-
-    // Resolve synchronously on a best-effort basis via the engine's resolver;
-    // this path runs on the runtime thread and is short-lived.
-    let resolver = engine.resolver.clone();
-    let name_owned = name.clone();
-    let answer_ip = match futures_block_on(async move { resolver.resolve(&name_owned).await }) {
-        Ok(Ok(addrs)) => addrs.into_iter().find(|ip| match qtype {
-            28 => ip.is_ipv6(),
-            _ => ip.is_ipv4(),
-        }),
-        _ => None,
-    };
-
-    let response = build_dns_response(&packet, answer_ip);
-    let _ = socket.send_slice(&response, endpoint);
-    let _ = (sockets, now);
 }
 
-/// Minimal inline block_on for a future that only needs a tokio reactor, used
-/// inside the poll loop. We spawn onto the current runtime and wait via a oneshot.
-fn futures_block_on<F>(future: F) -> Result<F::Output, ()>
-where
-    F: std::future::Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+/// Answer a DNS query that arrived on the TUN. Resolution runs on a spawned
+/// task because the resolver performs network I/O.
+fn handle_dns_packet<T: Read + Write + Send + 'static>(
+    packet: &[u8],
+    ip: &super::tcp::Ipv4Info,
+    engine: &Arc<Engine>,
+    io: &Arc<Mutex<T>>,
+) {
+    let udp = match packet.get(ip.ihl..) {
+        Some(u) if u.len() >= 8 => u,
+        _ => return,
+    };
+    let src_port = u16::from_be_bytes([udp[0], udp[1]]);
+    let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
+    if dst_port != 53 {
+        return;
+    }
+    let len = u16::from_be_bytes([udp[4], udp[5]]) as usize;
+    let end = udp.len().min(len);
+    let payload = &udp[8..end];
+    let Some((qname, qtype)) = parse_dns_question(payload) else { return };
+    let name = String::from_utf8_lossy(&qname).into_owned();
+
+    let resolver = engine.resolver.clone();
+    let io = io.clone();
+    let src_ip = ip.src;
+    let dst_ip = ip.dst;
+    let query = payload.to_vec();
     tokio::spawn(async move {
-        let out = future.await;
-        let _ = tx.send(out);
+        let answer_ip = match resolver.resolve(&name).await {
+            Ok(addrs) => addrs.into_iter().find(|ip| match qtype {
+                28 => ip.is_ipv6(),
+                _ => ip.is_ipv4(),
+            }),
+            Err(_) => None,
+        };
+        let response = build_dns_response(&query, answer_ip);
+        let packet = super::tcp::build_udp_packet(src_ip, dst_ip, 53, src_port, &response);
+        let mut io = io.lock().unwrap();
+        let _ = io.write_all(&packet);
     });
-    rx.recv().map_err(|_| ())
 }
 
 fn parse_dns_question(packet: &[u8]) -> Option<(Vec<u8>, u16)> {
@@ -240,13 +198,11 @@ fn build_dns_response(query: &[u8], answer_ip: Option<std::net::IpAddr>) -> Vec<
 mod tests {
     use super::*;
 
-    // Exercise the actual mixed TCP/DNS socket set and poll loop. Previously
-    // SessionManager::pump downcast the DNS socket to TCP and panicked on the
-    // first iteration, dropping the device and tearing down Android's VPN.
+    // The loop must stay alive while the device is open and release the
+    // descriptor on cancellation.
     #[cfg(unix)]
     #[tokio::test]
     async fn tun_runtime_keeps_descriptor_open_until_cancelled() {
-        use std::io::Read;
         use std::os::unix::net::UnixStream;
 
         let (local, mut peer) = UnixStream::pair().unwrap();
@@ -309,5 +265,21 @@ mod tests {
         let q = dns_query("nonexistent.invalid", 1);
         let resp = build_dns_response(&q, None);
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0);
+    }
+
+    #[test]
+    fn ipv4_info_parses_header() {
+        let packet = super::tcp::build_udp_packet(
+            Ipv4Addr::new(198, 18, 0, 1),
+            Ipv4Addr::new(198, 18, 0, 2),
+            12345,
+            53,
+            &[0xaa, 0xbb],
+        );
+        let info = super::tcp::parse_ipv4(&packet).unwrap();
+        assert_eq!(info.proto, 17);
+        assert_eq!(info.src, Ipv4Addr::new(198, 18, 0, 1));
+        assert_eq!(info.dst, Ipv4Addr::new(198, 18, 0, 2));
+        assert_eq!(info.ihl, 20);
     }
 }

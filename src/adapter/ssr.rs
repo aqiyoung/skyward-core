@@ -370,7 +370,7 @@ impl Outbound for SsrOutbound {
         let mut last_error = None;
         let mut tcp = None;
         for addr in self.server.resolve_all().await? {
-            match TcpStream::connect(addr).await {
+            match crate::net::connect_tcp(addr).await {
                 Ok(stream) => { tcp = Some(stream); break; }
                 Err(e) => last_error = Some(e),
             }

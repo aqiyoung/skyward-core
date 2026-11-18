@@ -11,6 +11,7 @@ pub mod hub;
 pub mod inbound;
 pub mod jni;
 pub mod mobile;
+pub mod net;
 pub mod rules;
 pub mod runtime_state;
 pub mod tunnel;

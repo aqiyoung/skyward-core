@@ -79,15 +79,14 @@ impl TargetAddr {
         match self {
             TargetAddr::Ip(ip, port) => Ok(vec![SocketAddr::new(*ip, *port)]),
             TargetAddr::Domain(host, port) => {
-                let addrs: Vec<SocketAddr> =
-                    tokio::net::lookup_host((host.as_str(), *port)).await?.collect();
-                if addrs.is_empty() {
+                let ips = crate::dns::resolve_host(host).await?;
+                if ips.is_empty() {
                     Err(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
                         "no address for host",
                     ))
                 } else {
-                    Ok(addrs)
+                    Ok(ips.into_iter().map(|ip| SocketAddr::new(ip, *port)).collect())
                 }
             }
         }

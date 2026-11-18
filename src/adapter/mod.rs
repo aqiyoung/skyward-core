@@ -64,7 +64,7 @@ impl Outbound for DirectOutbound {
     async fn connect(&self, target: &TargetAddr) -> io::Result<BoxedStream> {
         let mut last_error = None;
         for addr in target.resolve_all().await? {
-            match tokio::net::TcpStream::connect(addr).await {
+            match crate::net::connect_tcp(addr).await {
                 Ok(stream) => return Ok(Box::new(stream)),
                 Err(e) => last_error = Some(e),
             }

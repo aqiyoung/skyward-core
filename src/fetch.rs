@@ -51,7 +51,7 @@ async fn fetch_url_inner(url: &str) -> io::Result<Vec<u8>> {
     let mut tcp = None;
     let addresses = tokio::net::lookup_host((host.as_str(), port)).await?;
     for addr in addresses {
-        match TcpStream::connect(addr).await {
+        match crate::net::connect_tcp(addr).await {
             Ok(stream) => {
                 tcp = Some(stream);
                 break;
