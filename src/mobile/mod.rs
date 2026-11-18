@@ -127,6 +127,7 @@ pub fn invoke(data: &[u8]) -> Vec<u8> {
         "validateConfig" => handle_validate_config(&call),
         "setupConfig" => handle_setup_config(&call),
         "updateConfig" => handle_setup_config(&call),
+        "quickSetup" => handle_quick_setup(&call),
         "message" => ok(&call.id, Value::Null),
         other => err(&call.id, "not_implemented", format!("unknown method: {}", other)),
     }
@@ -836,6 +837,49 @@ fn handle_setup_config(call: &MethodCall) -> Vec<u8> {
     }
 }
 
+/// Apply per-run overrides (test-url, selected-map, skip-cert-verify) to the
+/// running engine. The App calls this on every service start; replacing the
+/// engine here would throw away the loaded profile and its strategy groups.
+fn handle_quick_setup(call: &MethodCall) -> Vec<u8> {
+    let selected: Vec<(String, String)> = call
+        .arguments
+        .get("selected-map")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(group, proxy)| {
+                    proxy.as_str().map(|p| (group.clone(), p.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let future = async move {
+        match crate::runtime_state::engine().await {
+            Some(engine) => {
+                for (group, proxy) in selected {
+                    engine.outbounds.set_selection(&group, &proxy);
+                }
+                Ok(())
+            }
+            None => {
+                let config = crate::config::Config::default();
+                let _ = crate::runtime_state::apply_config(
+                    config,
+                    std::path::PathBuf::from("config.yaml"),
+                    std::path::PathBuf::from("."),
+                )
+                .await;
+                Ok(())
+            }
+        }
+    };
+    match block_on(future) {
+        Ok(Ok(())) => ok(&call.id, Value::String(String::new())),
+        Ok(Err(e)) => ok(&call.id, Value::String(e)),
+        Err(e) => ok(&call.id, Value::String(e)),
+    }
+}
+
 /// Inline block_on for the small setup futures (they run on a dedicated thread
 /// in the JNI path; this keeps `invoke` synchronous as gomobile expects).
 fn block_on<F: std::future::Future + Send + 'static>(future: F) -> Result<F::Output, String>
@@ -978,6 +1022,27 @@ mod tests {
         let r = response(invoke(br#"{"method":"setupConfig","arguments":{}}"#));
         assert_eq!(r["error"], Value::Null);
         assert_eq!(r["result"], "");
+    }
+
+    #[test]
+    fn quick_setup_keeps_profile_groups() {
+        let _guard = crate::runtime_state::TEST_LOCK.lock().unwrap();
+        let _ = block_on(crate::runtime_state::apply_config(
+            crate::config::Config::from_str(
+                "proxies:\n  - {name: n1, type: direct}\nproxy-groups:\n  - {name: g1, type: select, proxies: [n1, DIRECT]}\n",
+            ).unwrap(),
+            std::path::PathBuf::from("c.yaml"),
+            std::path::PathBuf::from("."),
+        ));
+        let payload = serde_json::json!({
+            "method": "quickSetup",
+            "arguments": {"selected-map": {"g1": "n1"}}
+        }).to_string();
+        let r = response(invoke(payload.as_bytes()));
+        assert_eq!(r["error"], Value::Null);
+        let r = response(invoke(br#"{"method":"getProxies"}"#));
+        assert!(r["result"]["proxies"]["g1"]["all"].as_array().is_some());
+        assert_eq!(r["result"]["proxies"]["g1"]["now"], "n1");
     }
 
     #[test]

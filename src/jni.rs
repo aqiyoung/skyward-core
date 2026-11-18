@@ -215,9 +215,10 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_quickSetup(
     handler: JObject,
 ) {
     let setup_text = java_string(&mut env, &setup_params);
-    // Build a MethodCall around setupConfig so the existing handler does the work.
+    // quickSetup only carries per-run overrides (test-url/selected-map/
+    // skip-cert-verify); it must not reload or replace the loaded profile.
     let payload = format!(
-        "{{\"method\":\"setupConfig\",\"arguments\":{}}}",
+        "{{\"method\":\"quickSetup\",\"arguments\":{}}}",
         if setup_text.trim().is_empty() { "{}".to_string() } else { setup_text }
     );
     let result = mobile::invoke(payload.as_bytes());
