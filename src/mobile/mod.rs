@@ -410,6 +410,14 @@ fn handle_validate_proxies(call: &MethodCall) -> Vec<u8> {
     ok(&call.id, json!(results))
 }
 
+/// Rate-limited delay-test diagnostics so a log export shows node failures.
+fn delay_diag(message: &str) {
+    static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
+        crate::jni::emit_log_event(&format!("[rust-core] delay: {}", message));
+    }
+}
+
 fn handle_test_delay(call: &MethodCall) -> Vec<u8> {
     #[derive(Deserialize, Default)]
     struct Params {
@@ -437,7 +445,10 @@ fn handle_test_delay(call: &MethodCall) -> Vec<u8> {
         let delay = measure_delay(&engine, &name, &url, timeout_ms).await;
         match delay {
             Some(ms) => json!({"url": url, "name": name, "value": ms}),
-            None => json!({"url": url, "name": name, "value": -2, "message": "connect failed"}),
+            None => {
+                delay_diag(&format!("{} -> {} failed", name, url));
+                json!({"url": url, "name": name, "value": -2, "message": "connect failed"})
+            }
         }
     };
     ok(&call.id, block_on(future).unwrap_or_else(|_| json!({"value": -2})))
@@ -450,10 +461,21 @@ async fn measure_delay(
     timeout_ms: i64,
 ) -> Option<i32> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let rest = url.strip_prefix("http://")?;
+    // The App's default test URL is https://...; plain http:// is supported too.
+    let (scheme, rest) = url.split_once("://")?;
+    let use_tls = match scheme {
+        "http" => false,
+        "https" => true,
+        _ => return None,
+    };
     let authority = rest.split('/').next()?;
     let host = authority.split(':').next()?;
-    let port: u16 = authority.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(80);
+    let default_port = if use_tls { 443 } else { 80 };
+    let port: u16 = authority
+        .split(':')
+        .nth(1)
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(default_port);
     let target = match host.parse::<std::net::IpAddr>() {
         Ok(ip) => crate::common::TargetAddr::Ip(ip, port),
         Err(_) => crate::common::TargetAddr::Domain(host.to_string(), port),
@@ -461,13 +483,24 @@ async fn measure_delay(
     let path = format!("/{}", rest.split_once('/').map(|(_, p)| p).unwrap_or(""));
 
     let dial = engine.dial_named(name, &target);
-    let mut stream = tokio::time::timeout(
+    let stream = tokio::time::timeout(
         std::time::Duration::from_millis(timeout_ms as u64),
         dial,
     )
     .await
     .ok()?
     .ok()?;
+    let mut stream = if use_tls {
+        tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms as u64),
+            crate::adapter::tls::connect_tls(host, stream),
+        )
+        .await
+        .ok()?
+        .ok()?
+    } else {
+        stream
+    };
 
     let start = std::time::Instant::now();
     let request = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", path, authority);
