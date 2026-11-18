@@ -38,7 +38,7 @@ fn vm() -> Option<&'static JavaVM> {
 /// Emit a log event to the App's event listener regardless of the openLogs
 /// switch. The data fields must match the App's Log model: `LogLevel`,
 /// `Payload` and a `dateTime` key (the Dart parser ignores its value).
-fn emit_log_event(message: &str) {
+pub fn emit_log_event(message: &str) {
     emit_event_json(&serde_json::json!({
         "type": "log",
         "data": { "LogLevel": "info", "Payload": message, "dateTime": "" }
