@@ -203,12 +203,15 @@ pub fn spawn_session(engine: Arc<Engine>, target: TargetAddr, bridges: SessionBr
             // Drain bytes destined for the network into the outbound.
             let mut write_buf = vec![0u8; 16 * 1024];
             let n = bridges.to_net.pop(&mut write_buf);
+            if n > 0 {
+                if stream.write_all(&write_buf[..n]).await.is_err() {
+                    break;
+                }
+                continue;
+            }
             tokio::select! {
                 _ = bridges.cancel.notified() => break,
                 _ = bridges.to_net.notified() => {},
-                result = async {
-                    if n == 0 { std::future::pending().await } else { stream.write_all(&write_buf[..n]).await }
-                } => if result.is_err() { break; },
                 result = stream.read(&mut read_buf) => match result {
                     Ok(0) | Err(_) => break,
                     Ok(n) => bridges.from_net.push(&read_buf[..n]),
