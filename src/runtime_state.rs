@@ -69,6 +69,26 @@ pub async fn apply_config_from_path(path: &str) -> Result<(), String> {
             seq_len("proxy-groups"),
             seq_len("rules")
         ));
+        // Show one url-test group verbatim to reveal how its members are stored.
+        if let Some(groups) = map.get(serde_yaml::Value::String("proxy-groups".into()))
+            .and_then(|v| v.as_sequence())
+        {
+            for g in groups {
+                let kind = g.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if kind.eq_ignore_ascii_case("url-test") {
+                    let name = g.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                    let keys: Vec<String> = g.as_mapping()
+                        .map(|m| m.keys().filter_map(|k| k.as_str().map(str::to_string)).collect())
+                        .unwrap_or_default();
+                    let proxies_len = g.get("proxies").and_then(|v| v.as_sequence()).map(|s| s.len()).unwrap_or(0);
+                    log(&format!(
+                        "apply_config: url-test group {:?} keys={:?} proxies_len={} raw={:?}",
+                        name, keys, proxies_len, g
+                    ));
+                    break;
+                }
+            }
+        }
     }
     let config = match Config::from_str(&text) {
         Ok(c) => c,
@@ -90,7 +110,7 @@ pub async fn apply_config_from_path(path: &str) -> Result<(), String> {
     // The App normally downloads these via updateGeoData, but that may not have
     // happened yet (e.g. first run), so fetch on demand here.
     let needs_geo = config.rules.iter().any(|r| {
-        let u = r.to_ascii_uppercase();
+        let u = r.raw.to_ascii_uppercase();
         u.starts_with("GEOIP,") || u.starts_with("GEOSITE,") || u.starts_with("RULE-SET,")
     });
     if needs_geo {

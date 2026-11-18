@@ -160,6 +160,30 @@ pub struct ProxyInfo {
     pub selected: Option<String>,
 }
 
+/// Regional flags/words present in a group name, used to fill an empty
+/// url-test group from proxy nodes whose names carry the same region.
+fn region_tags(name: &str) -> Vec<String> {
+    let mut tags = Vec::new();
+    // Regional-indicator emoji pairs (e.g. 🇭🇰, 🇯🇵).
+    let runes: Vec<char> = name.chars().collect();
+    for w in runes.windows(2) {
+        if (0x1F1E6..=0x1F1FF).contains(&(w[0] as u32))
+            && (0x1F1E6..=0x1F1FF).contains(&(w[1] as u32))
+        {
+            tags.push(format!("{}{}", w[0], w[1]));
+        }
+    }
+    for word in [
+        "香港", "台湾", "日本", "美国", "新加坡", "韩国", "印尼", "俄罗斯", "德国", "英国",
+        "Hong Kong", "Taiwan", "Japan", "United States", "Singapore", "Korea",
+    ] {
+        if name.contains(word) {
+            tags.push(word.to_string());
+        }
+    }
+    tags
+}
+
 /// Owns the outbound registry and group-selection logic.
 pub struct OutboundManager {
     pub outbounds: HashMap<String, Arc<dyn Outbound>>,
@@ -362,6 +386,38 @@ impl OutboundManager {
             cursor: AtomicUsize::new(0),
             explicit: AtomicBool::new(false),
         });
+
+        // Some subscriptions express url-test/fallback membership through a
+        // construct our minimal schema doesn't expand, leaving the group's
+        // member list empty. An empty group resolves to DIRECT and silently
+        // bypasses the proxy. Fill it from the proxy nodes: prefer nodes whose
+        // name matches the group's region, otherwise use all real nodes.
+        let node_names: Vec<String> = config.proxies.iter()
+            .filter(|p| !matches!(p.name.as_str(), "DIRECT" | "REJECT"))
+            .map(|p| p.name.clone())
+            .collect();
+        let empty_groups: Vec<(String, String)> = groups.iter()
+            .filter(|(_, g)| matches!(g.kind.as_str(), "url-test" | "fallback") && g.members.is_empty())
+            .map(|(name, g)| (name.clone(), g.name.clone()))
+            .collect();
+        for (key, name) in empty_groups {
+            let tags = region_tags(&name);
+            let mut members: Vec<String> = if tags.is_empty() {
+                node_names.clone()
+            } else {
+                node_names.iter()
+                    .filter(|n| tags.iter().any(|t| n.contains(t)))
+                    .cloned()
+                    .collect()
+            };
+            if members.is_empty() {
+                members = node_names.clone();
+            }
+            tracing::info!("filled empty group {} with {} nodes", name, members.len());
+            if let Some(g) = groups.get_mut(&key) {
+                g.members = members;
+            }
+        }
 
         Self { outbounds, groups }
     }
