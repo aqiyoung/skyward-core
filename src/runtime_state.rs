@@ -39,13 +39,29 @@ pub async fn set_engine(engine: Arc<Engine>) {
 /// Load config from `path`, parse it, and apply. Returns an error string on
 /// failure (matching the Go `withMessage` convention).
 pub async fn apply_config_from_path(path: &str) -> Result<(), String> {
+    let log = |m: &str| {
+        tracing::info!("{}", m);
+        crate::jni::emit_log_event(&format!("[rust-core] {}", m));
+    };
+    log(&format!("apply_config: loading {}", path));
     let config_path = PathBuf::from(path);
-    let config = Config::load(&config_path).map_err(|e| e.to_string())?;
+    let config = match Config::load(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            log(&format!("apply_config: PARSE FAILED: {}", e));
+            return Err(e.to_string());
+        }
+    };
+    log(&format!("apply_config: parsed {} proxies, {} groups, {} rules, {} providers",
+        config.proxies.len(), config.proxy_groups.len(), config.rules.len(),
+        config.proxy_providers.len()));
     let data_dir = config_path
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
+    log("apply_config: building engine...");
     apply_config(config, config_path, data_dir).await;
+    log("apply_config: engine built and installed");
     Ok(())
 }
 
