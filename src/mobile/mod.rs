@@ -11,6 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
@@ -48,6 +49,12 @@ pub struct MethodResponse {
 static IS_INIT: AtomicBool = AtomicBool::new(false);
 static SEQ: AtomicU64 = AtomicU64::new(0);
 static HOME_DIR: OnceLock<String> = OnceLock::new();
+
+/// The core home dir (set by initClash), where mihomo keeps geoip.dat /
+/// geosite.dat. Used by the engine to locate GeoX data.
+pub fn home_dir() -> Option<PathBuf> {
+    HOME_DIR.get().filter(|s| !s.is_empty()).map(PathBuf::from)
+}
 
 fn ok(id: &str, result: Value) -> Vec<u8> {
     encode(MethodResponse {
@@ -360,33 +367,30 @@ fn handle_outbound_ip(call: &MethodCall) -> Vec<u8> {
 }
 
 fn handle_memory_stats(call: &MethodCall) -> Vec<u8> {
-    let rss = process_rss();
-    crate::jni::emit_log_event(&format!("[rust-core] memory rss={}", rss));
-    // Rust has no Go-style heap buckets; report RSS as the in-use figure so the
-    // dashboard shows the core's real footprint.
+    let rss = process_mem_kb("VmRSS:").unwrap_or(0) * 1024;
+    // The App (Android, core-in-process) computes app = rss - runtimeTotal and
+    // coreTotal = runtimeTotal. Reporting the whole RSS as heapInuse made app
+    // show 0B. Go reports only the core runtime's heap; Rust has no equivalent,
+    // so use the data segment (VmData, which contains the heap) as an estimate
+    // of the core's own footprint and let the rest show as app memory.
+    let core_heap = process_mem_kb("VmData:").unwrap_or(rss / 8) * 1024;
+    let core_heap = core_heap.min(rss.saturating_sub(1024 * 1024));
+    crate::jni::emit_log_event(&format!("[rust-core] memory rss={} core_heap={}", rss, core_heap));
     ok(&call.id, json!({
-        "rss": rss, "heapInuse": rss, "heapIdle": 0u64, "stackInuse": 0u64,
+        "rss": rss, "heapInuse": core_heap, "heapIdle": 0u64, "stackInuse": 0u64,
         "runtimeOther": 0u64, "budget": 0i64, "gcPercent": 0i32, "deviceTotal": 0u64,
     }))
 }
 
-/// Resident set size of this process, in bytes.
-fn process_rss() -> u64 {
-    if let Ok(text) = std::fs::read_to_string("/proc/self/statm") {
-        if let Some(pages) = text.split_whitespace().nth(1).and_then(|p| p.parse::<u64>().ok()) {
-            return pages * 4096;
+/// Read a kB-valued field from /proc/self/status (e.g. "VmRSS:").
+fn process_mem_kb(field: &str) -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix(field) {
+            return rest.split_whitespace().next().and_then(|v| v.parse::<u64>().ok());
         }
     }
-    if let Ok(text) = std::fs::read_to_string("/proc/self/status") {
-        for line in text.lines() {
-            if let Some(rest) = line.strip_prefix("VmRSS:") {
-                if let Some(kb) = rest.split_whitespace().next().and_then(|v| v.parse::<u64>().ok()) {
-                    return kb * 1024;
-                }
-            }
-        }
-    }
-    0
+    None
 }
 
 fn handle_start_log(call: &MethodCall) -> Vec<u8> {
@@ -1171,11 +1175,12 @@ mod tests {
     #[test]
     fn memory_stats_reports_real_rss() {
         let _guard = crate::runtime_state::TEST_LOCK.lock().unwrap();
-        let rss = process_rss();
-        assert!(rss > 0, "process RSS should be readable");
         let r = response(invoke(br#"{"method":"getMemoryStats"}"#));
-        assert_eq!(r["result"]["rss"].as_u64(), Some(rss));
-        assert_eq!(r["result"]["heapInuse"].as_u64(), Some(rss));
+        let rss = r["result"]["rss"].as_u64().unwrap_or(0);
+        let heap = r["result"]["heapInuse"].as_u64().unwrap_or(0);
+        assert!(rss > 0, "process RSS should be readable");
+        assert!(heap > 0, "core heap estimate should be readable");
+        assert!(heap <= rss, "core heap must not exceed total RSS");
     }
 
     #[test]

@@ -95,6 +95,19 @@ impl Engine {
         };
         let rules = RuleSet::new(&config.rules);
         let resolver = Resolver::new(config.dns.clone().unwrap_or_default());
+        // Diagnostics: show the mode and the final (MATCH) rule target. If all
+        // traffic resolves to DIRECT, the mode or the fallback rule is the cause.
+        let match_rule = rules
+            .rules
+            .iter()
+            .rev()
+            .find(|r| matches!(r.kind, crate::rules::RuleKind::Match));
+        log(format!(
+            "engine: mode={} rules={} match_target={:?}",
+            config.mode,
+            rules.rules.len(),
+            match_rule.map(|r| r.target.as_str())
+        ));
         log(format!("engine: rules/resolver done ({:?})", t0.elapsed()));
         let proxy_providers = Arc::new(ProxyProviderRegistry::load(&config, data_dir).await);
         log(format!("engine: proxy_providers done ({:?})", t0.elapsed()));
@@ -120,8 +133,16 @@ impl Engine {
 
         let mode = RwLock::new(config.mode.clone());
         log(format!("engine: loading geo ({:?})", t0.elapsed()));
-        let geo = Arc::new(GeoData::load(data_dir));
-        log(format!("engine: geo done ({:?})", t0.elapsed()));
+        // mihomo keeps GeoX files in the core home dir, which may differ from
+        // the config file's parent. Search both so GEOIP/GEOSITE rules work.
+        let home = crate::mobile::home_dir();
+        let geo_dirs: Vec<&Path> = match home.as_deref() {
+            Some(h) if h != data_dir => vec![data_dir, h],
+            _ => vec![data_dir],
+        };
+        let geo = Arc::new(GeoData::load_from(&geo_dirs));
+        log(format!("engine: geo done ({:?}) geoip={} geosite={} ({:?})",
+            t0.elapsed(), geo.geoip.len(), geo.geosite.len(), t0.elapsed()));
         let providers = Arc::new(ProviderRegistry::load(&config, data_dir).await);
         log(format!("engine: rule providers done ({:?})", t0.elapsed()));
         let connections = Arc::new(ConnectionTracker::new());
@@ -139,9 +160,23 @@ impl Engine {
                     TargetAddr::Domain(h, _) => self.resolver.resolve_first(h).await.ok(),
                     TargetAddr::Ip(ip, _) => Some(*ip),
                 };
-                self.rules.find(target, resolved, Some(&self.geo), Some(&self.providers))
-                    .map(|r| r.target.clone())
-                    .unwrap_or_else(|| "DIRECT".to_string())
+                match self.rules.find(target, resolved, Some(&self.geo), Some(&self.providers)) {
+                    Some(rule) => rule.target.clone(),
+                    None => {
+                        // No rule matched (e.g. GEOIP/GEOSITE with empty geo data,
+                        // or RULE-SET with no provider). Say why instead of
+                        // silently routing to DIRECT.
+                        static NO_MATCH: std::sync::atomic::AtomicUsize =
+                            std::sync::atomic::AtomicUsize::new(0);
+                        if NO_MATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
+                            crate::jni::emit_log_event(&format!(
+                                "[rust-core] no rule matched for {} (geoip={} geosite={} rule-providers={}); using DIRECT",
+                                target.address(), self.geo.geoip.len(), self.geo.geosite.len(), self.providers.len()
+                            ));
+                        }
+                        "DIRECT".to_string()
+                    }
+                }
             }
         }
     }

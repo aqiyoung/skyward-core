@@ -25,6 +25,14 @@ pub struct GeoIpDatabase {
 }
 
 impl GeoIpDatabase {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn contains(&self, country: &str, ip: IpAddr) -> bool {
         self.entries.iter().any(|(code, cidrs)| {
             code.eq_ignore_ascii_case(country)
@@ -43,6 +51,14 @@ pub struct GeoSiteDatabase {
 }
 
 impl GeoSiteDatabase {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn matches(&self, country: &str, domain: &str) -> bool {
         let domain = domain.to_ascii_lowercase();
         self.entries.iter().any(|(code, values)| {
@@ -73,20 +89,34 @@ impl GeoData {
     /// Load from `geoip.dat` / `geosite.dat` in `dir`. Missing or malformed
     /// files are non-fatal: the corresponding rules simply never match.
     pub fn load(dir: &Path) -> Self {
+        Self::load_from(&[dir])
+    }
+
+    /// Load from the first directory that contains each file. mihomo keeps the
+    /// GeoX files in the core home dir, which is not necessarily the config
+    /// file's parent, so callers pass both as candidates.
+    pub fn load_from(dirs: &[&Path]) -> Self {
         let mut data = Self::default();
-        match fs::read(dir.join("geoip.dat")) {
-            Ok(bytes) => match parse_geoip_list(&bytes) {
+        let read = |name: &str| -> Option<Vec<u8>> {
+            for dir in dirs {
+                if let Ok(bytes) = fs::read(dir.join(name)) {
+                    tracing::info!("loaded {} from {}", name, dir.display());
+                    return Some(bytes);
+                }
+            }
+            None
+        };
+        if let Some(bytes) = read("geoip.dat") {
+            match parse_geoip_list(&bytes) {
                 Ok(db) => data.geoip = db,
                 Err(e) => tracing::warn!("failed to parse geoip.dat: {}", e),
-            },
-            Err(e) => tracing::debug!("geoip.dat not available: {}", e),
+            }
         }
-        match fs::read(dir.join("geosite.dat")) {
-            Ok(bytes) => match parse_geosite_list(&bytes) {
+        if let Some(bytes) = read("geosite.dat") {
+            match parse_geosite_list(&bytes) {
                 Ok(db) => data.geosite = db,
                 Err(e) => tracing::warn!("failed to parse geosite.dat: {}", e),
-            },
-            Err(e) => tracing::debug!("geosite.dat not available: {}", e),
+            }
         }
         data
     }

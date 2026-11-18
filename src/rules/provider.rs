@@ -116,6 +116,14 @@ pub struct ProviderRegistry {
 }
 
 impl ProviderRegistry {
+    pub fn len(&self) -> usize {
+        self.providers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
+
     /// Build all providers. Network/file failures are logged and skipped so
     /// the kernel still starts with the remaining rules.
     pub async fn load(config: &Config, data_dir: &Path) -> Self {
