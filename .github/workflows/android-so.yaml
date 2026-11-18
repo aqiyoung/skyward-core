@@ -23,7 +23,8 @@ permissions:
   contents: read
 
 env:
-  NDK_VERSION: 28.2.13676358
+  # nttld/setup-ndk expects the revision name (r28c), not the full version.
+  NDK_VERSION: r28c
   API_LEVEL: '26'
 
 jobs:
