@@ -163,7 +163,18 @@ fn handle_get_proxies(call: &MethodCall) -> Vec<u8> {
             all.push(item.name.clone());
             let mut view = serde_json::Map::new();
             view.insert("name".into(), Value::String(item.name.clone()));
-            view.insert("type".into(), Value::String(item.kind.clone()));
+            // App's GroupType enum matches on PascalCase names (Selector,
+            // URLTest, ...) via `type.name == proxy.type`. Nodes already use
+            // PascalCase kinds; map group kinds from config values as well.
+            let display_type = match item.kind.as_str() {
+                "select" | "GLOBAL" => "Selector",
+                "url-test" => "URLTest",
+                "fallback" => "Fallback",
+                "load-balance" => "LoadBalance",
+                "relay" => "Relay",
+                other => other,
+            };
+            view.insert("type".into(), Value::String(display_type.to_string()));
             if !item.members.is_empty() {
                 view.insert("all".into(), json!(item.members));
                 if let Some(sel) = &item.selected {
@@ -721,10 +732,31 @@ fn handle_setup_config(call: &MethodCall) -> Vec<u8> {
     };
 
     let path_owned = path.to_string();
-    let future = async move { crate::runtime_state::apply_config_from_path(&path_owned).await };
+    let diag_path = path_owned.clone();
+    let future = async move {
+        let result = crate::runtime_state::apply_config_from_path(&path_owned).await;
+        if result.is_ok() {
+            if let Some(engine) = crate::runtime_state::engine().await {
+                let msg = format!(
+                    "[rust-core] config applied: {} proxies, {} groups, {} rules",
+                    engine.outbounds.outbounds.len(),
+                    engine.outbounds.groups.len(),
+                    engine.rules.rules.len()
+                );
+                tracing::info!("{}", msg);
+                crate::jni::emit_log_event(&msg);
+            }
+        }
+        result
+    };
+    // Emit the path we are reading to aid diagnosis.
+    crate::jni::emit_log_event(&format!("[rust-core] setupConfig reading path: {}", diag_path));
     match block_on(future) {
         Ok(Ok(())) => ok(&call.id, Value::String(String::new())),
-        Ok(Err(e)) => ok(&call.id, Value::String(e)),
+        Ok(Err(e)) => {
+            crate::jni::emit_log_event(&format!("[rust-core] setupConfig FAILED: {}", e));
+            ok(&call.id, Value::String(e))
+        }
         Err(e) => ok(&call.id, Value::String(e)),
     }
 }
@@ -888,6 +920,8 @@ mod tests {
         assert!(r["result"]["all"].as_array().unwrap().iter().any(|n| n == "g1"));
         assert!(r["result"]["proxies"]["g1"]["all"].as_array().is_some());
         assert_eq!(r["result"]["proxies"]["g1"]["now"], "n1");
+        // App's GroupType matches PascalCase names.
+        assert_eq!(r["result"]["proxies"]["g1"]["type"], "Selector");
     }
 
     #[test]
