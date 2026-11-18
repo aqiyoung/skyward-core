@@ -28,8 +28,10 @@ hmac = "0.12"
 sha1 = "0.10"
 rand = "0.8"
 sha2 = "0.10"
-rustls = "0.23"
-tokio-rustls = "0.26"
+# ring backend: pure Rust + C, cross-compiles cleanly to aarch64-linux-android
+# without aws-lc-rs's cmake/go toolchain requirement.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "0.26"
 aes = "0.8"
 crc32fast = "1"

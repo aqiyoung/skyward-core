@@ -1,0 +1,90 @@
+name: android-so
+
+# Cross-compile the Rust core to an aarch64 Android cdylib. The resulting
+# libskyward_core.so is the input the Skyward App's rust-core build consumes.
+# Everything runs on the runner; no local toolchain is needed.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ rust-core ]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**'
+      - 'jni/**'
+      - '.github/workflows/android-so.yaml'
+
+concurrency:
+  group: android-so-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NDK_VERSION: 28.2.13676358
+  API_LEVEL: '26'
+
+jobs:
+  build-so:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (aarch64 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Install NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          link-to-sdk: true
+
+      - name: Cross-compile cdylib
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          NDK="$ANDROID_NDK_HOME"
+          LLVM="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$LLVM/aarch64-linux-android${{ env.API_LEVEL }}-clang"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_AR="$LLVM/llvm-ar"
+          export CC_aarch64_linux_android="$LLVM/aarch64-linux-android${{ env.API_LEVEL }}-clang"
+          export AR_aarch64_linux_android="$LLVM/llvm-ar"
+          cargo build --locked --release --target aarch64-linux-android
+          SO=target/aarch64-linux-android/release/libskyward_core.so
+          test -f "$SO"
+          echo "so: $(stat -c%s "$SO") bytes"
+          file "$SO"
+          "$LLVM/llvm-nm" -D --defined-only "$SO" | grep -q Java_com_follow_clash_core_mobile_Mobile_invokeMethod \
+            || { echo "missing JNI symbol"; exit 1; }
+          echo "JNI symbols present"
+
+      - name: Package .so + JNI headers + example config
+        run: |
+          set -euo pipefail
+          mkdir -p dist/jni/com/follow/clash/core/mobile
+          cp target/aarch64-linux-android/release/libskyward_core.so dist/
+          cp -R jni/java/com/follow/clash/core/mobile/. dist/jni/com/follow/clash/core/mobile/
+          cp config.example.yaml dist/
+          cp README.md dist/
+          (cd dist && zip -r ../skyward-core-android-arm64.zip .)
+          ls -la skyward-core-android-arm64.zip
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: skyward-core-android-arm64
+          path: skyward-core-android-arm64.zip
+          if-no-files-found: error
+          retention-days: 30
