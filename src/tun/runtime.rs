@@ -235,6 +235,40 @@ fn build_dns_response(query: &[u8], answer_ip: Option<std::net::IpAddr>) -> Vec<
 mod tests {
     use super::*;
 
+    // Exercise the actual mixed TCP/DNS socket set and poll loop. Previously
+    // SessionManager::pump downcast the DNS socket to TCP and panicked on the
+    // first iteration, dropping the device and tearing down Android's VPN.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tun_runtime_keeps_descriptor_open_until_cancelled() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+
+        let (local, mut peer) = UnixStream::pair().unwrap();
+        local.set_nonblocking(true).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let config = TunConfig::parse(
+            "mips", "198.18.0.1/30", "198.18.0.2",
+            r#"{"mtu":9000,"congestion-controller":"cubic"}"#,
+        ).unwrap();
+        let engine = Arc::new(Engine::new(
+            crate::config::Config::default(),
+            Arc::new(crate::common::TrafficStats::default()),
+            std::path::Path::new("."),
+        ).await);
+        let mut task = tokio::spawn(run(
+            TunDevice::new(local, config.options.mtu), config, engine,
+            Arc::new(Notify::new()),
+        ));
+        assert!(tokio::time::timeout(Duration::from_millis(300), &mut task).await.is_err(),
+            "TUN loop exited during startup");
+        let mut byte = [0];
+        assert_eq!(peer.read(&mut byte).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(peer.read(&mut byte).unwrap(), 0, "cancellation must close the device");
+    }
+
     fn dns_query(name: &str, qtype: u16) -> Vec<u8> {
         let mut p = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
         for label in name.split('.').filter(|x| !x.is_empty()) {

@@ -265,9 +265,12 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
                 .clone();
             *TUN_SESSION.lock().unwrap() = Some((fd, config.clone()));
             emit_log_event("[rust-core] TUN runtime spawned, returning TRUE");
-            rt.spawn(async move {
+            let task = rt.spawn(async move {
                 crate::tun::runtime::run(device, config, engine, wake).await;
-                let e = format!("[rust-core] TUN runtime EXITED for fd {}", fd);
+            });
+            rt.spawn(async move {
+                let outcome = task.await;
+                let e = format!("[rust-core] TUN runtime EXITED for fd {}: {:?}", fd, outcome);
                 tracing::warn!("{}", e);
                 emit_log_event(&e);
             });

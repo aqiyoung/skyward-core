@@ -34,7 +34,9 @@ impl SessionManager {
     /// ones. Must be called from within a tokio runtime (it spawns relay tasks).
     pub fn pump(&mut self, sockets: &mut SocketSet<'_>, engine: &Arc<Engine>) {
         // Collect handle snapshots first to avoid borrowing sockets twice.
-        let handles: Vec<SocketHandle> = sockets.iter().map(|(h, _)| h).collect();
+        let handles: Vec<SocketHandle> = sockets.iter().filter_map(|(h, socket)| {
+            matches!(socket, smoltcp::socket::Socket::Tcp(_)).then_some(h)
+        }).collect();
         for handle in handles {
             let target = {
                 let socket = sockets.get::<tcp::Socket>(handle);
