@@ -55,10 +55,11 @@ impl<S: Subscriber> Layer<S> for AppLogLayer {
             Level::DEBUG => "debug",
             Level::TRACE => "trace",
         };
-        let payload = json!({"type": level, "payload": visitor.message}).to_string();
-        crate::jni::emit_event_json(&json!({"type": "log", "data": {"type": level, "payload": visitor.message}}).to_string());
-        // Keep payload variable meaningful for future field expansion.
-        let _ = payload;
+        // Match the App's Log model: LogLevel / Payload / dateTime.
+        crate::jni::emit_event_json(&json!({
+            "type": "log",
+            "data": { "LogLevel": level, "Payload": visitor.message, "dateTime": "" }
+        }).to_string());
     }
 }
 
