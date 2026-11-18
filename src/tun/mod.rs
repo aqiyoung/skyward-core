@@ -8,7 +8,7 @@
 use std::io::{self, Read, Write};
 
 #[cfg(unix)]
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use serde::Deserialize;
 use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
