@@ -121,6 +121,16 @@ impl ProviderRegistry {
     pub async fn load(config: &Config, data_dir: &Path) -> Self {
         let mut registry = Self::default();
         for (name, def) in &config.rule_providers {
+            // Never block core startup on a remote download. Only load inline
+            // providers or ones with a local cached file; skip http-only ones
+            // that would need the network (they are refreshed out-of-band).
+            if def.kind == "http" {
+                let has_cache = def.path.as_ref().map(|p| resolve_path(p, data_dir).exists()).unwrap_or(false);
+                if !has_cache {
+                    tracing::warn!("rule provider {} skipped (no local cache, http)", name);
+                    continue;
+                }
+            }
             match Self::build(name, def, data_dir).await {
                 Ok(provider) => {
                     tracing::info!("rule provider {} loaded ({} entries)", name, provider.len());

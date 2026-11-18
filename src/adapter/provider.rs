@@ -2,18 +2,14 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use regex::Regex;
 use serde::Deserialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::timeout;
 
 use crate::adapter::{build_outbound, Outbound};
-use crate::common::TargetAddr;
 use crate::config::{Config, ProxyDef, ProxyProviderDef};
 use crate::fetch::fetch_url;
 
@@ -58,6 +54,16 @@ impl ProxyProviderRegistry {
     pub async fn load(config: &Config, data_dir: &Path) -> Self {
         let mut registry = Self::default();
         for (name, def) in &config.proxy_providers {
+            // Skip http providers without a local cache so startup is instant.
+            if def.kind == "http" {
+                let cached = def.path.as_ref().map(|p| {
+                    if Path::new(p).is_absolute() { Path::new(p).to_path_buf() } else { data_dir.join(p) }
+                });
+                if !cached.map(|p| p.exists()).unwrap_or(false) {
+                    tracing::warn!("proxy provider {} skipped (no local cache, http)", name);
+                    continue;
+                }
+            }
             match Self::build(name, def, data_dir).await {
                 Ok(provider) => {
                     tracing::info!("proxy provider {} loaded ({} nodes)", name, provider.len());
@@ -137,24 +143,18 @@ impl ProxyProviderRegistry {
             true
         });
 
-        let check_enabled = def.health_check.enable;
-        let check_url = def.health_check.url.as_deref();
+        // Do NOT run health probes during startup: with hundreds of nodes this
+        // would block core readiness for minutes. Mark all nodes alive and let
+        // on-demand delay tests (asyncTestDelay) measure them later.
+        let _ = &def.health_check;
         let mut proxies = Vec::with_capacity(definitions.len());
         for d in definitions {
             let outbound = build_outbound(&d);
-            let latency = if check_enabled {
-                match check_url {
-                    Some(url) => check_proxy(&outbound, url).await,
-                    None => Some(Duration::ZERO),
-                }
-            } else {
-                Some(Duration::ZERO)
-            };
             proxies.push(ProviderProxy {
                 def: d,
                 outbound,
-                alive: latency.is_some(),
-                latency,
+                alive: true,
+                latency: Some(Duration::ZERO),
             });
         }
 
@@ -227,36 +227,6 @@ pub struct ProviderInfo {
     pub kind: String,
     pub count: usize,
     pub alive: usize,
-}
-
-/// Run one HTTP health check through the given outbound.
-async fn check_proxy(outbound: &Arc<dyn Outbound>, url: &str) -> Option<Duration> {
-    let (scheme, rest) = url.split_once("://")?;
-    if scheme != "http" {
-        return None;
-    }
-    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-    let path = format!("/{}", path);
-    let (host, port) = authority.rsplit_once(':')
-        .and_then(|(h, p)| p.parse::<u16>().ok().map(|port| (h.to_string(), port)))
-        .unwrap_or((authority.to_string(), 80));
-    let target = match host.parse::<IpAddr>() {
-        Ok(ip) => TargetAddr::Ip(ip, port),
-        Err(_) => TargetAddr::Domain(host.clone(), port),
-    };
-
-    let started = Instant::now();
-    let mut stream = timeout(Duration::from_secs(5), outbound.connect(&target)).await.ok()?.ok()?;
-    let request = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", path, host);
-    timeout(Duration::from_secs(5), stream.write_all(request.as_bytes())).await.ok()?.ok()?;
-    let mut response = [0u8; 64];
-    let n = timeout(Duration::from_secs(5), stream.read(&mut response)).await.ok()?.ok()?;
-    let text = String::from_utf8_lossy(&response[..n]);
-    if text.contains(" 200 ") || text.contains(" 204 ") {
-        Some(started.elapsed())
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]
