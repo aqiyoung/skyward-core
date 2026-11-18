@@ -45,7 +45,32 @@ pub async fn apply_config_from_path(path: &str) -> Result<(), String> {
     };
     log(&format!("apply_config: loading {}", path));
     let config_path = PathBuf::from(path);
-    let config = match Config::load(&config_path) {
+    // Read once and also scan the raw YAML, so a profile whose groups our
+    // schema drops is visible in the log (parsed vs raw counts).
+    let text = match std::fs::read_to_string(&config_path) {
+        Ok(t) => t,
+        Err(e) => {
+            let msg = format!("apply_config: READ FAILED: {}", e);
+            log(&msg);
+            return Err(msg);
+        }
+    };
+    if let Ok(serde_yaml::Value::Mapping(map)) = serde_yaml::from_str::<serde_yaml::Value>(&text) {
+        let seq_len = |key: &str| {
+            map.get(serde_yaml::Value::String(key.to_string()))
+                .and_then(|v| v.as_sequence())
+                .map(|s| s.len())
+                .unwrap_or(0)
+        };
+        log(&format!(
+            "apply_config: raw yaml top-level keys={}, proxies={}, proxy-groups={}, rules={}",
+            map.len(),
+            seq_len("proxies"),
+            seq_len("proxy-groups"),
+            seq_len("rules")
+        ));
+    }
+    let config = match Config::from_str(&text) {
         Ok(c) => c,
         Err(e) => {
             log(&format!("apply_config: PARSE FAILED: {}", e));

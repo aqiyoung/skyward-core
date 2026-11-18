@@ -853,12 +853,19 @@ fn handle_quick_setup(call: &MethodCall) -> Vec<u8> {
                 .collect()
         })
         .unwrap_or_default();
+    let applied = selected.len();
     let future = async move {
         match crate::runtime_state::engine().await {
             Some(engine) => {
                 for (group, proxy) in selected {
                     engine.outbounds.set_selection(&group, &proxy);
                 }
+                crate::jni::emit_log_event(&format!(
+                    "[rust-core] quickSetup: applied {} selection(s), keeping {} proxies / {} groups",
+                    applied,
+                    engine.outbounds.outbounds.len(),
+                    engine.outbounds.groups.len()
+                ));
                 Ok(())
             }
             None => {
