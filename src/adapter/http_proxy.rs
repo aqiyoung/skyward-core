@@ -19,6 +19,7 @@ pub struct HttpOutbound {
     password: String,
     use_tls: bool,
     sni: String,
+    verify: bool,
 }
 
 impl HttpOutbound {
@@ -30,6 +31,7 @@ impl HttpOutbound {
         password: Option<&str>,
         use_tls: bool,
         sni: Option<&str>,
+        verify: bool,
     ) -> Option<Self> {
         let sni = sni.filter(|s| !s.is_empty()).unwrap_or(server).to_string();
         let server = match server.parse::<IpAddr>() {
@@ -43,6 +45,7 @@ impl HttpOutbound {
             password: password.unwrap_or("").to_string(),
             use_tls,
             sni,
+            verify,
         })
     }
 
@@ -88,7 +91,7 @@ impl Outbound for HttpOutbound {
         })?;
 
         let mut stream: BoxedStream = if self.use_tls {
-            connect_tls(&self.sni, tcp).await?
+            connect_tls(&self.sni, tcp, self.verify).await?
         } else {
             Box::new(tcp)
         };
@@ -131,7 +134,7 @@ mod tests {
 
     #[test]
     fn connect_request_with_auth() {
-        let outbound = HttpOutbound::try_new("h", "1.2.3.4", 8080, Some("user"), Some("pass"), false, None).unwrap();
+        let outbound = HttpOutbound::try_new("h", "1.2.3.4", 8080, Some("user"), Some("pass"), false, None, true).unwrap();
         let ip: IpAddr = "1.1.1.1".parse().unwrap();
         let req = outbound.connect_request(&TargetAddr::Ip(ip, 443));
         assert!(req.starts_with("CONNECT 1.1.1.1:443 HTTP/1.1\r\n"));
@@ -142,7 +145,7 @@ mod tests {
 
     #[test]
     fn connect_request_without_auth() {
-        let outbound = HttpOutbound::try_new("h", "proxy.example", 8080, None, None, false, None).unwrap();
+        let outbound = HttpOutbound::try_new("h", "proxy.example", 8080, None, None, false, None, true).unwrap();
         let req = outbound.connect_request(&TargetAddr::Domain("example.com".into(), 80));
         assert!(!req.contains("Proxy-Authorization"));
         assert!(req.contains("CONNECT example.com:80 HTTP/1.1\r\n"));

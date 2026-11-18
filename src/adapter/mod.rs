@@ -148,6 +148,9 @@ pub struct OutboundManager {
 }
 
 pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
+    // Per-node TLS verification, matching the Go kernel (which governs proxy
+    // outbound TLS by `skip-cert-verify` in the proxy config).
+    let verify = !def.skip_cert_verify.unwrap_or(false);
     match def.kind.as_str() {
                 "direct" => Arc::new(DirectOutbound::new(def.name.clone())),
                 "reject" => Arc::new(RejectOutbound::new(def.name.clone())),
@@ -161,6 +164,7 @@ pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
                             def.password.as_deref(),
                             def.tls.unwrap_or(false),
                             def.sni.as_deref().or(def.server_name.as_deref()),
+                            verify,
                         ),
                         _ => None,
                     };
@@ -180,6 +184,7 @@ pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
                             def.password.as_deref(),
                             def.tls.unwrap_or(false),
                             def.sni.as_deref().or(def.server_name.as_deref()),
+                            verify,
                         ),
                         _ => None,
                     };
@@ -218,6 +223,7 @@ pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
                             def.version.unwrap_or(1),
                             def.tls.unwrap_or(false),
                             def.sni.as_deref().or(def.server_name.as_deref()),
+                            verify,
                         ),
                         _ => None,
                     };
@@ -250,6 +256,7 @@ pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
                             def.cipher.as_deref().unwrap_or("auto"),
                             def.tls.unwrap_or(false),
                             def.sni.as_deref().or(def.server_name.as_deref()),
+                            verify,
                         ),
                         _ => None,
                     };
@@ -268,6 +275,7 @@ pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
                             uuid,
                             def.tls.unwrap_or(false),
                             def.sni.as_deref().or(def.server_name.as_deref()),
+                            verify,
                         ),
                         _ => None,
                     };
@@ -285,6 +293,7 @@ pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
                             port,
                             password,
                             def.sni.as_deref(),
+                            verify,
                         ),
                         _ => None,
                     };

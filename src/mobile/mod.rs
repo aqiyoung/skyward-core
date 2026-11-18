@@ -504,7 +504,9 @@ async fn measure_delay(
     };
 
     let mut stream = if use_tls {
-        match tokio::time::timeout(timeout, crate::adapter::tls::connect_tls(host, stream)).await {
+        // The Go kernel's delay probe does not verify the target certificate;
+        // it only measures latency.
+        match tokio::time::timeout(timeout, crate::adapter::tls::connect_tls(host, stream, false)).await {
             Err(_) => {
                 delay_diag(&format!("{} tls handshake timed out", name));
                 return None;

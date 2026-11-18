@@ -83,6 +83,8 @@ pub struct ProxyDef {
     pub tls: Option<bool>,
     #[serde(rename = "server-name")]
     pub server_name: Option<String>,
+    #[serde(rename = "skip-cert-verify")]
+    pub skip_cert_verify: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

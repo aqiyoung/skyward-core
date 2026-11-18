@@ -17,10 +17,11 @@ pub struct TrojanOutbound {
     server: TargetAddr,
     password_hash: String,
     sni: String,
+    verify: bool,
 }
 
 impl TrojanOutbound {
-    pub fn try_new(name: &str, server: &str, port: u16, password: &str, sni: Option<&str>) -> Option<Self> {
+    pub fn try_new(name: &str, server: &str, port: u16, password: &str, sni: Option<&str>, verify: bool) -> Option<Self> {
         if password.is_empty() {
             return None;
         }
@@ -31,7 +32,7 @@ impl TrojanOutbound {
             Ok(ip) => TargetAddr::Ip(ip, port),
             Err(_) => TargetAddr::Domain(server.to_string(), port),
         };
-        Some(Self { name: name.to_string(), server, password_hash, sni })
+        Some(Self { name: name.to_string(), server, password_hash, sni, verify })
     }
 }
 
@@ -63,7 +64,7 @@ impl Outbound for TrojanOutbound {
 
         // The SNI host comes from the server address (or its override), never
         // from the connection target — the target is carried inside TLS.
-        let mut stream = connect_tls(&self.sni, tcp).await?;
+        let mut stream = connect_tls(&self.sni, tcp, self.verify).await?;
         // Mirrors transport/trojan.WriteHeader: hex(SHA224(password)) + CRLF,
         // then the TCP command byte, the SOCKS5 address and a trailing CRLF.
         let mut header = self.password_hash.as_bytes().to_vec();
@@ -106,7 +107,7 @@ mod tests {
 
     #[test]
     fn password_is_sha224_hex() {
-        let outbound = TrojanOutbound::try_new("t", "example.com", 443, "password", None).unwrap();
+        let outbound = TrojanOutbound::try_new("t", "example.com", 443, "password", None, true).unwrap();
         assert_eq!(outbound.password_hash.len(), 56);
         assert_eq!(
             outbound.password_hash,
@@ -117,9 +118,9 @@ mod tests {
 
     #[test]
     fn sni_override_is_honored() {
-        let outbound = TrojanOutbound::try_new("t", "1.2.3.4", 443, "pw", Some("cdn.example.com")).unwrap();
+        let outbound = TrojanOutbound::try_new("t", "1.2.3.4", 443, "pw", Some("cdn.example.com"), true).unwrap();
         assert_eq!(outbound.sni, "cdn.example.com");
-        assert!(TrojanOutbound::try_new("t", "h", 443, "", None).is_none());
+        assert!(TrojanOutbound::try_new("t", "h", 443, "", None, true).is_none());
     }
 
     #[test]

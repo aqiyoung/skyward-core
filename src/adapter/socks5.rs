@@ -18,6 +18,7 @@ pub struct Socks5Outbound {
     password: String,
     use_tls: bool,
     sni: String,
+    verify: bool,
 }
 
 impl Socks5Outbound {
@@ -29,6 +30,7 @@ impl Socks5Outbound {
         password: Option<&str>,
         use_tls: bool,
         sni: Option<&str>,
+        verify: bool,
     ) -> Option<Self> {
         let sni = sni.filter(|s| !s.is_empty()).unwrap_or(server).to_string();
         let server = match server.parse::<IpAddr>() {
@@ -42,6 +44,7 @@ impl Socks5Outbound {
             password: password.unwrap_or("").to_string(),
             use_tls,
             sni,
+            verify,
         })
     }
 }
@@ -97,7 +100,7 @@ impl Outbound for Socks5Outbound {
         })?;
 
         let mut stream: BoxedStream = if self.use_tls {
-            connect_tls(&self.sni, tcp).await?
+            connect_tls(&self.sni, tcp, self.verify).await?
         } else {
             Box::new(tcp)
         };
@@ -179,9 +182,9 @@ mod tests {
 
     #[test]
     fn credentials_are_optional() {
-        let plain = Socks5Outbound::try_new("s", "proxy.example", 1080, None, None, false, None).unwrap();
+        let plain = Socks5Outbound::try_new("s", "proxy.example", 1080, None, None, false, None, true).unwrap();
         assert!(plain.username.is_empty());
-        let auth = Socks5Outbound::try_new("s", "proxy.example", 1080, Some("u"), Some("p"), false, None).unwrap();
+        let auth = Socks5Outbound::try_new("s", "proxy.example", 1080, Some("u"), Some("p"), false, None, true).unwrap();
         assert_eq!(auth.username, "u");
         assert_eq!(auth.password, "p");
     }

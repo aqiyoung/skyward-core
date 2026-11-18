@@ -282,6 +282,7 @@ pub struct SnellOutbound {
     version: i32,
     use_tls: bool,
     sni: String,
+    verify: bool,
 }
 
 impl SnellOutbound {
@@ -293,6 +294,7 @@ impl SnellOutbound {
         version: i32,
         use_tls: bool,
         sni: Option<&str>,
+        verify: bool,
     ) -> Option<Self> {
         if psk.is_empty() || !(1..=3).contains(&version) {
             return None;
@@ -302,7 +304,7 @@ impl SnellOutbound {
             Ok(ip) => TargetAddr::Ip(ip, port),
             Err(_) => TargetAddr::Domain(server.to_string(), port),
         };
-        Some(Self { name: name.to_string(), server, psk: psk.as_bytes().to_vec(), version, use_tls, sni })
+        Some(Self { name: name.to_string(), server, psk: psk.as_bytes().to_vec(), version, use_tls, sni, verify })
     }
 
     fn header(&self, target: &TargetAddr) -> Vec<u8> {
@@ -343,7 +345,7 @@ impl Outbound for SnellOutbound {
         let tcp = tcp.ok_or_else(|| last_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no Snell server address")))?;
 
         let mut base: BoxedStream = if self.use_tls {
-            connect_tls(&self.sni, tcp).await?
+            connect_tls(&self.sni, tcp, self.verify).await?
         } else {
             Box::new(tcp)
         };
@@ -371,15 +373,15 @@ mod tests {
 
     #[test]
     fn rejects_bad_config() {
-        assert!(SnellOutbound::try_new("s", "h", 443, "", 1, false, None).is_none());
-        assert!(SnellOutbound::try_new("s", "h", 443, "pw", 0, false, None).is_none());
-        assert!(SnellOutbound::try_new("s", "h", 443, "pw", 4, false, None).is_none());
-        assert!(SnellOutbound::try_new("s", "h", 443, "pw", 1, false, None).is_some());
+        assert!(SnellOutbound::try_new("s", "h", 443, "", 1, false, None, true).is_none());
+        assert!(SnellOutbound::try_new("s", "h", 443, "pw", 0, false, None, true).is_none());
+        assert!(SnellOutbound::try_new("s", "h", 443, "pw", 4, false, None, true).is_none());
+        assert!(SnellOutbound::try_new("s", "h", 443, "pw", 1, false, None, true).is_some());
     }
 
     #[test]
     fn header_layout() {
-        let outbound = SnellOutbound::try_new("s", "h", 443, "pw", 1, false, None).unwrap();
+        let outbound = SnellOutbound::try_new("s", "h", 443, "pw", 1, false, None, true).unwrap();
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         let header = outbound.header(&TargetAddr::Ip(ip, 443));
         assert_eq!(header[0], 0x01);
@@ -389,7 +391,7 @@ mod tests {
         assert_eq!(&header[4..11], b"1.2.3.4");
         assert_eq!(&header[11..], &443u16.to_be_bytes());
 
-        let v2 = SnellOutbound::try_new("s", "h", 443, "pw", 2, false, None).unwrap();
+        let v2 = SnellOutbound::try_new("s", "h", 443, "pw", 2, false, None, true).unwrap();
         assert_eq!(v2.header(&TargetAddr::Domain("x".into(), 80))[1], COMMAND_CONNECT_V2);
     }
 

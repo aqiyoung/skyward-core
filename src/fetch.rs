@@ -61,7 +61,8 @@ async fn fetch_url_inner(url: &str) -> io::Result<Vec<u8>> {
     }
     let tcp = tcp.ok_or_else(|| last_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address")))?;
     let mut stream: BoxedStream = if use_tls {
-        connect_tls(&host, tcp).await?
+        // Downloads (subscriptions, GeoX, providers) are always verified.
+        connect_tls(&host, tcp, true).await?
     } else {
         Box::new(tcp)
     };

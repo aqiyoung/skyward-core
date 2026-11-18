@@ -68,6 +68,7 @@ pub struct VlessOutbound {
     uuid: [u8; 16],
     use_tls: bool,
     sni: String,
+    verify: bool,
 }
 
 impl VlessOutbound {
@@ -78,6 +79,7 @@ impl VlessOutbound {
         uuid: &str,
         use_tls: bool,
         sni: Option<&str>,
+        verify: bool,
     ) -> Option<Self> {
         let uuid = parse_uuid(uuid)?;
         let sni = sni.filter(|s| !s.is_empty()).unwrap_or(server).to_string();
@@ -85,7 +87,7 @@ impl VlessOutbound {
             Ok(ip) => TargetAddr::Ip(ip, port),
             Err(_) => TargetAddr::Domain(server.to_string(), port),
         };
-        Some(Self { name: name.to_string(), server, uuid, use_tls, sni })
+        Some(Self { name: name.to_string(), server, uuid, use_tls, sni, verify })
     }
 }
 
@@ -116,7 +118,7 @@ impl Outbound for VlessOutbound {
         })?;
 
         let mut stream: BoxedStream = if self.use_tls {
-            connect_tls(&self.sni, tcp).await?
+            connect_tls(&self.sni, tcp, self.verify).await?
         } else {
             Box::new(tcp)
         };
@@ -181,12 +183,12 @@ mod tests {
 
     #[test]
     fn tls_and_sni_defaults() {
-        let plain = VlessOutbound::try_new("v", "example.com", 443, "b831381d-6324-4d53-ad4f-8cda48b30811", false, None).unwrap();
+        let plain = VlessOutbound::try_new("v", "example.com", 443, "b831381d-6324-4d53-ad4f-8cda48b30811", false, None, true).unwrap();
         assert!(!plain.use_tls);
         assert_eq!(plain.sni, "example.com");
-        let secured = VlessOutbound::try_new("v", "example.com", 443, "b831381d63244d53ad4f8cda48b30811", true, Some("cdn.example.com")).unwrap();
+        let secured = VlessOutbound::try_new("v", "example.com", 443, "b831381d63244d53ad4f8cda48b30811", true, Some("cdn.example.com"), true).unwrap();
         assert!(secured.use_tls);
         assert_eq!(secured.sni, "cdn.example.com");
-        assert!(VlessOutbound::try_new("v", "h", 443, "bad", true, None).is_none());
+        assert!(VlessOutbound::try_new("v", "h", 443, "bad", true, None, true).is_none());
     }
 }

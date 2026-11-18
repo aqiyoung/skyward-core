@@ -515,6 +515,7 @@ pub struct VmessOutbound {
     security: u8,
     use_tls: bool,
     sni: String,
+    verify: bool,
 }
 
 impl VmessOutbound {
@@ -526,6 +527,7 @@ impl VmessOutbound {
         security: &str,
         use_tls: bool,
         sni: Option<&str>,
+        verify: bool,
     ) -> Option<Self> {
         let uuid = parse_uuid(uuid)?;
         let security = match security.to_ascii_lowercase().as_str() {
@@ -538,7 +540,7 @@ impl VmessOutbound {
             Ok(ip) => TargetAddr::Ip(ip, port),
             Err(_) => TargetAddr::Domain(server.to_string(), port),
         };
-        Some(Self { name: name.to_string(), server, uuid, security, use_tls, sni })
+        Some(Self { name: name.to_string(), server, uuid, security, use_tls, sni, verify })
     }
 }
 
@@ -590,7 +592,7 @@ impl Outbound for VmessOutbound {
             .as_secs() as i64);
 
         let mut stream: BoxedStream = if self.use_tls {
-            connect_tls(&self.sni, tcp).await?
+            connect_tls(&self.sni, tcp, self.verify).await?
         } else {
             Box::new(tcp)
         };
