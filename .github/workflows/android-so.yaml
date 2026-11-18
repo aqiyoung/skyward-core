@@ -89,3 +89,18 @@ jobs:
           path: skyward-core-android-arm64.zip
           if-no-files-found: error
           retention-days: 30
+
+      - name: Publish .so to a GitHub Release (rolling tag)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG=rust-core-so
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          fi
+          gh release create "$TAG" skyward-core-android-arm64.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "skyward-core Android arm64 .so (rolling)" \
+            --notes "Prebuilt Rust core cdylib + JNI headers for the Skyward App rust-core build. Rebuilt on every manual dispatch of android-so."
