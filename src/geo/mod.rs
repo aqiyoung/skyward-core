@@ -85,6 +85,48 @@ pub struct GeoData {
     pub geosite: GeoSiteDatabase,
 }
 
+/// Download a GeoX resource into `dir` and return the number of bytes saved.
+/// `geo_type` is one of GEOIP / GEOSITE / MMDB / ASN (case-insensitive).
+pub async fn download_geo(geo_type: &str, dir: &Path) -> Result<usize, String> {
+    let (file, url): (&str, &str) = match geo_type.to_ascii_uppercase().as_str() {
+        "GEOIP" => (
+            "geoip.dat",
+            "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat",
+        ),
+        "GEOSITE" => (
+            "geosite.dat",
+            "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat",
+        ),
+        // MMDB/ASN are used by mihomo's rule engine but our minimal engine does
+        // not consume them; keep them working for API compatibility.
+        "MMDB" => (
+            "geoip.metadb",
+            "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb",
+        ),
+        "ASN" => (
+            "GeoLite2-ASN.mmdb",
+            "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb",
+        ),
+        other => return Err(format!("unknown geo resource: {}", other)),
+    };
+    let bytes = crate::fetch::fetch_url_large(url)
+        .await
+        .map_err(|e| format!("download {}: {}", file, e))?;
+    if bytes.is_empty() {
+        return Err(format!("download {}: empty response", file));
+    }
+    // Validate the protobuf files before writing, so a truncated download
+    // cannot replace a good file and silently kill the rules.
+    if file == "geoip.dat" {
+        parse_geoip_list(&bytes).map_err(|e| format!("invalid geoip.dat: {}", e))?;
+    } else if file == "geosite.dat" {
+        parse_geosite_list(&bytes).map_err(|e| format!("invalid geosite.dat: {}", e))?;
+    }
+    fs::create_dir_all(dir).map_err(|e| format!("create dir: {}", e))?;
+    fs::write(dir.join(file), &bytes).map_err(|e| format!("write {}: {}", file, e))?;
+    Ok(bytes.len())
+}
+
 impl GeoData {
     /// Load from `geoip.dat` / `geosite.dat` in `dir`. Missing or malformed
     /// files are non-fatal: the corresponding rules simply never match.

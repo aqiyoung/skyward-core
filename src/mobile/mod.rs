@@ -126,6 +126,7 @@ pub fn invoke(data: &[u8]) -> Vec<u8> {
         "getExternalProviders" => handle_external_providers(&call),
         "getExternalProvider" => handle_external_provider(&call),
         "updateDns" => handle_update_dns(&call),
+        "updateGeoData" => handle_update_geo_data(&call),
         "getConnections" => handle_get_connections(&call),
         "getConnectionCount" => handle_connection_count(&call),
         "closeConnections" => handle_close_connections(&call),
@@ -1035,6 +1036,25 @@ fn handle_setup_config(call: &MethodCall) -> Vec<u8> {
                 );
                 tracing::info!("{}", msg);
                 crate::jni::emit_log_event(&msg);
+                // Show the MATCH fallback group's kind and first members so a
+                // chain ending in DIRECT is visible in one line.
+                if let Some(target) = crate::runtime_state::engine().await
+                    .and_then(|e| e.rules.rules.iter().rev()
+                        .find(|r| matches!(r.kind, crate::rules::RuleKind::Match))
+                        .map(|r| r.target.clone()))
+                {
+                    let detail = engine.outbounds.groups.get(&target).map(|g| format!(
+                        "kind={} members={:?} selected={:?}",
+                        g.kind,
+                        g.members.iter().take(5).cloned().collect::<Vec<_>>(),
+                        g.selected()
+                    )).unwrap_or_else(|| "not a group".to_string());
+                    let resolved = engine.outbounds.resolve(&target).await;
+                    crate::jni::emit_log_event(&format!(
+                        "[rust-core] MATCH target={} {} resolved={}",
+                        target, detail, resolved
+                    ));
+                }
             }
         }
         result
@@ -1047,6 +1067,47 @@ fn handle_setup_config(call: &MethodCall) -> Vec<u8> {
             crate::jni::emit_log_event(&format!("[rust-core] setupConfig FAILED: {}", e));
             ok(&call.id, Value::String(e))
         }
+        Err(e) => ok(&call.id, Value::String(e)),
+    }
+}
+
+/// Download a GeoX resource and reload the active engine so its rules pick up
+/// the new geoip/geosite data. Returns an empty string on success.
+fn handle_update_geo_data(call: &MethodCall) -> Vec<u8> {
+    let geo_type = call.arguments.as_str().unwrap_or("").to_string();
+    let future = async move {
+        let home = match home_dir() {
+            Some(h) => h,
+            None => return "core home dir not set".to_string(),
+        };
+        match crate::geo::download_geo(&geo_type, &home).await {
+            Ok(n) => {
+                crate::jni::emit_log_event(&format!(
+                    "[rust-core] updateGeoData {} ok ({} bytes)",
+                    geo_type, n
+                ));
+                // Reload the engine so GEOIP/GEOSITE rules use the fresh data.
+                let path = crate::runtime_state::config_path().await;
+                if let Some(path) = path {
+                    if let Err(e) = crate::runtime_state::apply_config_from_path(&path).await {
+                        crate::jni::emit_log_event(&format!(
+                            "[rust-core] updateGeoData reload failed: {}",
+                            e
+                        ));
+                    } else {
+                        crate::jni::emit_log_event("[rust-core] updateGeoData engine reloaded");
+                    }
+                }
+                String::new()
+            }
+            Err(e) => {
+                crate::jni::emit_log_event(&format!("[rust-core] updateGeoData {} failed: {}", geo_type, e));
+                e
+            }
+        }
+    };
+    match block_on(future) {
+        Ok(message) => ok(&call.id, Value::String(message)),
         Err(e) => ok(&call.id, Value::String(e)),
     }
 }

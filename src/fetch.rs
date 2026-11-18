@@ -17,6 +17,14 @@ pub async fn fetch_url(url: &str) -> io::Result<Vec<u8>> {
     }
 }
 
+/// Download with a longer deadline, for large GeoX files (a few MB each).
+pub async fn fetch_url_large(url: &str) -> io::Result<Vec<u8>> {
+    match tokio::time::timeout(Duration::from_secs(60), fetch_url_inner(url)).await {
+        Ok(r) => r,
+        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "geo download timed out")),
+    }
+}
+
 use std::time::Duration;
 
 async fn fetch_url_inner(url: &str) -> io::Result<Vec<u8>> {

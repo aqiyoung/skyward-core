@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -114,16 +114,35 @@ pub struct GroupState {
     pub url: Option<String>,
     /// Selected index for `select`; rolling counter for `load-balance`.
     cursor: AtomicUsize,
+    /// Whether an explicit selection (from the App's selected-map or a
+    /// changeProxy call) has been applied. Health-based groups default to the
+    /// first real node until the App picks one.
+    explicit: AtomicBool,
 }
 
 impl GroupState {
     pub fn selected(&self) -> Option<String> {
-        self.members.get(self.cursor.load(Ordering::Relaxed) % self.members.len().max(1)).cloned()
+        let kind = self.kind.as_str();
+        let is_health = matches!(kind, "url-test" | "fallback");
+        let idx = self.cursor.load(Ordering::Relaxed);
+        let chosen = if is_health && !self.explicit.load(Ordering::Relaxed) {
+            // mihomo would pick the healthiest node here. Without probes, pick
+            // the first real proxy rather than a DIRECT/REJECT sentinel, or
+            // the group routes every connection straight out.
+            self.members
+                .iter()
+                .position(|m| !matches!(m.as_str(), "DIRECT" | "REJECT"))
+                .unwrap_or(0)
+        } else {
+            idx % self.members.len().max(1)
+        };
+        self.members.get(chosen).cloned()
     }
 
     pub fn set_selected(&self, name: &str) -> bool {
         if let Some(i) = self.members.iter().position(|m| m == name) {
             self.cursor.store(i, Ordering::Release);
+            self.explicit.store(true, Ordering::Release);
             true
         } else {
             false
@@ -332,6 +351,7 @@ impl OutboundManager {
                 members: g.proxies.clone(),
                 url: g.url.clone(),
                 cursor: AtomicUsize::new(0),
+                explicit: AtomicBool::new(false),
             });
         }
         groups.insert("GLOBAL".into(), GroupState {
@@ -340,6 +360,7 @@ impl OutboundManager {
             members: global_members,
             url: None,
             cursor: AtomicUsize::new(0),
+            explicit: AtomicBool::new(false),
         });
 
         Self { outbounds, groups }
