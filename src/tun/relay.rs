@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
-use tokio_util::sync::CancellationToken;
 
 use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
