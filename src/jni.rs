@@ -35,6 +35,15 @@ fn vm() -> Option<&'static JavaVM> {
     JAVA_VM.get()
 }
 
+/// Emit a log event to the App's event listener regardless of the openLogs
+/// switch. Uses the same {type:"log", data:{type,payload}} shape as the Go core.
+fn emit_log_event(message: &str) {
+    emit_event_json(&serde_json::json!({
+        "type": "log",
+        "data": { "type": "info", "payload": message }
+    }).to_string());
+}
+
 /// Call `handler.onResult(byte[])` on the current thread.
 fn fire_result(
     env: &mut JNIEnv,
@@ -204,10 +213,14 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
     let dns_text = java_string(&mut env, &dns);
     let options_text = java_string(&mut env, &options);
 
-    tracing::info!(
-        "startTun called: fd={} stack='{}' address='{}' dns='{}' options='{}'",
+    let diag = format!(
+        "[rust-core] startTun called: fd={} stack='{}' address='{}' dns='{}' options='{}'",
         fd, stack_text, address_text, dns_text, options_text
     );
+    tracing::info!("{}", diag);
+    // Push diagnostics straight to the App event channel, independent of the
+    // openLogs setting, so VPN-start failures are visible in the log page.
+    emit_log_event(&diag);
     let config = match crate::tun::TunConfig::parse(&stack_text, &address_text, &dns_text, &options_text) {
         Ok(c) => c,
         Err(e) => {
@@ -222,11 +235,15 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
     let mtu = config.options.mtu;
     match crate::tun::device_from_fd(fd, mtu) {
         Ok(device) => {
-            tracing::info!("TUN session started: fd={} stack={} mtu={}", fd, config.stack, mtu);
+            let msg = format!("[rust-core] TUN device opened: fd={} stack={} mtu={}", fd, config.stack, mtu);
+            tracing::info!("{}", msg);
+            emit_log_event(&msg);
             let rt = match tokio_runtime() {
                 Some(rt) => rt,
                 None => {
-                    tracing::error!("TUN: no tokio runtime available");
+                    let e = "[rust-core] FATAL: no tokio runtime available";
+                    tracing::error!("{}", e);
+                    emit_log_event(e);
                     return JNI_FALSE;
                 }
             };
@@ -239,14 +256,19 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
                 .get_or_init(|| Arc::new(tokio::sync::Notify::new()))
                 .clone();
             *TUN_SESSION.lock().unwrap() = Some((fd, config.clone()));
+            emit_log_event("[rust-core] TUN runtime spawned, returning TRUE");
             rt.spawn(async move {
                 crate::tun::runtime::run(device, config, engine, wake).await;
-                tracing::warn!("TUN runtime exited for fd {}", fd);
+                let e = format!("[rust-core] TUN runtime EXITED for fd {}", fd);
+                tracing::warn!("{}", e);
+                emit_log_event(&e);
             });
             JNI_TRUE
         }
         Err(e) => {
-            tracing::error!("startTun: device from fd failed: {}", e);
+            let msg = format!("[rust-core] FATAL: device from fd failed: {}", e);
+            tracing::error!("{}", msg);
+            emit_log_event(&msg);
             JNI_FALSE
         }
     }
