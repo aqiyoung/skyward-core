@@ -24,7 +24,7 @@ pub struct TunOptions {
     pub mtu: usize,
     #[serde(default)]
     pub gso: bool,
-    #[serde(default)]
+    #[serde(default, rename = "congestion-controller")]
     pub congestion_controller: String,
 }
 
@@ -49,11 +49,12 @@ pub struct TunConfig {
 
 impl TunConfig {
     pub fn parse(stack: &str, address: &str, dns: &str, options: &str) -> io::Result<Self> {
+        // Options are tuning hints only (mtu/gso/CC). Never fail TUN startup
+        // because of them — fall back to defaults if the JSON is unexpected.
         let options: TunOptions = if options.trim().is_empty() {
             TunOptions::default()
         } else {
-            serde_json::from_str(options)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("tun options: {}", e)))?
+            serde_json::from_str(options).unwrap_or_else(|_| TunOptions::default())
         };
         let parse_list = |s: &str| -> Vec<String> {
             s.split(',').map(str::trim).filter(|x| !x.is_empty()).map(str::to_string).collect()
@@ -84,11 +85,19 @@ impl<T> TunDevice<T> {
 /// ownership; closing happens when the device is dropped.
 #[cfg(unix)]
 pub fn device_from_fd(fd: i32, mtu: usize) -> io::Result<TunDevice<std::fs::File>> {
-    if fd <= 0 {
+    if fd < 0 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "no tun descriptor"));
     }
-    // SAFETY: the caller (VpnService via JNI) transfers ownership of fd to us.
+    // SAFETY: the caller (VpnService via detachFd) transfers ownership of fd.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    // The TUN fd from Android's VpnService must be non-blocking; a blocking
+    // read() would freeze the tokio worker that drives the whole stack.
+    unsafe {
+        let flags = libc::fcntl(owned.as_raw_fd(), libc::F_GETFL, 0);
+        if flags >= 0 {
+            libc::fcntl(owned.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
     // File wraps a raw fd and implements Read/Write; needed by the runtime loop.
     Ok(TunDevice::new(std::fs::File::from(owned), mtu))
 }

@@ -28,10 +28,13 @@ impl<'a> Stack<'a> {
         let mut iface = Interface::new(iface_config, device, Instant::now());
 
         // Configure the first IPv4 address from the address list, if any.
-        if let Some(addr) = config.addresses.first().and_then(|s| s.split('/').next()) {
+        if let Some(full) = config.addresses.first() {
+            let mut parts = full.split('/');
+            let addr = parts.next().unwrap_or("");
+            let prefix: u8 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(30);
             if let Ok(ip) = addr.parse::<smoltcp::wire::Ipv4Address>() {
                 iface.update_ip_addrs(|addrs| {
-                    let _ = addrs.push(IpCidr::new(ip.into(), 24));
+                    let _ = addrs.push(IpCidr::new(ip.into(), prefix));
                 });
             }
         }

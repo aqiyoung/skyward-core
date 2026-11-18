@@ -191,6 +191,10 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
     let dns_text = java_string(&mut env, &dns);
     let options_text = java_string(&mut env, &options);
 
+    tracing::info!(
+        "startTun called: fd={} stack='{}' address='{}' dns='{}' options='{}'",
+        fd, stack_text, address_text, dns_text, options_text
+    );
     let config = match crate::tun::TunConfig::parse(&stack_text, &address_text, &dns_text, &options_text) {
         Ok(c) => c,
         Err(e) => {
