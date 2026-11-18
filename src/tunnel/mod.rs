@@ -79,10 +79,18 @@ pub struct Engine {
 
 impl Engine {
     pub async fn new(config: Config, traffic: SharedTraffic, data_dir: &Path) -> Self {
+        let t0 = std::time::Instant::now();
+        let log = |s: String| {
+            tracing::info!("{}", s);
+            crate::jni::emit_log_event(&format!("[rust-core] {}", s));
+        };
         let rules = RuleSet::new(&config.rules);
         let resolver = Resolver::new(config.dns.clone().unwrap_or_default());
+        log(format!("engine: rules/resolver done ({:?})", t0.elapsed()));
         let proxy_providers = Arc::new(ProxyProviderRegistry::load(&config, data_dir).await);
+        log(format!("engine: proxy_providers done ({:?})", t0.elapsed()));
         let mut outbounds = OutboundManager::new(&config);
+        log(format!("engine: outbounds done ({:?})", t0.elapsed()));
 
         // Provider nodes become first-class outbounds so groups and rules can
         // refer to them by name.
@@ -102,8 +110,11 @@ impl Engine {
         }
 
         let mode = RwLock::new(config.mode.clone());
+        log(format!("engine: loading geo ({:?})", t0.elapsed()));
         let geo = Arc::new(GeoData::load(data_dir));
+        log(format!("engine: geo done ({:?})", t0.elapsed()));
         let providers = Arc::new(ProviderRegistry::load(&config, data_dir).await);
+        log(format!("engine: rule providers done ({:?})", t0.elapsed()));
         let connections = Arc::new(ConnectionTracker::new());
         Self { config, rules, resolver, outbounds, traffic, mode, geo, providers, proxy_providers, connections }
     }
