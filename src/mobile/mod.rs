@@ -183,7 +183,19 @@ fn handle_get_proxies(call: &MethodCall) -> Vec<u8> {
             }
             views.insert(item.name.clone(), Value::Object(view));
         }
-        json!({"proxies": views, "all": all})
+        let result = json!({"proxies": views, "all": all});
+        // Diagnostics: report what we are actually returning to the App.
+        let types: Vec<String> = result["proxies"].as_object()
+            .map(|m| m.iter().filter(|(_, v)| v.get("all").is_some())
+                .map(|(k, v)| format!("{}={}", k, v["type"].as_str().unwrap_or("?"))).collect())
+            .unwrap_or_default();
+        crate::jni::emit_log_event(&format!(
+            "[rust-core] getProxies returning {} entries, {} groups: {}",
+            result["all"].as_array().map(|a| a.len()).unwrap_or(0),
+            types.len(),
+            types.iter().take(8).cloned().collect::<Vec<_>>().join(", ")
+        ));
+        result
     };
     ok(&call.id, block_on(future).unwrap_or_else(|_| json!({"proxies": {}, "all": []})))
 }
