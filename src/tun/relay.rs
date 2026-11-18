@@ -198,19 +198,20 @@ pub fn spawn_session(engine: Arc<Engine>, target: TargetAddr, bridges: SessionBr
                 return;
             }
         };
-        let mut buf = vec![0u8; 16 * 1024];
+        let mut read_buf = vec![0u8; 16 * 1024];
         loop {
             // Drain bytes destined for the network into the outbound.
-            let n = bridges.to_net.pop(&mut buf);
+            let mut write_buf = vec![0u8; 16 * 1024];
+            let n = bridges.to_net.pop(&mut write_buf);
             tokio::select! {
                 _ = bridges.cancel.notified() => break,
                 _ = bridges.to_net.notified() => {},
                 result = async {
-                    if n == 0 { std::future::pending().await } else { stream.write_all(&buf[..n]).await }
+                    if n == 0 { std::future::pending().await } else { stream.write_all(&write_buf[..n]).await }
                 } => if result.is_err() { break; },
-                result = stream.read(&mut buf) => match result {
+                result = stream.read(&mut read_buf) => match result {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => bridges.from_net.push(&buf[..n]),
+                    Ok(n) => bridges.from_net.push(&read_buf[..n]),
                 }
             }
         }
