@@ -180,6 +180,9 @@ fn handle_get_proxies(call: &MethodCall) -> Vec<u8> {
                 if let Some(sel) = &item.selected {
                     view.insert("now".into(), Value::String(sel.clone()));
                 }
+                // The App filters groups with `hidden == false` in rule mode;
+                // `hidden` is nullable, so omitting it (null) hides every group.
+                view.insert("hidden".into(), Value::Bool(false));
             }
             views.insert(item.name.clone(), Value::Object(view));
         }
@@ -934,6 +937,8 @@ mod tests {
         assert_eq!(r["result"]["proxies"]["g1"]["now"], "n1");
         // App's GroupType matches PascalCase names.
         assert_eq!(r["result"]["proxies"]["g1"]["type"], "Selector");
+        // The App hides groups whose `hidden` is not exactly false.
+        assert_eq!(r["result"]["proxies"]["g1"]["hidden"], false);
     }
 
     #[test]
