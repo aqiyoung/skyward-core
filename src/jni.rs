@@ -279,9 +279,6 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
             }
             let cancel = Arc::new(tokio::sync::Notify::new());
             *TUN_CANCEL.lock().unwrap() = Some(cancel.clone());
-            if let Some(previous) = TUN_CANCEL.lock().unwrap().take() {
-                previous.notify_one();
-            }
             let task = rt.spawn(async move {
                 crate::tun::runtime::run(device, config, engine, wake, cancel).await;
                 let e = format!("[rust-core] TUN runtime EXITED for fd {}", fd);
