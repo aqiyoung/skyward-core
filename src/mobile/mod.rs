@@ -986,12 +986,43 @@ fn handle_setup_config(call: &MethodCall) -> Vec<u8> {
         };
     };
 
+    // The App sends the user's current selection for every selector group
+    // together with the config path. Go applies this with patchSelectGroup()
+    // right after loading the config; without it every group falls back to its
+    // first member (usually DIRECT), so no traffic ever reaches a proxy.
+    let selected: Vec<(String, String)> = call
+        .arguments
+        .get("selected-map")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(group, proxy)| proxy.as_str().map(|p| (group.clone(), p.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let path_owned = path.to_string();
     let diag_path = path_owned.clone();
     let future = async move {
         let result = crate::runtime_state::apply_config_from_path(&path_owned).await;
         if result.is_ok() {
             if let Some(engine) = crate::runtime_state::engine().await {
+                // Mirror Go's patchSelectGroup after a config load.
+                let mut applied = 0;
+                let mut missing = Vec::new();
+                for (group, proxy) in &selected {
+                    if engine.outbounds.set_selection(group, proxy) {
+                        applied += 1;
+                    } else {
+                        missing.push(group.clone());
+                    }
+                }
+                crate::jni::emit_log_event(&format!(
+                    "[rust-core] setupConfig selected-map: {} applied, {} missing ({})",
+                    applied,
+                    missing.len(),
+                    missing.iter().take(6).cloned().collect::<Vec<_>>().join(", ")
+                ));
                 let msg = format!(
                     "[rust-core] config applied: {} proxies, {} groups, {} rules",
                     engine.outbounds.outbounds.len(),

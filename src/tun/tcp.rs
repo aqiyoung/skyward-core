@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -232,11 +232,8 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
         let done = flow.done.clone();
         let engine = self.engine.clone();
         let io = self.io.clone();
-        let addr = format!("{}:{}", key.target_ip, key.target_port);
-        let target = match addr.parse::<IpAddr>() {
-            Ok(ip) => TargetAddr::Ip(ip, key.target_port),
-            Err(_) => return,
-        };
+        let addr = key_target_addr(&key).address();
+        let target = key_target_addr(&key);
         tokio::spawn(async move {
             let mut stream: BoxedStream = tokio::select! {
                 _ = cancel.notified() => return,
@@ -298,6 +295,14 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             diag(format!("TUN write failed: {}", e));
         }
     }
+}
+
+/// Build the dial target directly from the parsed flow key. The target IP is
+/// already an `Ipv4Addr` from the packet; never round-trip through an
+/// `"ip:port"` string parsed as `IpAddr` (that always failed and dropped every
+/// TUN connection).
+fn key_target_addr(key: &FlowKey) -> TargetAddr {
+    TargetAddr::Ip(std::net::IpAddr::V4(key.target_ip), key.target_port)
 }
 
 pub(crate) struct Ipv4Info {
@@ -470,6 +475,18 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::common::TrafficStats;
+
+    #[test]
+    fn flow_key_builds_a_valid_dial_target() {
+        let key = FlowKey {
+            client_ip: Ipv4Addr::new(198, 18, 0, 1),
+            client_port: 40000,
+            target_ip: Ipv4Addr::new(91, 108, 56, 150),
+            target_port: 443,
+        };
+        let target = key_target_addr(&key);
+        assert_eq!(target.address(), "91.108.56.150:443");
+    }
 
     struct TestIo {
         out: Vec<u8>,
