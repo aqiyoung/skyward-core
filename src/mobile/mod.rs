@@ -699,7 +699,7 @@ fn handle_service_check(call: &MethodCall) -> Vec<u8> {
         names: Vec<String>,
         timeout: i64,
     }
-    let params = serde_json::from_value(call.arguments.clone()).unwrap_or_default();
+    let params: Params = serde_json::from_value(call.arguments.clone()).unwrap_or_default();
     let timeout_ms = if params.timeout > 0 { params.timeout } else { 5000 };
     let proxy_name = params.proxy_name.clone();
     let names = params.names.clone();
