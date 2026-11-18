@@ -436,6 +436,7 @@ fn handle_test_delay(call: &MethodCall) -> Vec<u8> {
         params.test_url.clone()
     };
     let timeout_ms = if params.timeout > 0 { params.timeout } else { 5000 };
+    crate::jni::emit_log_event(&format!("[rust-core] delay: start {} {}", name, url));
     let future = async move {
         let engine = match crate::runtime_state::engine().await {
             Some(e) => e,
@@ -445,7 +446,10 @@ fn handle_test_delay(call: &MethodCall) -> Vec<u8> {
         };
         let delay = measure_delay(&engine, &name, &url, timeout_ms).await;
         match delay {
-            Some(ms) => json!({"url": url, "name": name, "value": ms}),
+            Some(ms) => {
+                crate::jni::emit_log_event(&format!("[rust-core] delay: end {} = {}ms", name, ms));
+                json!({"url": url, "name": name, "value": ms})
+            }
             None => {
                 delay_diag(&format!("{} -> {} failed", name, url));
                 json!({"url": url, "name": name, "value": -2, "message": "connect failed"})
