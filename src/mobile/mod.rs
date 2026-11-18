@@ -466,7 +466,10 @@ async fn measure_delay(
     let use_tls = match scheme {
         "http" => false,
         "https" => true,
-        _ => return None,
+        other => {
+            delay_diag(&format!("{} unsupported scheme '{}'", name, other));
+            return None;
+        }
     };
     let authority = rest.split('/').next()?;
     let host = authority.split(':').next()?;
@@ -481,51 +484,75 @@ async fn measure_delay(
         Err(_) => crate::common::TargetAddr::Domain(host.to_string(), port),
     };
     let path = format!("/{}", rest.split_once('/').map(|(_, p)| p).unwrap_or(""));
+    let timeout = std::time::Duration::from_millis(timeout_ms as u64);
 
-    let dial = engine.dial_named(name, &target);
-    let stream = tokio::time::timeout(
-        std::time::Duration::from_millis(timeout_ms as u64),
-        dial,
-    )
-    .await
-    .ok()?
-    .ok()?;
+    let stream = match tokio::time::timeout(timeout, engine.dial_named(name, &target)).await {
+        Err(_) => {
+            delay_diag(&format!("{} dial {} timed out", name, target.address()));
+            return None;
+        }
+        Ok(Err(e)) => {
+            delay_diag(&format!("{} dial {} failed: {}", name, target.address(), e));
+            return None;
+        }
+        Ok(Ok(s)) => s,
+    };
+
     let mut stream = if use_tls {
-        tokio::time::timeout(
-            std::time::Duration::from_millis(timeout_ms as u64),
-            crate::adapter::tls::connect_tls(host, stream),
-        )
-        .await
-        .ok()?
-        .ok()?
+        match tokio::time::timeout(timeout, crate::adapter::tls::connect_tls(host, stream)).await {
+            Err(_) => {
+                delay_diag(&format!("{} tls handshake timed out", name));
+                return None;
+            }
+            Ok(Err(e)) => {
+                delay_diag(&format!("{} tls handshake failed: {}", name, e));
+                return None;
+            }
+            Ok(Ok(s)) => s,
+        }
     } else {
         stream
     };
 
     let start = std::time::Instant::now();
     let request = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", path, authority);
-    tokio::time::timeout(
-        std::time::Duration::from_millis(timeout_ms as u64),
-        stream.write_all(request.as_bytes()),
-    )
-    .await
-    .ok()?
-    .ok()?;
+    match tokio::time::timeout(timeout, stream.write_all(request.as_bytes())).await {
+        Err(_) => {
+            delay_diag(&format!("{} request write timed out", name));
+            return None;
+        }
+        Ok(Err(e)) => {
+            delay_diag(&format!("{} request write failed: {}", name, e));
+            return None;
+        }
+        Ok(Ok(_)) => {}
+    }
+
     let mut buf = [0u8; 64];
-    let n = tokio::time::timeout(
-        std::time::Duration::from_millis(timeout_ms as u64),
-        stream.read(&mut buf),
-    )
-    .await
-    .ok()?
-    .ok()?;
+    let n = match tokio::time::timeout(timeout, stream.read(&mut buf)).await {
+        Err(_) => {
+            delay_diag(&format!("{} response read timed out", name));
+            return None;
+        }
+        Ok(Err(e)) => {
+            delay_diag(&format!("{} response read failed: {}", name, e));
+            return None;
+        }
+        Ok(Ok(n)) => n,
+    };
     if n == 0 {
+        delay_diag(&format!("{} empty response", name));
         return None;
     }
     let text = String::from_utf8_lossy(&buf[..n]);
     if text.contains(" 200 ") || text.contains(" 204 ") {
         Some(start.elapsed().as_millis() as i32)
     } else {
+        delay_diag(&format!(
+            "{} unexpected status: {:?}",
+            name,
+            text.lines().next().unwrap_or("")
+        ));
         None
     }
 }

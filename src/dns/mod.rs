@@ -11,6 +11,17 @@ use crate::config::DnsConfig;
 
 static SHARED: OnceLock<Resolver> = OnceLock::new();
 
+/// Accept `host`, `host:port` or a bare IP; reject URLs and other schemes.
+fn parse_upstream(server: &str) -> Option<std::net::SocketAddr> {
+    if let Ok(addr) = server.parse::<std::net::SocketAddr>() {
+        return Some(addr);
+    }
+    if let Ok(ip) = server.parse::<IpAddr>() {
+        return Some(std::net::SocketAddr::new(ip, 53));
+    }
+    None
+}
+
 /// Resolve through the core's protected DNS path. The system resolver must not
 /// be used here: once the VPN is up it forwards queries to the TUN address and
 /// the lookup loops back into the tunnel we are hosting.
@@ -55,7 +66,7 @@ impl Resolver {
 
         let mut addrs = Vec::new();
         for server in self.upstreams() {
-            let Some(addr) = format!("{}:53", server).parse::<std::net::SocketAddr>().ok() else {
+            let Some(addr) = parse_upstream(&server) else {
                 continue;
             };
             for qtype in [1u16, 28u16] {
@@ -93,13 +104,21 @@ impl Resolver {
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "empty DNS answer"))
     }
 
-    /// DNS servers to query, falling back to public resolvers when the config
-    /// does not name any.
+    /// DNS servers to query. Configured nameservers that are not plain
+    /// `host[:port]` (for example DoH URLs) are ignored, and if none remain we
+    /// fall back to public resolvers so a lookup can still succeed.
     fn upstreams(&self) -> Vec<String> {
-        if self.config.nameserver.is_empty() {
+        let valid: Vec<String> = self
+            .config
+            .nameserver
+            .iter()
+            .filter(|s| parse_upstream(s).is_some())
+            .cloned()
+            .collect();
+        if valid.is_empty() {
             vec!["223.5.5.5".to_string(), "8.8.8.8".to_string()]
         } else {
-            self.config.nameserver.clone()
+            valid
         }
     }
 
