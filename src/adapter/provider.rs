@@ -83,18 +83,27 @@ impl ProxyProviderRegistry {
                 tokio::fs::read(&path).await.map_err(|e| io::Error::new(e.kind(), format!("read {}: {}", path.display(), e)))?
             }
             "http" => {
-                let url = def.url.as_ref()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "http provider needs url"))?;
-                let bytes = fetch_url(url).await?;
+                // Prefer cached copy to keep core startup fast and offline-safe.
                 if let Some(path) = &def.path {
-                    let path = if Path::new(path).is_absolute() {
+                    let cached = if Path::new(path).is_absolute() {
                         Path::new(path).to_path_buf()
                     } else {
                         data_dir.join(path)
                     };
-                    let _ = tokio::fs::write(&path, &bytes).await;
+                    if let Ok(bytes) = tokio::fs::read(&cached).await {
+                        bytes
+                    } else {
+                        let url = def.url.as_ref()
+                            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "http provider needs url"))?;
+                        let bytes = fetch_url(url).await?;
+                        let _ = tokio::fs::write(&cached, &bytes).await;
+                        bytes
+                    }
+                } else {
+                    let url = def.url.as_ref()
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "http provider needs url"))?;
+                    fetch_url(url).await?
                 }
-                bytes
             }
             other => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("unknown provider type '{}'", other))),
         };

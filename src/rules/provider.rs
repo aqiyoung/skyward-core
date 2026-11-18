@@ -145,6 +145,13 @@ impl ProviderRegistry {
                 tokio::fs::read(&path).await.map_err(|e| io::Error::new(e.kind(), format!("read {}: {}", path.display(), e)))?
             }
             "http" => {
+                // Prefer the cached copy so startup is instant and offline-safe.
+                if let Some(path) = &def.path {
+                    let cached = resolve_path(path, data_dir);
+                    if let Ok(bytes) = tokio::fs::read(&cached).await {
+                        return Ok(RuleProvider::new(name.to_string(), behavior, parse_payload(&bytes, &format)));
+                    }
+                }
                 let url = def.url.as_ref().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "http provider needs url"))?;
                 let bytes = fetch_url(url).await?;
                 if let Some(path) = &def.path {

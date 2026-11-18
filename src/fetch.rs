@@ -10,6 +10,16 @@ use crate::adapter::tls::connect_tls;
 use crate::adapter::BoxedStream;
 
 pub async fn fetch_url(url: &str) -> io::Result<Vec<u8>> {
+    // Hard cap the whole download so a dead upstream cannot stall core startup.
+    match tokio::time::timeout(Duration::from_secs(3), fetch_url_inner(url)).await {
+        Ok(r) => r,
+        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "provider download timed out")),
+    }
+}
+
+use std::time::Duration;
+
+async fn fetch_url_inner(url: &str) -> io::Result<Vec<u8>> {
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid URL"))?;
