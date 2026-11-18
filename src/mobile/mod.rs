@@ -361,6 +361,7 @@ fn handle_outbound_ip(call: &MethodCall) -> Vec<u8> {
 
 fn handle_memory_stats(call: &MethodCall) -> Vec<u8> {
     let rss = process_rss();
+    crate::jni::emit_log_event(&format!("[rust-core] memory rss={}", rss));
     // Rust has no Go-style heap buckets; report RSS as the in-use figure so the
     // dashboard shows the core's real footprint.
     ok(&call.id, json!({
@@ -1134,6 +1135,16 @@ mod tests {
 
     fn response(data: Vec<u8>) -> Value {
         serde_json::from_slice(&data).unwrap()
+    }
+
+    #[test]
+    fn memory_stats_reports_real_rss() {
+        let _guard = crate::runtime_state::TEST_LOCK.lock().unwrap();
+        let rss = process_rss();
+        assert!(rss > 0, "process RSS should be readable");
+        let r = response(invoke(br#"{"method":"getMemoryStats"}"#));
+        assert_eq!(r["result"]["rss"].as_u64(), Some(rss));
+        assert_eq!(r["result"]["heapInuse"].as_u64(), Some(rss));
     }
 
     #[test]
