@@ -117,31 +117,41 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             return;
         }
 
-        let Some(flow) = self.flows.get_mut(&key) else {
-            // Not ours (or already gone): reject so the client stops retrying.
-            self.send(key, tcp.ack, tcp.seq, RST | ACK, &[]);
-            return;
+        // Update the flow inside a scoped borrow so the manager can still send
+        // packets (which takes &self) once the mutation is done.
+        let action = {
+            let Some(flow) = self.flows.get_mut(&key) else {
+                // Not ours (or already gone): reject so the client stops retrying.
+                self.send(key, tcp.ack, tcp.seq, RST | ACK, &[]);
+                return;
+            };
+
+            if flow.state == State::SynReceived && tcp.flags & ACK != 0 {
+                flow.state = State::Established;
+            }
+
+            if tcp.flags & FIN != 0 {
+                flow.state = State::Closed;
+                Some((flow.local_next, tcp.seq.wrapping_add(1), true))
+            } else {
+                let payload = tcp.payload(packet, ip.ihl);
+                if payload.is_empty() {
+                    None
+                } else {
+                    let n = payload.len() as u32;
+                    flow.client_next = flow.client_next.wrapping_add(n);
+                    flow.to_net.push(payload);
+                    Some((flow.local_next, flow.client_next, false))
+                }
+            }
         };
 
-        if flow.state == State::SynReceived && tcp.flags & ACK != 0 {
-            flow.state = State::Established;
-        }
-
-        if tcp.flags & FIN != 0 {
-            let (local_next, client_next) = (flow.local_next, flow.client_next);
-            flow.state = State::Closed;
-            self.send(key, local_next, tcp.seq.wrapping_add(1), ACK, &[]);
-            self.send(key, local_next, tcp.seq.wrapping_add(1), FIN | ACK, &[]);
-            self.remove(&key);
-            return;
-        }
-
-        let payload = tcp.payload(packet, ip.ihl);
-        if !payload.is_empty() {
-            let n = payload.len() as u32;
-            flow.client_next = flow.client_next.wrapping_add(n);
-            flow.to_net.push(payload);
-            self.send(key, flow.local_next, flow.client_next, ACK, &[]);
+        if let Some((seq, ack, fin)) = action {
+            self.send(key, seq, ack, ACK, &[]);
+            if fin {
+                self.send(key, seq, ack, FIN | ACK, &[]);
+                self.remove(&key);
+            }
         }
     }
 
@@ -273,7 +283,7 @@ pub(crate) fn parse_ipv4(packet: &[u8]) -> Option<Ipv4Info> {
     if packet.len() < ihl {
         return None;
     }
-    Some(IpHeader {
+    Some(Ipv4Info {
         src: Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]),
         dst: Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]),
         proto: packet[9],
@@ -335,8 +345,8 @@ fn build_packet(
     ip[9] = 6;
     ip[12..16].copy_from_slice(&src.octets());
     ip[16..20].copy_from_slice(&dst.octets());
-    let checksum = checksum(&ip);
-    ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+    let ip_checksum = checksum(&ip);
+    ip[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
 
     let mut tcp = vec![0u8; 20 + payload.len()];
     tcp[0..2].copy_from_slice(&src_port.to_be_bytes());

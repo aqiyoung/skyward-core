@@ -108,7 +108,7 @@ fn handle_dns_packet<T: Read + Write + Send + 'static>(
             Err(_) => None,
         };
         let response = build_dns_response(&query, answer_ip);
-        let packet = super::tcp::build_udp_packet(src_ip, dst_ip, 53, src_port, &response);
+        let packet = crate::tun::tcp::build_udp_packet(src_ip, dst_ip, 53, src_port, &response);
         let mut io = io.lock().unwrap();
         let _ = io.write_all(&packet);
     });
@@ -269,14 +269,14 @@ mod tests {
 
     #[test]
     fn ipv4_info_parses_header() {
-        let packet = super::tcp::build_udp_packet(
+        let packet = crate::tun::tcp::build_udp_packet(
             Ipv4Addr::new(198, 18, 0, 1),
             Ipv4Addr::new(198, 18, 0, 2),
             12345,
             53,
             &[0xaa, 0xbb],
         );
-        let info = super::tcp::parse_ipv4(&packet).unwrap();
+        let info = crate::tun::tcp::parse_ipv4(&packet).unwrap();
         assert_eq!(info.proto, 17);
         assert_eq!(info.src, Ipv4Addr::new(198, 18, 0, 1));
         assert_eq!(info.dst, Ipv4Addr::new(198, 18, 0, 2));
