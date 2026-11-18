@@ -71,6 +71,28 @@ pub async fn connect_tls<S>(host: &str, tcp: S, verify: bool) -> io::Result<Boxe
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    connect_tls_inner(host, tcp, verify, true).await
+}
+
+/// TLS for the delay probe: HTTP/1.1 only. Advertising `h2` makes targets such
+/// as www.gstatic.com negotiate HTTP/2, and the probe speaks HTTP/1.1, so the
+/// response would be binary frames instead of a status line.
+pub async fn connect_tls_http1<S>(host: &str, tcp: S, verify: bool) -> io::Result<BoxedStream>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    connect_tls_inner(host, tcp, verify, false).await
+}
+
+async fn connect_tls_inner<S>(
+    host: &str,
+    tcp: S,
+    verify: bool,
+    advertise_h2: bool,
+) -> io::Result<BoxedStream>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let builder = ClientConfig::builder();
     let mut config = if verify {
         builder
@@ -87,8 +109,13 @@ where
             }))
             .with_no_client_auth()
     };
-    // Matches the ALPN set the Go kernel advertises for TLS-based outbounds.
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    // TLS-based outbounds offer h2 + http/1.1; the delay probe offers only
+    // http/1.1 (see connect_tls_http1).
+    config.alpn_protocols = if advertise_h2 {
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    } else {
+        vec![b"http/1.1".to_vec()]
+    };
 
     let server_name = match host.parse::<IpAddr>() {
         Ok(ip) => ServerName::IpAddress(ip.into()),
