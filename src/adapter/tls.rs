@@ -79,7 +79,7 @@ where
             })
             .with_no_client_auth()
     } else {
-        let provider = Arc::new(rustls::crypto::default_provider());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
         builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate {
