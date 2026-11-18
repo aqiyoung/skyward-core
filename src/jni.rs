@@ -17,6 +17,8 @@ use crate::mobile;
 static JAVA_VM: OnceLock<JavaVM> = OnceLock::new();
 static EVENT_LISTENER: Mutex<Option<GlobalRef>> = Mutex::new(None);
 static TUN_SESSION: Mutex<Option<(i32, crate::tun::TunConfig)>> = Mutex::new(None);
+static TUN_TASK: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
+static TUN_CANCEL: Mutex<Option<Arc<tokio::sync::Notify>>> = Mutex::new(None);
 static TOKIO_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static TUN_WAKE: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
 
@@ -203,6 +205,13 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_stopTun(
     _env: JNIEnv,
     _class: JObject,
 ) {
+    if let Some(cancel) = TUN_CANCEL.lock().unwrap().take() {
+        cancel.notify_one();
+    }
+    if let Some(task) = TUN_TASK.lock().unwrap().take() {
+        task.abort();
+    }
+    *TUN_SESSION.lock().unwrap() = None;
 }
 
 #[no_mangle]
@@ -265,15 +274,22 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
                 .clone();
             *TUN_SESSION.lock().unwrap() = Some((fd, config.clone()));
             emit_log_event("[rust-core] TUN runtime spawned, returning TRUE");
+            if let Some(previous) = TUN_TASK.lock().unwrap().take() {
+                previous.abort();
+            }
+            let cancel = Arc::new(tokio::sync::Notify::new());
+            *TUN_CANCEL.lock().unwrap() = Some(cancel.clone());
+            if let Some(previous) = TUN_CANCEL.lock().unwrap().take() {
+                previous.notify_one();
+            }
             let task = rt.spawn(async move {
-                crate::tun::runtime::run(device, config, engine, wake).await;
-            });
-            rt.spawn(async move {
-                let outcome = task.await;
-                let e = format!("[rust-core] TUN runtime EXITED for fd {}: {:?}", fd, outcome);
+                crate::tun::runtime::run(device, config, engine, wake, cancel).await;
+                let e = format!("[rust-core] TUN runtime EXITED for fd {}", fd);
                 tracing::warn!("{}", e);
                 emit_log_event(&e);
+                *TUN_SESSION.lock().unwrap() = None;
             });
+            *TUN_TASK.lock().unwrap() = Some(task);
             JNI_TRUE
         }
         Err(e) => {

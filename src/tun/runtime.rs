@@ -71,6 +71,7 @@ pub async fn run<D>(
     config: TunConfig,
     engine: Arc<Engine>,
     wake: Arc<Notify>,
+    cancel: Arc<Notify>,
 ) where
     D: std::io::Read + std::io::Write + Send + 'static,
 {
@@ -99,6 +100,10 @@ pub async fn run<D>(
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
             _ = wake.notified() => {}
+            _ = cancel.notified() => {
+                sessions.shutdown();
+                return;
+            },
         }
     }
 }
@@ -256,16 +261,17 @@ mod tests {
             Arc::new(crate::common::TrafficStats::default()),
             std::path::Path::new("."),
         ).await);
+        let cancel = Arc::new(Notify::new());
         let mut task = tokio::spawn(run(
             TunDevice::new(local, config.options.mtu), config, engine,
-            Arc::new(Notify::new()),
+            Arc::new(Notify::new()), cancel.clone(),
         ));
         assert!(tokio::time::timeout(Duration::from_millis(300), &mut task).await.is_err(),
             "TUN loop exited during startup");
         let mut byte = [0];
         assert_eq!(peer.read(&mut byte).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
+        cancel.notify_one();
+        task.await.unwrap();
         assert_eq!(peer.read(&mut byte).unwrap(), 0, "cancellation must close the device");
     }
 

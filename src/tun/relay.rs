@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
@@ -80,6 +81,13 @@ impl SessionManager {
                 }
             }
         }
+    }
+
+    pub fn shutdown(&mut self) {
+        for bridges in self.sessions.values() {
+            bridges.cancel.notify_one();
+        }
+        self.sessions.clear();
     }
 
     pub fn session_count(&self) -> usize {
@@ -156,6 +164,7 @@ impl Default for ByteQueue {
 pub struct SessionBridges {
     pub to_net: ByteQueue,
     pub from_net: ByteQueue,
+    cancel: Arc<Notify>,
 }
 
 impl SessionBridges {
@@ -163,6 +172,7 @@ impl SessionBridges {
         Self {
             to_net: ByteQueue::new(),
             from_net: ByteQueue::new(),
+            cancel: Arc::new(Notify::new()),
         }
     }
 }
@@ -178,7 +188,10 @@ impl Default for SessionBridges {
 /// outbound closes or errors.
 pub fn spawn_session(engine: Arc<Engine>, target: TargetAddr, bridges: SessionBridges) {
     tokio::spawn(async move {
-        let mut stream: BoxedStream = match engine.dial(&target).await {
+        let mut stream: BoxedStream = match tokio::select! {
+            _ = bridges.cancel.notified() => return,
+            result = engine.dial(&target) => result,
+        } {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("TUN relay dial {} failed: {}", target.address(), e);
@@ -189,21 +202,16 @@ pub fn spawn_session(engine: Arc<Engine>, target: TargetAddr, bridges: SessionBr
         loop {
             // Drain bytes destined for the network into the outbound.
             let n = bridges.to_net.pop(&mut buf);
-            if n > 0 {
-                if stream.write_all(&buf[..n]).await.is_err() {
-                    break;
-                }
-                continue;
+            if n > 0 && stream.write_all(&buf[..n]).await.is_err() {
+                break;
             }
-
-            // Read bytes from the outbound and hand them to the poll loop.
-            match stream.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => bridges.from_net.push(&buf[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    bridges.to_net.notified().await;
+            tokio::select! {
+                _ = bridges.cancel.notified() => break,
+                _ = bridges.to_net.notified() => {},
+                result = stream.read(&mut buf) => match result {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => bridges.from_net.push(&buf[..n]),
                 }
-                Err(_) => break,
             }
         }
     });
