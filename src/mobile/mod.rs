@@ -159,9 +159,7 @@ fn handle_get_proxies(call: &MethodCall) -> Vec<u8> {
         };
         let snapshots = engine.outbounds.snapshot();
         let mut views = serde_json::Map::new();
-        let mut all = Vec::new();
         for item in &snapshots {
-            all.push(item.name.clone());
             let mut view = serde_json::Map::new();
             view.insert("name".into(), Value::String(item.name.clone()));
             // App's GroupType enum matches on PascalCase names (Selector,
@@ -181,23 +179,42 @@ fn handle_get_proxies(call: &MethodCall) -> Vec<u8> {
                 if let Some(sel) = &item.selected {
                     view.insert("now".into(), Value::String(sel.clone()));
                 }
-                // The App filters groups with `hidden == false` in rule mode;
-                // `hidden` is nullable, so omitting it (null) hides every group.
-                view.insert("hidden".into(), Value::Bool(false));
+                // The App filters groups with `hidden == false`; the built-in
+                // GLOBAL is hidden, exactly like the Go kernel.
+                view.insert("hidden".into(), Value::Bool(item.name == "GLOBAL"));
             }
             views.insert(item.name.clone(), Value::Object(view));
         }
+        // `all` is the group list in config order (GLOBAL first), matching the
+        // Go kernel; nodes are reached through their group's `all`.
+        let mut all: Vec<String> = engine.config.proxy_groups.iter()
+            .map(|g| g.name.clone())
+            .collect();
+        if !all.iter().any(|n| n == "GLOBAL") {
+            all.insert(0, "GLOBAL".to_string());
+        }
         let result = json!({"proxies": views, "all": all});
-        // Diagnostics: report what we are actually returning to the App.
-        let types: Vec<String> = result["proxies"].as_object()
-            .map(|m| m.iter().filter(|(_, v)| v.get("all").is_some())
-                .map(|(k, v)| format!("{}={}", k, v["type"].as_str().unwrap_or("?"))).collect())
+        // Diagnostics: report group member counts so an empty strategy group is
+        // visible in the log.
+        let groups_info: Vec<String> = result["proxies"].as_object()
+            .map(|m| m.iter()
+                .filter_map(|(k, v)| {
+                    v.get("all").map(|members| format!(
+                        "{}({})={}",
+                        k,
+                        members.as_array().map(|a| a.len()).unwrap_or(0),
+                        v["type"].as_str().unwrap_or("?")
+                    ))
+                })
+                .collect())
             .unwrap_or_default();
         crate::jni::emit_log_event(&format!(
-            "[rust-core] getProxies returning {} entries, {} groups: {}",
-            result["all"].as_array().map(|a| a.len()).unwrap_or(0),
-            types.len(),
-            types.iter().take(8).cloned().collect::<Vec<_>>().join(", ")
+            "[rust-core] getProxies returning {} entries, all=[{}], {} groups: {}",
+            result["proxies"].as_object().map(|m| m.len()).unwrap_or(0),
+            result["all"].as_array().map(|a| a.iter()
+                .filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default(),
+            groups_info.len(),
+            groups_info.iter().take(10).cloned().collect::<Vec<_>>().join(", ")
         ));
         result
     };
@@ -1075,8 +1092,10 @@ mod tests {
         assert_eq!(r["result"]["proxies"]["g1"]["now"], "n1");
         // App's GroupType matches PascalCase names.
         assert_eq!(r["result"]["proxies"]["g1"]["type"], "Selector");
-        // The App hides groups whose `hidden` is not exactly false.
+        // The App hides groups whose `hidden` is not exactly false; the
+        // built-in GLOBAL is hidden, matching the Go kernel.
         assert_eq!(r["result"]["proxies"]["g1"]["hidden"], false);
+        assert_eq!(r["result"]["proxies"]["GLOBAL"]["hidden"], true);
     }
 
     #[test]
