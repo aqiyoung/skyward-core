@@ -110,6 +110,7 @@ pub fn invoke(data: &[u8]) -> Vec<u8> {
         "resetTraffic" => handle_reset_traffic(&call),
         "encodeShareLinks" => handle_encode_share_links(&call),
         "decodeShareLinks" => handle_decode_share_links(&call),
+        "convertProxies" => handle_convert_proxies(&call),
         "getConfig" => handle_get_config(&call),
         "getProfileBase" => handle_get_profile_base(&call),
         "getProfileOutbounds" => handle_get_profile_outbounds(&call),
@@ -490,6 +491,36 @@ fn handle_encode_share_links(call: &MethodCall) -> Vec<u8> {
     ok(&call.id, json!(share_links::encode_links(&mappings)))
 }
 
+fn handle_convert_proxies(call: &MethodCall) -> Vec<u8> {
+    // The App passes a path to a file containing either a YAML config or a
+    // list of share links. Return the proxies as a list of maps.
+    let arg = call.arguments.as_str().unwrap_or("");
+    let text = read_config_text(arg);
+    let mut proxies: Vec<serde_json::Value> = Vec::new();
+
+    // First try a YAML config with a `proxies:` list.
+    if let Ok(value) = serde_yaml::from_str::<serde_json::Value>(&text) {
+        if let Some(arr) = value.get("proxies").and_then(|v| v.as_array()) {
+            proxies.extend(arr.iter().cloned());
+        }
+    }
+
+    // Otherwise treat each non-empty, non-YAML line as a share link.
+    if proxies.is_empty() {
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.contains(':') && !line.contains("://") {
+                continue;
+            }
+            let decoded = share_links::decode_lines(&[line.to_string()]);
+            if let Some(first) = decoded.first() {
+                proxies.extend(first.iter().map(|m| serde_json::Value::Object(m.clone())));
+            }
+        }
+    }
+    ok(&call.id, json!(proxies))
+}
+
 fn handle_decode_share_links(call: &MethodCall) -> Vec<u8> {
     let lines: Vec<String> = call.arguments.as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
@@ -723,10 +754,31 @@ where
     rx.recv().map_err(|_| "setup task failed".to_string())?
 }
 
+/// Read the argument as a file path first (the App writes subscription data to
+/// a temp file and passes its path), falling back to treating it as inline YAML
+/// content for compatibility with callers that pass the text directly.
+fn read_config_text(arg: &str) -> String {
+    if !arg.is_empty() && std::path::Path::new(arg).is_absolute() {
+        if let Ok(bytes) = std::fs::read(arg) {
+            return String::from_utf8_lossy(&bytes).into_owned();
+        }
+    }
+    arg.to_string()
+}
+
 fn handle_validate_config(call: &MethodCall) -> Vec<u8> {
-    // The App sends the raw config as a string argument.
-    let text = call.arguments.as_str().unwrap_or("");
-    match crate::config::Config::from_str(text) {
+    let arg = call.arguments.as_str().unwrap_or("");
+    let text = read_config_text(arg);
+    // A subscription may be a share-link list rather than a YAML config. Accept
+    // plain http/https/ss/etc. lines as valid (the App will convert them next).
+    let trimmed = text.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://")
+        || trimmed.starts_with("ss://") || trimmed.starts_with("ssr://")
+        || trimmed.starts_with("vmess://") || trimmed.starts_with("vless://")
+        || trimmed.starts_with("trojan://") {
+        return ok(&call.id, Value::String(String::new()));
+    }
+    match crate::config::Config::from_str(&text) {
         Ok(_) => ok(&call.id, Value::String(String::new())),
         Err(e) => ok(&call.id, Value::String(e.to_string())),
     }
@@ -777,6 +829,34 @@ mod tests {
         assert_eq!(r["result"], "");
         let r = response(invoke(br#"{"method":"validateConfig","arguments":"mode: bogus"}"#));
         assert!(r["result"].as_str().unwrap().contains("invalid mode"));
+    }
+
+    #[test]
+    fn validate_config_accepts_file_path() {
+        // Reproduces the real-device bug: the App passes a temp file path.
+        let dir = std::env::temp_dir().join(format!("skyward-val-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("sub.yaml");
+        std::fs::write(&file, "mode: rule\nrules:\n  - MATCH,DIRECT\n").unwrap();
+        let payload = serde_json::json!({"method": "validateConfig", "arguments": file.to_string_lossy()}).to_string();
+        let r = response(invoke(payload.as_bytes()));
+        assert_eq!(r["result"], "", "path-based validateConfig must read the file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_config_accepts_share_link_file() {
+        let dir = std::env::temp_dir().join(format!("skyward-share-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("sub.txt");
+        std::fs::write(&file, "ss://YWVzLTI1Ni1nY206cHc@1.2.3.4:8388#node\n").unwrap();
+        let payload = serde_json::json!({"method": "validateConfig", "arguments": file.to_string_lossy()}).to_string();
+        let r = response(invoke(payload.as_bytes()));
+        assert_eq!(r["result"], "");
+        let payload = serde_json::json!({"method": "convertProxies", "arguments": file.to_string_lossy()}).to_string();
+        let r = response(invoke(payload.as_bytes()));
+        assert_eq!(r["result"][0]["type"], "ss");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
