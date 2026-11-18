@@ -23,12 +23,6 @@ pub async fn engine() -> Option<Arc<Engine>> {
     ENGINE.read().await.clone()
 }
 
-/// Path of the currently applied config, used to reload the engine after a
-/// GeoX download so the new geo data reaches the rules.
-pub async fn config_path() -> Option<String> {
-    CONFIG_PATH.read().await.as_ref().map(|p| p.to_string_lossy().into_owned())
-}
-
 /// Build an engine from a config and install it as the active one.
 pub async fn apply_config(config: Config, config_path: PathBuf, data_dir: PathBuf) -> Arc<Engine> {
     let engine = Arc::new(Engine::new(config, traffic(), &data_dir).await);

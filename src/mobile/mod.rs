@@ -1089,6 +1089,7 @@ fn handle_update_geo_data(call: &MethodCall) -> Vec<u8> {
                 // Reload the engine so GEOIP/GEOSITE rules use the fresh data.
                 let path = crate::runtime_state::config_path().await;
                 if let Some(path) = path {
+                    let path = path.to_string_lossy().into_owned();
                     if let Err(e) = crate::runtime_state::apply_config_from_path(&path).await {
                         crate::jni::emit_log_event(&format!(
                             "[rust-core] updateGeoData reload failed: {}",
