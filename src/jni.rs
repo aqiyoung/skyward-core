@@ -63,8 +63,15 @@ pub fn emit_event_json(event: &str) {
     let Some(vm) = vm() else { return };
     let listener = EVENT_LISTENER.lock().ok().and_then(|g| g.clone());
     let Some(listener) = listener else { return };
+    // The App decodes native bytes as a CoreMethodCall, then reads
+    // `arguments` as a list of events. Wrap the bare event accordingly:
+    //   {"method":"message","arguments":[ <event> ]}
+    let envelope = match serde_json::from_str::<serde_json::Value>(event) {
+        Ok(ev) => serde_json::json!({ "method": "message", "arguments": [ev] }).to_string(),
+        Err(_) => event.to_string(),
+    };
     let result = vm.attach_current_thread().and_then(|mut env| {
-        let bytes = env.byte_array_from_slice(event.as_bytes())?;
+        let bytes = env.byte_array_from_slice(envelope.as_bytes())?;
         let value = JValue::Object(&bytes);
         env.call_method(&listener, "onResult", "([B)V", &[value])?;
         Ok(())
