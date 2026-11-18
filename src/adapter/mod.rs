@@ -371,8 +371,17 @@ impl OutboundManager {
     /// following the chain until an outbound is reached, like mihomo.
     pub async fn resolve(&self, name: &str) -> String {
         let mut current = name.to_string();
-        for _ in 0..16 {
+        for step in 0..16 {
             let Some(group) = self.groups.get(&current) else {
+                // current is a concrete outbound (or an unknown name).
+                static RESOLVE_DIAG: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                if RESOLVE_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                    crate::jni::emit_log_event(&format!(
+                        "[rust-core] resolve step {}: {} -> outbound (exists={})",
+                        step, current, self.outbounds.contains_key(&current)
+                    ));
+                }
                 return current;
             };
             let candidates: Vec<String> = group.members.iter()
@@ -380,6 +389,14 @@ impl OutboundManager {
                 .cloned()
                 .collect();
             if candidates.is_empty() {
+                static RESOLVE_DIAG: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                if RESOLVE_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                    crate::jni::emit_log_event(&format!(
+                        "[rust-core] resolve step {}: group {} kind={} members={:?} NO VALID CANDIDATES -> DIRECT",
+                        step, current, group.kind, group.members
+                    ));
+                }
                 return "DIRECT".to_string();
             }
 
@@ -392,11 +409,33 @@ impl OutboundManager {
                     let i = group.cursor.fetch_add(1, Ordering::Relaxed) % candidates.len();
                     candidates[i].clone()
                 }
-                _ => group
-                    .selected()
-                    .filter(|name| candidates.contains(name))
-                    .unwrap_or_else(|| candidates[0].clone()),
+                _ => {
+                    let chosen = group.selected();
+                    // If the stored selection isn't a valid candidate (e.g. an
+                    // emoji name whose variation selector changed between the
+                    // config and the selected-map), fall back to the first real
+                    // proxy, never DIRECT/REJECT — otherwise every connection
+                    // silently goes straight out.
+                    match chosen.filter(|name| candidates.contains(name)) {
+                        Some(name) => name,
+                        None => candidates
+                            .iter()
+                            .find(|m| *m != "DIRECT" && *m != "REJECT")
+                            .cloned()
+                            .unwrap_or_else(|| candidates[0].clone()),
+                    }
+                }
             };
+            {
+                static RESOLVE_DIAG: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                if RESOLVE_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                    crate::jni::emit_log_event(&format!(
+                        "[rust-core] resolve step {}: {} kind={} selected={:?} candidates={} -> next={}",
+                        step, current, group.kind, group.selected(), candidates.len(), next
+                    ));
+                }
+            }
             if next == current {
                 return current;
             }

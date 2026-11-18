@@ -84,6 +84,29 @@ pub async fn apply_config_from_path(path: &str) -> Result<(), String> {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
+
+    // Make sure GEOIP/GEOSITE data exists before building the engine, otherwise
+    // those rules never match and every connection falls through to DIRECT.
+    // The App normally downloads these via updateGeoData, but that may not have
+    // happened yet (e.g. first run), so fetch on demand here.
+    let needs_geo = config.rules.iter().any(|r| {
+        let u = r.to_ascii_uppercase();
+        u.starts_with("GEOIP,") || u.starts_with("GEOSITE,") || u.starts_with("RULE-SET,")
+    });
+    if needs_geo {
+        if let Some(home) = crate::mobile::home_dir() {
+            for (geo_type, file) in [("GEOIP", "geoip.dat"), ("GEOSITE", "geosite.dat")] {
+                if !home.join(file).exists() && !data_dir.join(file).exists() {
+                    log(&format!("apply_config: downloading {} on demand", file));
+                    match crate::geo::download_geo(geo_type, &home).await {
+                        Ok(n) => log(&format!("apply_config: {} downloaded ({} bytes)", file, n)),
+                        Err(e) => log(&format!("apply_config: {} download failed: {}", file, e)),
+                    }
+                }
+            }
+        }
+    }
+
     log("apply_config: building engine...");
     apply_config(config, config_path, data_dir).await;
     log("apply_config: engine built and installed");
