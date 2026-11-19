@@ -18,6 +18,7 @@ use std::sync::{Arc, OnceLock};
 use crate::common::VERSION;
 
 pub mod log_bridge;
+pub mod profile_base;
 pub mod share_links;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -107,6 +108,8 @@ pub fn invoke(data: &[u8]) -> Vec<u8> {
         "outboundIp" => handle_outbound_ip(&call),
         "getMemoryStats" => handle_memory_stats(&call),
         "validateProxies" => handle_validate_proxies(&call),
+        "validateFilters" => handle_validate_filters(&call),
+        "buildProfile" => handle_build_profile(&call),
         "startLog" => handle_start_log(&call),
         "stopLog" => handle_stop_log(&call),
         "watchRoute" => handle_watch_route(&call),
@@ -575,6 +578,60 @@ fn handle_validate_proxies(call: &MethodCall) -> Vec<u8> {
     ok(&call.id, json!(results))
 }
 
+/// Mirror Go's `handleValidateFilters`: each filter is a set of regex parts
+/// separated by backticks; the result list carries, per filter, the first
+/// compile error or an empty string.
+fn handle_validate_filters(call: &MethodCall) -> Vec<u8> {
+    let filters = call.arguments.as_array().cloned().unwrap_or_default();
+    let results: Vec<String> = filters
+        .iter()
+        .map(|f| {
+            let text = f.as_str().unwrap_or("");
+            for part in text.split('`') {
+                if let Err(e) = regex::Regex::new(part) {
+                    return e.to_string();
+                }
+            }
+            String::new()
+        })
+        .collect();
+    ok(&call.id, json!(results))
+}
+
+/// Mirror Go's `handleBuildProfile`: merge the profile with the App's
+/// overlay and write the result into the spill directory (`<home>/responses`),
+/// returning its path for the host to read back.
+fn handle_build_profile(call: &MethodCall) -> Vec<u8> {
+    let path = call.arguments.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let overlay = call.arguments.get("overlay").and_then(|v| v.as_str()).unwrap_or("");
+    let merged = (|| -> Result<String, String> {
+        let profile_text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        profile_base::merge_profile_base(&profile_text, overlay)
+    })();
+    let merged = match merged {
+        Ok(m) => m,
+        Err(e) => return err(&call.id, "core_error", e),
+    };
+    let Some(home) = home_dir() else {
+        return err(&call.id, "core_error", "core home dir not set".to_string());
+    };
+    let dir = home.join("responses");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return err(&call.id, "core_error", e.to_string());
+    }
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let name = format!(
+        "profile-{}-{}.yaml",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let out = dir.join(name);
+    match std::fs::write(&out, merged) {
+        Ok(()) => ok(&call.id, Value::String(out.to_string_lossy().into_owned())),
+        Err(e) => err(&call.id, "core_error", e.to_string()),
+    }
+}
+
 /// Rate-limited delay-test diagnostics so a log export shows node failures.
 fn delay_diag(message: &str) {
     static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -961,18 +1018,49 @@ fn finish_fallible(id: &str, result: Result<Result<Value, String>, String>) -> V
 }
 
 fn handle_get_profile_base(call: &MethodCall) -> Vec<u8> {
-    let path = call.arguments.as_str().map(str::to_string);
+    let path = call.arguments.as_str().unwrap_or("").to_string();
     let future = async move {
-        let value = crate::runtime_state::read_raw_config(path.as_deref()).await?;
-        let digest = sha256_hex(value.to_string().as_bytes());
-        let count = |key: &str| value.get(key).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+        // Go hashes the file's raw bytes and strips the sections the core
+        // re-injects at merge time (proxies / proxy-groups / rules /
+        // sub-rules). Returning them here would double-count them in the App
+        // and duplicate the profile's rules in the generated overlay.
+        let bytes = if path.is_empty() {
+            let active = crate::runtime_state::config_path()
+                .await
+                .ok_or_else(|| "no config applied".to_string())?;
+            std::fs::read(&active).map_err(|e| e.to_string())?
+        } else {
+            std::fs::read(&path).map_err(|e| e.to_string())?
+        };
+        let digest = sha256_hex(&bytes);
+        let text = String::from_utf8_lossy(&bytes);
+        let mut value: Value =
+            serde_yaml::from_str(&text).map_err(|e| format!("parse profile: {}", e))?;
+        let count = |key: &str| {
+            value
+                .get(key)
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0)
+        };
+        let counts = (
+            count("proxies"),
+            count("proxy-groups"),
+            count("rules"),
+        );
+        let match_rules = profile_base::match_rules_of(&value);
+        if let Some(obj) = value.as_object_mut() {
+            for section in ["proxies", "proxy-groups", "rules", "sub-rules"] {
+                obj.remove(section);
+            }
+        }
         Ok::<_, String>(json!({
             "config": value,
             "digest": digest,
-            "match-rules": [],
-            "proxies": count("proxies"),
-            "proxy-groups": count("proxy-groups"),
-            "rules": count("rules"),
+            "match-rules": match_rules,
+            "proxies": counts.0,
+            "proxy-groups": counts.1,
+            "rules": counts.2,
         }))
     };
     finish_fallible(&call.id, block_on(future))
@@ -1097,13 +1185,58 @@ fn handle_close_connection(call: &MethodCall) -> Vec<u8> {
     ok(&call.id, Value::Bool(block_on(future).unwrap_or(false)))
 }
 
+/// Merge a profile file with the App's overlay (Go's `mergeProfileBase`) and
+/// write the result to the running config path, `<home>/config.yaml`, like
+/// Go's `loadConfigWithBase` does. Returns that path on success.
+fn merge_base_to_running_config(profile_path: &str, overlay: &str) -> Result<String, String> {
+    let profile_text = std::fs::read_to_string(profile_path).map_err(|e| e.to_string())?;
+    let merged = profile_base::merge_profile_base(&profile_text, overlay)?;
+    let home = home_dir().ok_or_else(|| "core home dir not set".to_string())?;
+    std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
+    let target = home.join("config.yaml");
+    let tmp = home.join(".config-merged.yaml");
+    std::fs::write(&tmp, &merged).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &target).map_err(|e| e.to_string())?;
+    crate::jni::emit_log_event(&format!(
+        "[rust-core] setupConfig base: merged {} + overlay -> {}",
+        profile_path,
+        target.display()
+    ));
+    Ok(target.to_string_lossy().into_owned())
+}
+
 fn handle_setup_config(call: &MethodCall) -> Vec<u8> {
-    // Arguments: {"base":{"path":"..."},"test-url":"...","selected-map":{...}}
-    let path = call
-        .arguments
-        .get("base")
-        .and_then(|b| b.get("path"))
-        .and_then(|p| p.as_str())
+    // Arguments: {"base":{"path":"...","overlay":"..."},"test-url":"...","selected-map":{...}}
+    //
+    // When the App sends a base, the config to load is NOT the profile file
+    // alone: Go merges it with the overlay (patch settings, added rules,
+    // injected providers) first. Loading the raw profile discarded all of
+    // that, so App-side settings silently never took effect.
+    let mut effective_path: Option<String> = None;
+    if let Some(base) = call.arguments.get("base") {
+        let profile_path = base.get("path").and_then(|p| p.as_str()).unwrap_or("");
+        if !profile_path.is_empty() {
+            let overlay = base.get("overlay").and_then(|o| o.as_str()).unwrap_or("");
+            match merge_base_to_running_config(profile_path, overlay) {
+                Ok(merged_path) => effective_path = Some(merged_path),
+                Err(e) => {
+                    crate::jni::emit_log_event(&format!(
+                        "[rust-core] setupConfig base merge FAILED: {}",
+                        e
+                    ));
+                    return ok(&call.id, Value::String(e));
+                }
+            }
+        }
+    }
+    let path = effective_path
+        .as_deref()
+        .or_else(|| {
+            call.arguments
+                .get("base")
+                .and_then(|b| b.get("path"))
+                .and_then(|p| p.as_str())
+        })
         .or_else(|| call.arguments.get("path").and_then(|p| p.as_str()));
 
     let Some(path) = path else {
