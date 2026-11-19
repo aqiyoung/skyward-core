@@ -75,6 +75,9 @@ pub struct Engine {
     pub providers: Arc<ProviderRegistry>,
     pub proxy_providers: Arc<ProxyProviderRegistry>,
     pub connections: Arc<ConnectionTracker>,
+    /// Fires when the App asks for the connection list to be closed, so the
+    /// relays stop instead of leaving established flows on the old outbound.
+    pub close_signal: Arc<tokio::sync::Notify>,
 }
 
 /// Rate-limited diagnostics for connection routing, so the log shows which
@@ -146,7 +149,26 @@ impl Engine {
         let providers = Arc::new(ProviderRegistry::load(&config, data_dir).await);
         log(format!("engine: rule providers done ({:?})", t0.elapsed()));
         let connections = Arc::new(ConnectionTracker::new());
-        Self { config, rules, resolver, outbounds, traffic, mode, geo, providers, proxy_providers, connections }
+        Self {
+            config,
+            rules,
+            resolver,
+            outbounds,
+            traffic,
+            mode,
+            geo,
+            providers,
+            proxy_providers,
+            connections,
+            close_signal: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Close every tracked connection and stop the relays behind them.
+    pub async fn close_connections(&self) -> usize {
+        let count = self.connections.close_all().await;
+        self.close_signal.notify_waiters();
+        count
     }
 
     /// Choose a rule target based on the active mode and the rule set.

@@ -1063,9 +1063,8 @@ fn handle_connection_count(call: &MethodCall) -> Vec<u8> {
 
 fn handle_close_connections(call: &MethodCall) -> Vec<u8> {
     let future = async {
-        match crate::runtime_state::engine().await {
-            Some(engine) => { engine.connections.close_all().await; }
-            None => {}
+        if let Some(engine) = crate::runtime_state::engine().await {
+            engine.close_connections().await;
         }
     };
     let _ = block_on(future);
@@ -1093,10 +1092,12 @@ fn handle_setup_config(call: &MethodCall) -> Vec<u8> {
         .or_else(|| call.arguments.get("path").and_then(|p| p.as_str()));
 
     let Some(path) = path else {
-        // No path supplied. This happens during config switching / service
-        // restarts. NEVER replace a working engine with an empty default here —
-        // that wipes all groups/rules and makes strategy groups "not found".
-        // Only create a default engine when none exists at all.
+        // No path supplied. That is how the App sends a generated profile: it
+        // assembles the YAML (subscription, script, overrides) and writes it to
+        // `<home>/config.yaml` first. Loading that file is what makes a profile
+        // or script switch take effect — keeping the previous engine is why a
+        // switch looked like it did nothing. Only when the file is absent (a
+        // plain service restart) do we keep the engine that is already running.
         let selected: Vec<(String, String)> = call
             .arguments
             .get("selected-map")
@@ -1104,6 +1105,32 @@ fn handle_setup_config(call: &MethodCall) -> Vec<u8> {
             .map(|m| m.iter().filter_map(|(g, p)| p.as_str().map(|s| (g.clone(), s.to_string()))).collect())
             .unwrap_or_default();
         let future = async move {
+            let config_file = home_dir().map(|h| h.join("config.yaml"));
+            if let Some(file) = config_file.filter(|f| f.is_file()) {
+                let file = file.to_string_lossy().into_owned();
+                crate::jni::emit_log_event(&format!(
+                    "[rust-core] setupConfig no-path: applying {}",
+                    file
+                ));
+                if let Err(e) = crate::runtime_state::apply_config_from_path(&file).await {
+                    return e;
+                }
+                if let Some(engine) = crate::runtime_state::engine().await {
+                    let mut applied = 0;
+                    for (group, proxy) in selected {
+                        if engine.outbounds.set_selection(&group, &proxy) {
+                            applied += 1;
+                        }
+                    }
+                    crate::jni::emit_log_event(&format!(
+                        "[rust-core] setupConfig no-path: applied {} selection(s), {} proxies / {} groups",
+                        applied,
+                        engine.outbounds.outbounds.len(),
+                        engine.outbounds.groups.len()
+                    ));
+                }
+                return String::new();
+            }
             match crate::runtime_state::engine().await {
                 Some(engine) => {
                     for (group, proxy) in selected {
@@ -1121,9 +1148,10 @@ fn handle_setup_config(call: &MethodCall) -> Vec<u8> {
                     .await;
                 }
             }
+            String::new()
         };
         return match block_on(future) {
-            Ok(()) => ok(&call.id, Value::String(String::new())),
+            Ok(message) => ok(&call.id, Value::String(message)),
             Err(e) => ok(&call.id, Value::String(e)),
         };
     };

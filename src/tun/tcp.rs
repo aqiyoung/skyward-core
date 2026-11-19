@@ -251,6 +251,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             let final_name = engine.outbounds.resolve(&rule).await;
             let mut stream: BoxedStream = tokio::select! {
                 _ = cancel.notified() => return,
+                _ = engine.close_signal.notified() => return,
                 result = tokio::time::timeout(std::time::Duration::from_secs(10), engine.dial_named(&final_name, &target)) => {
                     match result {
                         Ok(Ok(s)) => {
@@ -293,6 +294,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                 }
                 tokio::select! {
                     _ = cancel.notified() => break,
+                    _ = engine.close_signal.notified() => break,
                     _ = to_net.notified() => {}
                     result = stream.read(&mut read_buf) => match result {
                         Ok(0) | Err(_) => break,
