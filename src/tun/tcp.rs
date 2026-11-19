@@ -32,7 +32,7 @@ const WINDOW: u16 = 65535;
 /// Rate-limited diagnostics for flow establishment.
 fn flow_diag(message: String) {
     static COUNT: AtomicUsize = AtomicUsize::new(0);
-    if COUNT.fetch_add(1, Ordering::Relaxed) < 200 {
+    if COUNT.fetch_add(1, Ordering::Relaxed) < 1000 {
         crate::jni::emit_log_event(&format!("[rust-core] {}", message));
     }
 }
@@ -41,7 +41,7 @@ fn flow_diag(message: String) {
 /// whether packets arrive and whether the outbound dial works.
 fn diag(message: String) {
     static COUNT: AtomicUsize = AtomicUsize::new(0);
-    if COUNT.fetch_add(1, Ordering::Relaxed) < 200 {
+    if COUNT.fetch_add(1, Ordering::Relaxed) < 1000 {
         crate::jni::emit_log_event(&format!("[rust-core] {}", message));
     }
 }
@@ -267,7 +267,6 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
         let done = flow.done.clone();
         let engine = self.engine.clone();
         let io = self.io.clone();
-        let addr = key_target_addr(&key).address();
         // If the destination is a fake-ip we handed out in DNS, recover the
         // original hostname so rules match by domain and proxies receive the
         // real host instead of a synthetic address.
@@ -275,6 +274,9 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             Some(host) => TargetAddr::Domain(host, key.target_port),
             None => TargetAddr::Ip(std::net::IpAddr::V4(key.target_ip), key.target_port),
         };
+        // Log the resolved target (domain when known), not the fake IP, so a
+        // log export names the site a flow belongs to.
+        let addr = target.address();
         tokio::spawn(async move {
             // Rules and the chain are decided before dialling so the connection
             // the App lists names the same route the packet actually took.
@@ -313,22 +315,26 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                 )
                 .await;
             let mut read_buf = vec![0u8; 16 * 1024];
-            loop {
+            let started = std::time::Instant::now();
+            let mut end_reason = "cancelled";
+            'relay: loop {
                 let mut write_buf = vec![0u8; 16 * 1024];
                 let n = to_net.pop(&mut write_buf);
                 if n > 0 {
                     if stream.write_all(&write_buf[..n]).await.is_err() {
-                        break;
+                        end_reason = "write_err";
+                        break 'relay;
                     }
                     up_counter.fetch_add(n as u64, Ordering::Relaxed);
                     continue;
                 }
                 tokio::select! {
-                    _ = cancel.notified() => break,
-                    _ = engine.close_signal.notified() => break,
+                    _ = cancel.notified() => { end_reason = "cancel"; break 'relay; }
+                    _ = engine.close_signal.notified() => { end_reason = "engine_close"; break 'relay; }
                     _ = to_net.notified() => {}
                     result = stream.read(&mut read_buf) => match result {
-                        Ok(0) | Err(_) => break,
+                        Ok(0) => { end_reason = "remote_eof"; break 'relay; }
+                        Err(_) => { end_reason = "read_err"; break 'relay; }
                         Ok(n) => {
                             down_counter.fetch_add(n as u64, Ordering::Relaxed);
                             from_net.push(&read_buf[..n]);
@@ -336,6 +342,14 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                     }
                 }
             }
+            flow_diag(format!(
+                "flow {} done up={} down={} lived={}ms end={}",
+                addr,
+                up_counter.load(Ordering::Relaxed),
+                down_counter.load(Ordering::Relaxed),
+                started.elapsed().as_millis(),
+                end_reason
+            ));
             engine.connections.remove(&id).await;
             done.store(true, Ordering::Relaxed);
         });
@@ -661,6 +675,77 @@ mod tests {
         let out = io.lock().unwrap().out.clone();
         let reply = parse_tcp(&out, 20).expect("reset packet");
         assert_eq!(reply.flags & RST, RST);
+    }
+
+    #[tokio::test]
+    async fn e2e_download_reassembles_over_mtu_sized_packets() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        // Local target server: read the request, reply with 30 KB, stay open.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected: Vec<u8> = (0..30_000u32).map(|i| (i % 251) as u8).collect();
+        let expected_clone = expected.clone();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"GET / HTTP/1.0\r\n\r\n");
+            sock.write_all(&expected_clone).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        });
+
+        let (mut tcp, io) = manager().await;
+        tcp.set_mtu(9000);
+        let client = Ipv4Addr::new(198, 18, 0, 1);
+        let target = Ipv4Addr::new(127, 0, 0, 1);
+        let (cport, tport) = (40000u16, port);
+
+        tcp.handle_packet(&client_packet(client, target, cport, tport, 1000, 0, SYN, &[]));
+        let out = io.lock().unwrap().out.clone();
+        io.lock().unwrap().out.clear();
+        let synack = parse_tcp(&out, 20).expect("syn-ack");
+        let isn = synack.seq;
+        // Handshake completion + request in one go, like a real app.
+        tcp.handle_packet(&client_packet(client, target, cport, tport, 1001, isn + 1, ACK, &[]));
+        tcp.handle_packet(&client_packet(
+            client, target, cport, tport, 1001, isn + 1, PSH | ACK, b"GET / HTTP/1.0\r\n\r\n",
+        ));
+
+        // Pump like the runtime loop and collect every packet written back.
+        let mut raw: Vec<u8> = Vec::new();
+        for _ in 0..100 {
+            tcp.pump();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let mut guard = io.lock().unwrap();
+            raw.extend_from_slice(&guard.out);
+            guard.out.clear();
+        }
+        server.abort();
+
+        // Split the byte stream back into IP packets and reassemble by seq.
+        let mut segments: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut rest = &raw[..];
+        while rest.len() >= 20 {
+            let total = u16::from_be_bytes([rest[2], rest[3]]) as usize;
+            assert!(total >= 40 && total <= 9000, "packet size {} out of bounds", total);
+            assert!(rest.len() >= total, "truncated packet in output");
+            let pkt = &rest[..total];
+            let hdr = parse_tcp(pkt, 20).expect("tcp header");
+            let payload = hdr.payload(pkt, 20);
+            if !payload.is_empty() {
+                segments.push((hdr.seq, payload.to_vec()));
+            }
+            rest = &rest[total..];
+        }
+        segments.sort_by_key(|(seq, _)| *seq);
+        let mut got: Vec<u8> = Vec::new();
+        let mut next = isn + 1;
+        for (seq, payload) in &segments {
+            assert_eq!(*seq, next, "sequence gap at {}", seq);
+            got.extend_from_slice(payload);
+            next = next.wrapping_add(payload.len() as u32);
+        }
+        assert_eq!(got, expected, "reassembled download differs");
     }
 
     #[tokio::test]

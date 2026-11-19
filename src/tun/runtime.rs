@@ -82,7 +82,7 @@ pub async fn run<T>(
 /// Rate-limited diagnostics for the DNS path.
 fn diag(message: String) {
     static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
+    if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 80 {
         crate::jni::emit_log_event(&format!("[rust-core] {}", message));
     }
 }
