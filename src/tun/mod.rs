@@ -82,15 +82,22 @@ impl<T> TunDevice<T> {
     }
 }
 
-/// Wrap a raw file descriptor into an owned handle. The caller transfers
-/// ownership; closing happens when the device is dropped.
+/// Wrap a raw file descriptor into an owned handle. We dup() the descriptor so
+/// the App keeps ownership of its ParcelFileDescriptor — closing that on stop
+/// is what tells Android to tear down the VPN and remove the status icon. The
+/// core closes only its duplicate when the TUN task ends.
 #[cfg(unix)]
 pub fn device_from_fd(fd: i32, mtu: usize) -> io::Result<TunDevice<std::fs::File>> {
     if fd < 0 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "no tun descriptor"));
     }
-    // SAFETY: the caller (VpnService via detachFd) transfers ownership of fd.
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: fd is a valid tun descriptor owned by the App's ParcelFileDescriptor.
+    // dup gives us an independent handle; the App keeps and closes the original.
+    let duped = unsafe { libc::dup(fd) };
+    if duped < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(duped) };
     // The TUN fd from Android's VpnService must be non-blocking; a blocking
     // read() would freeze the tokio worker that drives the whole stack.
     unsafe {
