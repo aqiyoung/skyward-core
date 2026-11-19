@@ -768,14 +768,22 @@ fn handle_service_check(call: &MethodCall) -> Vec<u8> {
 }
 
 fn handle_get_traffic(call: &MethodCall, total: bool) -> Vec<u8> {
-    let future = async move {
-        let snap = crate::runtime_state::traffic_snapshot().await;
-        // App expects the delta for getTraffic and cumulative for getTotalTraffic.
-        let (_up, _down) = (snap.up, snap.down);
-        json!({"up": snap.up, "down": snap.down})
-    };
-    let _ = total; // both share the same snapshot in this slice
-    ok(&call.id, block_on(future).unwrap_or_else(|_| json!({"up": 0, "down": 0})))
+    let snap = crate::runtime_state::traffic_snapshot(total);
+    if total {
+        static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+        let should_log = {
+            let mut last = LAST.lock().unwrap();
+            let due = last.map_or(true, |t| t.elapsed().as_secs() >= 10);
+            if due {
+                *last = Some(std::time::Instant::now());
+            }
+            due
+        };
+        if should_log {
+            crate::jni::emit_log_event(&format!("[rust-core] getTotalTraffic: up={} down={}", snap.up, snap.down));
+        }
+    }
+    ok(&call.id, json!(snap))
 }
 
 fn handle_reset_traffic(call: &MethodCall) -> Vec<u8> {

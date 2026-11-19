@@ -186,6 +186,26 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_invokeMethod(
     handler: JObject,
 ) {
     let input = java_string(&mut env, &data);
+    // Flutter delivers core calls on one serial queue. Like the Go bridge,
+    // return immediately for network probes so polling can continue.
+    if serde_json::from_str::<mobile::MethodCall>(&input)
+        .is_ok_and(|call| matches!(call.method.as_str(), "asyncTestDelay" | "probe" | "serviceCheck" | "outboundIp"))
+    {
+        if let (Some(vm), Some(rt)) = (vm(), tokio_runtime()) {
+            if let Ok(handler) = env.new_global_ref(&handler) {
+                rt.spawn_blocking(move || {
+                    let result = mobile::invoke(input.as_bytes());
+                    if let Ok(mut env) = vm.attach_current_thread() {
+                        if let Err(e) = fire_result(&mut env, handler.as_obj(), &result) {
+                            tracing::warn!("async invokeMethod callback: {}", e);
+                            let _ = env.exception_clear();
+                        }
+                    }
+                });
+                return;
+            }
+        }
+    }
     let result = mobile::invoke(input.as_bytes());
     if let Err(e) = fire_result(&mut env, &handler, &result) {
         let _ = env.throw_new("java/lang/RuntimeException", format!("invokeMethod callback: {}", e));
@@ -355,16 +375,12 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
 /// will build from the real config; this keeps the TUN path runnable now.
 async fn build_default_engine() -> Arc<crate::tunnel::Engine> {
     let config = crate::config::Config::default();
-    let traffic = Arc::new(crate::common::TrafficStats::default());
+    let traffic = crate::runtime_state::traffic();
     Arc::new(crate::tunnel::Engine::new(config, traffic, std::path::Path::new(".")).await)
 }
 
-fn traffic_json(_total: bool) -> String {
-    if let Some(rt) = tokio_runtime() {
-        let snap = rt.block_on(crate::runtime_state::traffic_snapshot());
-        return serde_json::json!({"up": snap.up, "down": snap.down}).to_string();
-    }
-    "{\"up\":0,\"down\":0}".to_string()
+fn traffic_json(total: bool) -> String {
+    serde_json::json!(crate::runtime_state::traffic_snapshot(total)).to_string()
 }
 
 #[no_mangle]

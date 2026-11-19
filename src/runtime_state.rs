@@ -15,7 +15,7 @@ static ENGINE: RwLock<Option<Arc<Engine>>> = RwLock::const_new(None);
 static CONFIG_PATH: RwLock<Option<PathBuf>> = RwLock::const_new(None);
 static TRAFFIC: std::sync::OnceLock<Arc<TrafficStats>> = std::sync::OnceLock::new();
 
-fn traffic() -> Arc<TrafficStats> {
+pub(crate) fn traffic() -> Arc<TrafficStats> {
     TRAFFIC
         .get_or_init(|| Arc::new(TrafficStats::default()))
         .clone()
@@ -142,8 +142,12 @@ pub async fn apply_config_from_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn traffic_snapshot() -> crate::common::TrafficSnapshot {
-    traffic().snapshot()
+pub fn traffic_snapshot(total: bool) -> crate::common::TrafficSnapshot {
+    if total {
+        traffic().snapshot()
+    } else {
+        traffic().rate()
+    }
 }
 
 pub async fn config_path() -> Option<PathBuf> {

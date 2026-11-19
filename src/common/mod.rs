@@ -2,7 +2,8 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Kernel version reported by the CLI and the REST API.
 pub const VERSION: &str = "0.1.0-alpha.1";
@@ -12,6 +13,7 @@ pub const VERSION: &str = "0.1.0-alpha.1";
 pub struct TrafficStats {
     upload: AtomicU64,
     download: AtomicU64,
+    rate_sample: Mutex<Option<(Instant, TrafficSnapshot, TrafficSnapshot)>>,
 }
 
 impl TrafficStats {
@@ -29,15 +31,52 @@ impl TrafficStats {
             down: self.download.load(Ordering::Relaxed),
         }
     }
+
+    pub fn rate(&self) -> TrafficSnapshot {
+        self.rate_at(Instant::now())
+    }
+
+    fn rate_at(&self, now: Instant) -> TrafficSnapshot {
+        let mut sample = self.rate_sample.lock().unwrap();
+        let current = self.snapshot();
+        let (last_time, last, rate) =
+            sample.get_or_insert((now, current, TrafficSnapshot::default()));
+        let elapsed = now.saturating_duration_since(*last_time);
+        if elapsed >= Duration::from_secs(1) {
+            let per_second = |bytes: u64| (bytes as f64 / elapsed.as_secs_f64()) as u64;
+            *rate = TrafficSnapshot {
+                up: per_second(current.up.saturating_sub(last.up)),
+                down: per_second(current.down.saturating_sub(last.down)),
+            };
+            *last_time = now;
+            *last = current;
+        }
+        *rate
+    }
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
 pub struct TrafficSnapshot {
     pub up: u64,
     pub down: u64,
 }
 
 pub type SharedTraffic = Arc<TrafficStats>;
+
+#[cfg(test)]
+#[test]
+fn traffic_rate_is_per_second_and_does_not_consume_totals() {
+    let traffic = TrafficStats::default();
+    let start = Instant::now();
+    assert_eq!(traffic.rate_at(start).up, 0);
+    traffic.add_upload(200);
+    traffic.add_download(600);
+    let rate = traffic.rate_at(start + Duration::from_secs(2));
+    assert_eq!((rate.up, rate.down), (100, 300));
+    assert_eq!(traffic.rate_at(start + Duration::from_secs(2)).down, 300);
+    assert_eq!(traffic.rate_at(start + Duration::from_secs(3)).down, 0);
+    assert_eq!(traffic.snapshot().down, 600);
+}
 
 /// A connection target as it appears on the wire. Keeping the hostname separate
 /// from the resolved IP is what lets domain rules and IP rules both work.
@@ -86,15 +125,20 @@ impl TargetAddr {
                         "no address for host",
                     ))
                 } else {
-                    Ok(ips.into_iter().map(|ip| SocketAddr::new(ip, *port)).collect())
+                    Ok(ips
+                        .into_iter()
+                        .map(|ip| SocketAddr::new(ip, *port))
+                        .collect())
                 }
             }
         }
     }
 
     pub async fn resolve(&self) -> std::io::Result<SocketAddr> {
-        self.resolve_all().await?.into_iter().next().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "no address for host")
-        })
+        self.resolve_all()
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no address for host"))
     }
 }
