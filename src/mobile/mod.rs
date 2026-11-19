@@ -429,7 +429,21 @@ fn handle_watch_route(call: &MethodCall) -> Vec<u8> {
             }
             None => serde_json::Map::new(),
         };
-        json!({"core-epoch": 0, "picks-version": 0, "picks": picks})
+        // Derive picks-version from the actual selection set so it changes when
+        // a group pick changes; a constant 0 makes the App think routing never
+        // changed and skip its route-map update.
+        let mut version: u64 = 1469598103934665603; // FNV offset basis
+        for (k, v) in &picks {
+            for b in k.as_bytes().iter().chain(v.as_str().unwrap_or("").as_bytes()) {
+                version ^= *b as u64;
+                version = version.wrapping_mul(1099511628211);
+            }
+        }
+        json!({
+            "core-epoch": crate::runtime_state::core_epoch(),
+            "picks-version": version,
+            "picks": picks
+        })
     };
     ok(&call.id, block_on(future).unwrap_or_else(|_| json!({"picks": {}})))
 }

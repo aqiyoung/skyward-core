@@ -19,6 +19,14 @@ fn traffic() -> Arc<TrafficStats> {
     TRAFFIC.get_or_init(|| Arc::new(TrafficStats::default())).clone()
 }
 
+/// Bumped every time the engine is (re)installed. The App watches this to know
+/// the routing strategy changed and re-renders the route map.
+static CORE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn core_epoch() -> u64 {
+    CORE_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub async fn engine() -> Option<Arc<Engine>> {
     ENGINE.read().await.clone()
 }
@@ -28,6 +36,7 @@ pub async fn apply_config(config: Config, config_path: PathBuf, data_dir: PathBu
     let engine = Arc::new(Engine::new(config, traffic(), &data_dir).await);
     *ENGINE.write().await = Some(engine.clone());
     *CONFIG_PATH.write().await = Some(config_path);
+    CORE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     engine
 }
 
@@ -113,7 +122,15 @@ pub async fn apply_config_from_path(path: &str) -> Result<(), String> {
         let u = r.to_ascii_uppercase();
         u.starts_with("GEOIP,") || u.starts_with("GEOSITE,") || u.starts_with("RULE-SET,")
     });
-    if needs_geo {
+    // Only attempt the on-demand geo fetch once per process. If the network
+    // can't reach GitHub (common here), retrying on every config load added
+    // ~10s of dead time to each subscription switch. The user can still retry
+    // explicitly via updateGeoData.
+    static GEO_FETCH_ATTEMPTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if needs_geo
+        && !GEO_FETCH_ATTEMPTED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
         if let Some(home) = crate::mobile::home_dir() {
             for (geo_type, file) in [("GEOIP", "geoip.dat"), ("GEOSITE", "geosite.dat")] {
                 if !home.join(file).exists() && !data_dir.join(file).exists() {
