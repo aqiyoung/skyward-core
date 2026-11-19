@@ -999,16 +999,34 @@ fn handle_setup_config(call: &MethodCall) -> Vec<u8> {
         .or_else(|| call.arguments.get("path").and_then(|p| p.as_str()));
 
     let Some(path) = path else {
-        // No path supplied: apply an empty config so the engine exists and the
-        // TUN relay can at least start with DIRECT routing.
-        let future = async {
-            let config = crate::config::Config::default();
-            crate::runtime_state::apply_config(
-                config,
-                std::path::PathBuf::from("config.yaml"),
-                std::path::PathBuf::from("."),
-            )
-            .await;
+        // No path supplied. This happens during config switching / service
+        // restarts. NEVER replace a working engine with an empty default here —
+        // that wipes all groups/rules and makes strategy groups "not found".
+        // Only create a default engine when none exists at all.
+        let selected: Vec<(String, String)> = call
+            .arguments
+            .get("selected-map")
+            .and_then(|v| v.as_object())
+            .map(|m| m.iter().filter_map(|(g, p)| p.as_str().map(|s| (g.clone(), s.to_string()))).collect())
+            .unwrap_or_default();
+        let future = async move {
+            match crate::runtime_state::engine().await {
+                Some(engine) => {
+                    for (group, proxy) in selected {
+                        engine.outbounds.set_selection(&group, &proxy);
+                    }
+                    crate::jni::emit_log_event("[rust-core] setupConfig no-path: kept existing engine");
+                }
+                None => {
+                    crate::jni::emit_log_event("[rust-core] setupConfig no-path: no engine, using default");
+                    let _ = crate::runtime_state::apply_config(
+                        crate::config::Config::default(),
+                        std::path::PathBuf::from("config.yaml"),
+                        std::path::PathBuf::from("."),
+                    )
+                    .await;
+                }
+            }
         };
         return match block_on(future) {
             Ok(()) => ok(&call.id, Value::String(String::new())),
