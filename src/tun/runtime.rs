@@ -97,9 +97,41 @@ fn handle_packet<T: Read + Write + Send + 'static>(
     };
     match ip.proto {
         6 => tcp.handle_packet(packet),
-        17 => handle_dns_packet(packet, &ip, io),
+        17 => {
+            let dst_port = packet
+                .get(ip.ihl + 2..ip.ihl + 4)
+                .map(|b| u16::from_be_bytes([b[0], b[1]]));
+            if dst_port == Some(53) {
+                handle_dns_packet(packet, &ip, io);
+            } else if icmp_budget() {
+                // UDP relay is not implemented; refuse fast (ICMP port
+                // unreachable) so QUIC and other UDP apps fall back to TCP
+                // immediately instead of timing out on a silent drop.
+                if let Some(reply) = crate::tun::tcp::build_icmp_port_unreachable(packet, ip.ihl)
+                {
+                    let _ = io.lock().unwrap().write_all(&reply);
+                }
+            }
+        }
         _ => {}
     }
+}
+
+/// Rate limit for ICMP refusals (~50/s), so a UDP flood cannot turn into a
+/// TUN write flood.
+fn icmp_budget() -> bool {
+    use std::sync::Mutex as StdMutex;
+    static STATE: StdMutex<(Option<std::time::Instant>, u32)> = StdMutex::new((None, 0));
+    let mut state = STATE.lock().unwrap();
+    let expired = state
+        .0
+        .map(|t| t.elapsed() > std::time::Duration::from_secs(1))
+        .unwrap_or(true);
+    if expired {
+        *state = (Some(std::time::Instant::now()), 0);
+    }
+    state.1 += 1;
+    state.1 <= 50
 }
 
 /// Answer a DNS query that arrived on the TUN with a fake-ip immediately.

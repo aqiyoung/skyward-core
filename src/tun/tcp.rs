@@ -58,7 +58,16 @@ pub struct FlowKey {
 enum State {
     SynReceived,
     Established,
-    Closed,
+}
+
+/// One segment handed to the app but not yet acknowledged. The minimal stack
+/// originally fired and forgot; a real stack (mihomo/gVisor) retransmits
+/// unacknowledged data, and without it a single packet dropped by the
+/// device-side stack stalls the flow forever.
+struct Unacked {
+    seq: u32,
+    data: Vec<u8>,
+    sent_at: std::time::Instant,
 }
 
 struct Flow {
@@ -71,6 +80,22 @@ struct Flow {
     from_net: Arc<ByteQueue>,
     cancel: Arc<Notify>,
     done: Arc<AtomicBool>,
+    /// The app sent FIN: no more uploads; the relay half-closes the outbound
+    /// write side once `to_net` drains, but downloads continue.
+    upload_closed: Arc<AtomicBool>,
+    /// The outbound stream reached EOF (server closed): once `from_net` has
+    /// been delivered, the manager answers with FIN.
+    remote_eof: Arc<AtomicBool>,
+    /// The relay died (dial failure, read/write error): the manager resets
+    /// the flow so the app fails fast instead of hanging on a live-looking
+    /// connection.
+    relay_failed: Arc<AtomicBool>,
+    /// Segments sent to the app awaiting its ACK, oldest first.
+    unacked: std::collections::VecDeque<Unacked>,
+    /// The app's latest advertised receive window; caps unacked bytes.
+    peer_window: u32,
+    fin_sent: bool,
+    fin_sent_at: Option<std::time::Instant>,
 }
 
 pub struct TcpManager<T> {
@@ -118,7 +143,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                 if flow.state == State::SynReceived {
                     // Retransmitted SYN: answer with the same SYN-ACK.
                     let (isn, client_next) = (flow.local_isn, flow.client_next);
-                    self.send(key, isn, client_next, SYN | ACK, &[]);
+                    self.send_syn_ack(key, isn, client_next);
                 }
                 return;
             }
@@ -133,8 +158,15 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                 from_net: Arc::new(ByteQueue::new()),
                 cancel: Arc::new(Notify::new()),
                 done: Arc::new(AtomicBool::new(false)),
+                upload_closed: Arc::new(AtomicBool::new(false)),
+                remote_eof: Arc::new(AtomicBool::new(false)),
+                relay_failed: Arc::new(AtomicBool::new(false)),
+                unacked: std::collections::VecDeque::new(),
+                peer_window: tcp.window as u32,
+                fin_sent: false,
+                fin_sent_at: None,
             };
-            self.send(key, isn, flow.client_next, SYN | ACK, &[]);
+            self.send_syn_ack(key, isn, flow.client_next);
             diag(format!(
                 "TCP SYN {}:{} -> {}:{}",
                 key.client_ip, key.client_port, key.target_ip, key.target_port
@@ -151,7 +183,13 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
 
         // Update the flow inside a scoped borrow so the manager can still send
         // packets (which takes &self) once the mutation is done.
-        let action = {
+        enum Act {
+            None,
+            Ack(u32),
+            Remove,
+            Reset,
+        }
+        let action = 'act: {
             let Some(flow) = self.flows.get_mut(&key) else {
                 // Not ours (or already gone): reject so the client stops retrying.
                 self.send(key, tcp.ack, tcp.seq, RST | ACK, &[]);
@@ -161,87 +199,233 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             if flow.state == State::SynReceived && tcp.flags & ACK != 0 {
                 flow.state = State::Established;
             }
+            flow.peer_window = tcp.window as u32;
 
-            if tcp.flags & FIN != 0 {
-                flow.state = State::Closed;
-                Some((flow.local_next, tcp.seq.wrapping_add(1), true))
-            } else {
-                let payload = tcp.payload(packet, ip.ihl);
-                if payload.is_empty() {
-                    None
-                } else {
-                    let n = payload.len() as u32;
-                    flow.client_next = flow.client_next.wrapping_add(n);
-                    // Application bytes leaving the device toward the network.
-                    self.engine.traffic.add_upload(payload.len() as u64);
-                    flow.to_net.push(payload);
-                    Some((flow.local_next, flow.client_next, false))
+            // Retire outbound segments the app has acknowledged, and finish
+            // the flow once it acknowledges our FIN.
+            if tcp.flags & ACK != 0 {
+                while let Some(front) = flow.unacked.front() {
+                    let end = front.seq.wrapping_add(front.data.len() as u32);
+                    if (tcp.ack.wrapping_sub(end) as i32) >= 0 {
+                        flow.unacked.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                if flow.fin_sent && tcp.ack == flow.local_next {
+                    break 'act Act::Remove;
                 }
             }
+
+            let payload = tcp.payload(packet, ip.ihl);
+            let mut act = Act::None;
+
+            if flow.fin_sent {
+                // We already closed our side; anything more is answered with
+                // a reset so the app stops.
+                if !payload.is_empty() || tcp.flags & FIN != 0 {
+                    act = Act::Reset;
+                }
+            } else if !payload.is_empty() {
+                let seg_seq = tcp.seq;
+                let seg_end = seg_seq.wrapping_add(payload.len() as u32);
+                if seg_seq == flow.client_next {
+                    flow.client_next = seg_end;
+                    self.engine.traffic.add_upload(payload.len() as u64);
+                    flow.to_net.push(payload);
+                } else if (seg_end.wrapping_sub(flow.client_next) as i32) > 0
+                    && (flow.client_next.wrapping_sub(seg_seq) as i32) > 0
+                {
+                    // Partial overlap (retransmission straddling new data):
+                    // keep only the bytes past what we already have.
+                    let skip = flow.client_next.wrapping_sub(seg_seq) as usize;
+                    let fresh = &payload[skip..];
+                    flow.client_next = seg_end;
+                    self.engine.traffic.add_upload(fresh.len() as u64);
+                    flow.to_net.push(fresh);
+                }
+                // else: a pure retransmission or an out-of-order segment —
+                // drop it; the ACK below tells the app where we stand.
+                act = Act::Ack(flow.client_next);
+            }
+
+            if tcp.flags & FIN != 0 && !flow.upload_closed.load(Ordering::Relaxed) {
+                let fin_seq = tcp.seq.wrapping_add(payload.len() as u32);
+                if fin_seq == flow.client_next {
+                    flow.client_next = flow.client_next.wrapping_add(1);
+                    // Half-close: downloads continue; the relay shuts the
+                    // outbound write side once the queue drains.
+                    flow.upload_closed.store(true, Ordering::Relaxed);
+                    act = Act::Ack(flow.client_next);
+                }
+            }
+
+            act
         };
 
-        if let Some((seq, ack, fin)) = action {
-            self.send(key, seq, ack, ACK, &[]);
-            if fin {
-                self.send(key, seq, ack, FIN | ACK, &[]);
-                self.remove(&key);
+        match action {
+            Act::Ack(ack) => {
+                let seq = self.flows.get(&key).map(|f| f.local_next).unwrap_or(0);
+                self.send(key, seq, ack, ACK, &[]);
             }
+            Act::Remove => self.remove(&key),
+            Act::Reset => self.reset_flow(key),
+            Act::None => {}
         }
     }
 
-    /// Push bytes received from outbounds back into the TUN.
-    pub fn pump(&mut self) {
-        let mut ready = Vec::new();
-        for (key, flow) in self.flows.iter() {
-            let n = flow.from_net.len();
-            if n > 0 {
-                ready.push((*key, n));
-            }
+    /// Send a RST for a live flow and drop it (dial/relay failure, or the app
+    /// kept talking after our FIN).
+    fn reset_flow(&mut self, key: FlowKey) {
+        if let Some(flow) = self.flows.get(&key) {
+            let (seq, ack) = (flow.local_next, flow.client_next);
+            self.send(key, seq, ack, RST | ACK, &[]);
         }
-        for (key, _) in ready {
-            // Work on a cloned queue handle so the flow map stays borrow-free
-            // while sequence numbers are updated between packets.
+        self.remove(&key);
+    }
+
+    /// SYN-ACK carrying an MSS option, like a real stack sends: without it
+    /// peers fall back to a 536-byte default segment size.
+    fn send_syn_ack(&self, key: FlowKey, seq: u32, ack: u32) {
+        let mss = self.mtu_payload.min(u16::MAX as usize) as u16;
+        let options = [2u8, 4, (mss >> 8) as u8, (mss & 0xff) as u8];
+        let packet = build_packet_opts(
+            key.target_ip,
+            key.client_ip,
+            key.target_port,
+            key.client_port,
+            seq,
+            ack,
+            SYN | ACK,
+            &options,
+            &[],
+        );
+        let mut io = self.io.lock().unwrap();
+        if let Err(e) = io.write_all(&packet) {
+            tracing::warn!("TUN write failed: {}", e);
+        }
+    }
+
+    /// Push bytes received from outbounds back into the TUN, retransmit what
+    /// the app never acknowledged, and drive flow teardown (FIN after the
+    /// server closes, RST when the relay died).
+    pub fn pump(&mut self) {
+        let keys: Vec<FlowKey> = self.flows.keys().copied().collect();
+        for key in keys {
+            // A dead relay (dial failure, stream error) resets the flow so
+            // the app fails fast and retries instead of hanging.
+            let failed = self
+                .flows
+                .get(&key)
+                .map(|f| f.relay_failed.load(Ordering::Relaxed))
+                .unwrap_or(false);
+            if failed {
+                self.reset_flow(key);
+                continue;
+            }
+
+            // Retransmit the oldest unacknowledged segment if it has been
+            // outstanding too long — the packet we sent was likely dropped
+            // by the device-side stack and the app is waiting on exactly
+            // these bytes.
+            let retransmit = self.flows.get(&key).and_then(|f| {
+                f.unacked.front().and_then(|front| {
+                    if front.sent_at.elapsed() > std::time::Duration::from_millis(300) {
+                        Some((front.seq, front.data.clone(), f.client_next))
+                    } else {
+                        None
+                    }
+                })
+            });
+            if let Some((seq, data, ack)) = retransmit {
+                self.send(key, seq, ack, PSH | ACK, &data);
+                if let Some(flow) = self.flows.get_mut(&key) {
+                    if let Some(front) = flow.unacked.front_mut() {
+                        front.sent_at = std::time::Instant::now();
+                    }
+                }
+                continue;
+            }
+
+            // Send new data, bounded by the app's advertised window and the
+            // interface MTU.
             let Some(from_net) = self.flows.get(&key).map(|f| f.from_net.clone()) else {
                 continue;
             };
-            // One packet per pop, capped at the interface MTU (see
-            // `mtu_payload`): anything larger is dropped by the kernel and
-            // the bytes would never reach the app.
             let mut buf = vec![0u8; self.mtu_payload];
-            // Drain the flow's queue in MTU-sized packets (bounded per pump
-            // so one busy flow cannot starve the others).
             for _ in 0..256 {
-                let n = from_net.pop(&mut buf);
+                let (window_left, seq, ack) = {
+                    let Some(flow) = self.flows.get(&key) else { break };
+                    let inflight: u32 = flow
+                        .unacked
+                        .iter()
+                        .map(|u| u.data.len() as u32)
+                        .sum();
+                    (
+                        flow.peer_window.saturating_sub(inflight),
+                        flow.local_next,
+                        flow.client_next,
+                    )
+                };
+                if window_left == 0 {
+                    break;
+                }
+                let cap = (window_left as usize).min(self.mtu_payload);
+                let n = from_net.pop(&mut buf[..cap]);
                 if n == 0 {
                     break;
                 }
-                let Some((seq, ack)) = self
-                    .flows
-                    .get(&key)
-                    .map(|f| (f.local_next, f.client_next))
-                else {
-                    break;
-                };
                 // Application bytes arriving from the network into the device.
                 self.engine.traffic.add_download(n as u64);
                 self.send(key, seq, ack, PSH | ACK, &buf[..n]);
                 if let Some(flow) = self.flows.get_mut(&key) {
                     flow.local_next = flow.local_next.wrapping_add(n as u32);
+                    flow.unacked.push_back(Unacked {
+                        seq,
+                        data: buf[..n].to_vec(),
+                        sent_at: std::time::Instant::now(),
+                    });
                 }
                 if from_net.is_empty() {
                     break;
                 }
             }
-        }
-        // Drop flows whose relay task has finished.
-        let dead: Vec<FlowKey> = self
-            .flows
-            .iter()
-            .filter(|(_, f)| f.done.load(Ordering::Relaxed) && f.from_net.is_empty())
-            .map(|(k, _)| *k)
-            .collect();
-        for key in dead {
-            self.remove(&key);
+
+            // Server closed and everything has been handed over: answer FIN.
+            let send_fin = self.flows.get(&key).map(|f| {
+                f.remote_eof.load(Ordering::Relaxed)
+                    && f.from_net.is_empty()
+                    && !f.fin_sent
+            });
+            if send_fin == Some(true) {
+                let (seq, ack) = {
+                    let flow = self.flows.get(&key).unwrap();
+                    (flow.local_next, flow.client_next)
+                };
+                self.send(key, seq, ack, FIN | ACK, &[]);
+                if let Some(flow) = self.flows.get_mut(&key) {
+                    flow.local_next = flow.local_next.wrapping_add(1);
+                    flow.fin_sent = true;
+                    flow.fin_sent_at = Some(std::time::Instant::now());
+                }
+                continue;
+            }
+
+            // Teardown backstops: FIN never acknowledged, or the relay ended
+            // quietly with nothing left to deliver.
+            let drop_flow = self.flows.get(&key).map(|f| {
+                (f.fin_sent
+                    && f.fin_sent_at
+                        .map(|t| t.elapsed() > std::time::Duration::from_secs(10))
+                        .unwrap_or(false))
+                    || (f.done.load(Ordering::Relaxed)
+                        && f.from_net.is_empty()
+                        && f.unacked.is_empty()
+                        && !f.fin_sent)
+            });
+            if drop_flow == Some(true) {
+                self.remove(&key);
+            }
         }
     }
 
@@ -265,6 +449,9 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
         let from_net = flow.from_net.clone();
         let cancel = flow.cancel.clone();
         let done = flow.done.clone();
+        let upload_closed = flow.upload_closed.clone();
+        let remote_eof = flow.remote_eof.clone();
+        let relay_failed = flow.relay_failed.clone();
         let fallback_engine = self.engine.clone();
         let io = self.io.clone();
         // If the destination is a fake-ip we handed out in DNS, recover the
@@ -302,10 +489,16 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                         Ok(Err(e)) => {
                             tracing::warn!("TUN flow {} dial failed: {}", addr, e);
                             diag(format!("flow {} dial failed: {}", addr, e));
+                            // The manager resets the flow so the app fails
+                            // fast instead of hanging on a dead connection.
+                            relay_failed.store(true, Ordering::Relaxed);
+                            done.store(true, Ordering::Relaxed);
                             return;
                         }
                         Err(_) => {
                             diag(format!("flow {} dial timed out", addr));
+                            relay_failed.store(true, Ordering::Relaxed);
+                            done.store(true, Ordering::Relaxed);
                             return;
                         }
                     }
@@ -325,12 +518,24 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             let mut read_buf = vec![0u8; 16 * 1024];
             let started = std::time::Instant::now();
             let mut end_reason = "cancelled";
+            let mut write_shutdown = false;
             'relay: loop {
+                // App half-closed and its bytes are flushed: close the
+                // outbound write side so the server sees EOF, keep reading.
+                if !write_shutdown
+                    && upload_closed.load(Ordering::Relaxed)
+                    && to_net.is_empty()
+                {
+                    use tokio::io::AsyncWriteExt as _;
+                    let _ = stream.shutdown().await;
+                    write_shutdown = true;
+                }
                 let mut write_buf = vec![0u8; 16 * 1024];
                 let n = to_net.pop(&mut write_buf);
                 if n > 0 {
                     if stream.write_all(&write_buf[..n]).await.is_err() {
                         end_reason = "write_err";
+                        relay_failed.store(true, Ordering::Relaxed);
                         break 'relay;
                     }
                     up_counter.fetch_add(n as u64, Ordering::Relaxed);
@@ -341,8 +546,16 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                     _ = engine.close_signal.notified() => { end_reason = "engine_close"; break 'relay; }
                     _ = to_net.notified() => {}
                     result = stream.read(&mut read_buf) => match result {
-                        Ok(0) => { end_reason = "remote_eof"; break 'relay; }
-                        Err(_) => { end_reason = "read_err"; break 'relay; }
+                        Ok(0) => {
+                            end_reason = "remote_eof";
+                            remote_eof.store(true, Ordering::Relaxed);
+                            break 'relay;
+                        }
+                        Err(_) => {
+                            end_reason = "read_err";
+                            relay_failed.store(true, Ordering::Relaxed);
+                            break 'relay;
+                        }
                         Ok(n) => {
                             down_counter.fetch_add(n as u64, Ordering::Relaxed);
                             from_net.push(&read_buf[..n]);
@@ -419,6 +632,7 @@ struct TcpHeader {
     seq: u32,
     ack: u32,
     flags: u8,
+    window: u16,
     data_offset: usize,
 }
 
@@ -444,6 +658,7 @@ fn parse_tcp(packet: &[u8], ihl: usize) -> Option<TcpHeader> {
         ack: u32::from_be_bytes([p[8], p[9], p[10], p[11]]),
         data_offset: ((p[12] >> 4) as usize) * 4,
         flags: p[13],
+        window: u16::from_be_bytes([p[14], p[15]]),
     })
 }
 
@@ -458,8 +673,26 @@ fn build_packet(
     flags: u8,
     payload: &[u8],
 ) -> Vec<u8> {
+    build_packet_opts(src, dst, src_port, dst_port, seq, ack, flags, &[], payload)
+}
+
+/// Build an IPv4/TCP packet with TCP options (already padded to a multiple
+/// of 4 bytes), e.g. the MSS option on a SYN-ACK.
+#[allow(clippy::too_many_arguments)]
+fn build_packet_opts(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    options: &[u8],
+    payload: &[u8],
+) -> Vec<u8> {
+    let header_len = 20 + options.len();
     let mut ip = [0u8; 20];
-    let total_len = 40 + payload.len();
+    let total_len = 20 + header_len + payload.len();
     ip[0] = 0x45;
     ip[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
     ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
@@ -470,15 +703,16 @@ fn build_packet(
     let ip_checksum = checksum(&ip);
     ip[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
 
-    let mut tcp = vec![0u8; 20 + payload.len()];
+    let mut tcp = vec![0u8; header_len + payload.len()];
     tcp[0..2].copy_from_slice(&src_port.to_be_bytes());
     tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
     tcp[4..8].copy_from_slice(&seq.to_be_bytes());
     tcp[8..12].copy_from_slice(&ack.to_be_bytes());
-    tcp[12] = 5 << 4;
+    tcp[12] = ((header_len / 4) as u8) << 4;
     tcp[13] = flags;
     tcp[14..16].copy_from_slice(&WINDOW.to_be_bytes());
-    tcp[20..].copy_from_slice(payload);
+    tcp[20..20 + options.len()].copy_from_slice(options);
+    tcp[header_len..].copy_from_slice(payload);
 
     let mut pseudo = Vec::with_capacity(12 + tcp.len());
     pseudo.extend_from_slice(&src.octets());
@@ -537,6 +771,45 @@ pub(crate) fn build_udp_packet(
     out.extend_from_slice(&ip);
     out.extend_from_slice(&udp);
     out
+}
+
+/// Build an ICMP destination/port-unreachable packet answering `original`
+/// (a full IPv4 packet). Non-DNS UDP is not relayed by this core; refusing
+/// it immediately lets QUIC-capable apps fall back to TCP at once instead
+/// of waiting out their handshake timeouts on a silently black-holed
+/// datagram.
+pub(crate) fn build_icmp_port_unreachable(original: &[u8], ihl: usize) -> Option<Vec<u8>> {
+    if original.len() < ihl + 8 {
+        return None;
+    }
+    let src = Ipv4Addr::new(original[16], original[17], original[18], original[19]);
+    let dst = Ipv4Addr::new(original[12], original[13], original[14], original[15]);
+    let quote_len = ihl + 8;
+    let icmp_len = 8 + quote_len;
+    let total_len = 20 + icmp_len;
+
+    let mut icmp = vec![0u8; icmp_len];
+    icmp[0] = 3; // destination unreachable
+    icmp[1] = 3; // port unreachable
+    icmp[8..8 + quote_len].copy_from_slice(&original[..quote_len]);
+    let icmp_checksum = checksum(&icmp);
+    icmp[2..4].copy_from_slice(&icmp_checksum.to_be_bytes());
+
+    let mut ip = [0u8; 20];
+    ip[0] = 0x45;
+    ip[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+    ip[8] = 64;
+    ip[9] = 1;
+    ip[12..16].copy_from_slice(&src.octets());
+    ip[16..20].copy_from_slice(&dst.octets());
+    let ip_checksum = checksum(&ip);
+    ip[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+
+    let mut out = Vec::with_capacity(total_len);
+    out.extend_from_slice(&ip);
+    out.extend_from_slice(&icmp);
+    Some(out)
 }
 
 fn checksum(data: &[u8]) -> u16 {
@@ -749,6 +1022,10 @@ mod tests {
         let mut got: Vec<u8> = Vec::new();
         let mut next = isn + 1;
         for (seq, payload) in &segments {
+            // Retransmissions repeat already-covered bytes; skip the overlap.
+            if (*seq).wrapping_add(payload.len() as u32).wrapping_sub(next) as i32 <= 0 {
+                continue;
+            }
             assert_eq!(*seq, next, "sequence gap at {}", seq);
             got.extend_from_slice(payload);
             next = next.wrapping_add(payload.len() as u32);
@@ -757,17 +1034,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fin_completes_the_flow() {
+    async fn fin_half_closes_and_remote_eof_finishes() {
+        let (mut tcp, io) = manager().await;
+        let client = Ipv4Addr::new(198, 18, 0, 1);
+        let target = Ipv4Addr::new(127, 0, 0, 1);
+        let (cport, tport) = (40000u16, 1u16);
+        tcp.handle_packet(&client_packet(client, target, cport, tport, 1000, 0, SYN, &[]));
+        let synack = parse_tcp(&io.lock().unwrap().out.clone(), 20).unwrap();
+        let isn = synack.seq;
+        tcp.handle_packet(&client_packet(client, target, cport, tport, 1001, isn + 1, ACK, &[]));
+        io.lock().unwrap().out.clear();
+        // App half-closes: the flow must survive for the download direction.
+        tcp.handle_packet(&client_packet(
+            client, target, cport, tport, 1001, isn + 1, FIN | ACK, &[],
+        ));
+        assert_eq!(tcp.flows.len(), 1, "FIN must half-close, not kill the flow");
+        let key = *tcp.flows.keys().next().unwrap();
+        assert!(tcp.flows[&key].upload_closed.load(Ordering::Relaxed));
+        // Server closes too: pump answers with FIN, and the flow is dropped
+        // once the app acknowledges it.
+        tcp.flows[&key].remote_eof.store(true, Ordering::Relaxed);
+        io.lock().unwrap().out.clear();
+        tcp.pump();
+        let out = io.lock().unwrap().out.clone();
+        let fin = parse_tcp(&out, 20).expect("fin packet");
+        assert_eq!(fin.flags & (FIN | ACK), FIN | ACK);
+        tcp.handle_packet(&client_packet(
+            client, target, cport, tport, 1002, isn + 2, ACK, &[],
+        ));
+        assert!(tcp.flows.is_empty(), "flow ends after the FIN is acked");
+    }
+
+    #[tokio::test]
+    async fn duplicate_segment_is_not_queued_twice() {
         let (mut tcp, io) = manager().await;
         let client = Ipv4Addr::new(198, 18, 0, 1);
         let target = Ipv4Addr::new(127, 0, 0, 1);
         let (cport, tport) = (40000u16, 1u16);
         tcp.handle_packet(&client_packet(client, target, cport, tport, 1000, 0, SYN, &[]));
         tcp.handle_packet(&client_packet(client, target, cport, tport, 1001, 1, ACK, &[]));
-        io.lock().unwrap().out.clear();
-        tcp.handle_packet(&client_packet(
-            client, target, cport, tport, 1001, 1, FIN | ACK, &[],
-        ));
-        assert!(tcp.flows.is_empty(), "flow should be gone after FIN");
+        let pkt = client_packet(client, target, cport, tport, 1001, 1, PSH | ACK, b"hello");
+        tcp.handle_packet(&pkt);
+        tcp.handle_packet(&pkt); // retransmission of the same segment
+        let key = *tcp.flows.keys().next().unwrap();
+        assert_eq!(tcp.flows[&key].to_net.len(), 5, "duplicate bytes must be dropped");
+        let _ = io;
+    }
+
+    #[tokio::test]
+    async fn syn_ack_carries_mss_option() {
+        let (mut tcp, io) = manager().await;
+        let client = Ipv4Addr::new(198, 18, 0, 1);
+        let target = Ipv4Addr::new(1, 1, 1, 1);
+        tcp.handle_packet(&client_packet(client, target, 40000, 443, 1000, 0, SYN, &[]));
+        let out = io.lock().unwrap().out.clone();
+        let reply = parse_tcp(&out, 20).expect("valid tcp");
+        assert_eq!(reply.data_offset, 24, "SYN-ACK must carry 4 bytes of options");
+        assert_eq!(&out[20 + 20..20 + 24], &[2, 4, 0x05, 0xb4], "MSS option = 1460");
     }
 }
