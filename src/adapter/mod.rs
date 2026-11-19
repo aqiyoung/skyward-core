@@ -24,6 +24,7 @@ pub mod tls;
 pub mod trojan;
 pub mod vless;
 pub mod vmess;
+pub mod ws;
 
 use http_proxy::HttpOutbound;
 use shadowsocks::ShadowsocksOutbound;
@@ -300,6 +301,8 @@ pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
                             def.tls.unwrap_or(false),
                             def.tls_server_name(),
                             verify,
+                            def.network.as_deref(),
+                            def.ws_opts.as_ref(),
                         ),
                         _ => None,
                     };
@@ -316,9 +319,14 @@ pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
                             server,
                             port,
                             uuid,
-                            def.tls.unwrap_or(false),
+                            // mihomo nodes spell TLS either `tls: true` or
+                            // `security: tls`; accept both.
+                            def.tls.unwrap_or(false)
+                                || def.security.as_deref() == Some("tls"),
                             def.tls_server_name(),
                             verify,
+                            def.network.as_deref(),
+                            def.ws_opts.as_ref(),
                         ),
                         _ => None,
                     };

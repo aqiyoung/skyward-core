@@ -1,6 +1,7 @@
 //! VMess AEAD outbound (security aes-128-gcm / chacha20-poly1305), ported from
 //! `transport/vmess`. The legacy (non-AEAD) auth and alter-id rotation are not
-//! implemented; UDP and the HTTP/WS/H2 transport wrappers are out of scope.
+//! implemented; UDP and the HTTP/H2 transport wrappers are out of scope. The
+//! WebSocket wrapper (`network: ws`) is supported via `adapter::ws`.
 
 use std::io;
 use std::net::IpAddr;
@@ -21,9 +22,11 @@ use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
-use crate::adapter::tls::connect_tls;
+use crate::adapter::tls::{connect_tls, connect_tls_http1};
+use crate::adapter::ws::connect_ws;
 use crate::adapter::{BoxedStream, Outbound};
 use crate::common::TargetAddr;
+use crate::config::WsOpts;
 
 const VERSION: u8 = 0x01;
 const OPTION_CHUNK_STREAM: u8 = 0x01;
@@ -516,6 +519,10 @@ pub struct VmessOutbound {
     use_tls: bool,
     sni: String,
     verify: bool,
+    use_ws: bool,
+    ws_path: String,
+    ws_host: String,
+    ws_headers: Vec<(String, String)>,
 }
 
 impl VmessOutbound {
@@ -528,6 +535,8 @@ impl VmessOutbound {
         use_tls: bool,
         sni: Option<&str>,
         verify: bool,
+        network: Option<&str>,
+        ws_opts: Option<&WsOpts>,
     ) -> Option<Self> {
         let uuid = parse_uuid(uuid)?;
         let security = match security.to_ascii_lowercase().as_str() {
@@ -540,7 +549,38 @@ impl VmessOutbound {
             Ok(ip) => TargetAddr::Ip(ip, port),
             Err(_) => TargetAddr::Domain(server.to_string(), port),
         };
-        Some(Self { name: name.to_string(), server, uuid, security, use_tls, sni, verify })
+        let use_ws = network.map(|n| n.eq_ignore_ascii_case("ws")).unwrap_or(false);
+        let (ws_path, ws_host, ws_headers) = if use_ws {
+            let path = ws_opts
+                .and_then(|w| w.path.clone())
+                .unwrap_or_else(|| "/".to_string());
+            let headers: Vec<(String, String)> = ws_opts
+                .and_then(|w| w.headers.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            let host = headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| sni.clone());
+            (path, host, headers)
+        } else {
+            (String::new(), String::new(), Vec::new())
+        };
+        Some(Self {
+            name: name.to_string(),
+            server,
+            uuid,
+            security,
+            use_tls,
+            sni,
+            verify,
+            use_ws,
+            ws_path,
+            ws_host,
+            ws_headers,
+        })
     }
 }
 
@@ -592,10 +632,19 @@ impl Outbound for VmessOutbound {
             .as_secs() as i64);
 
         let mut stream: BoxedStream = if self.use_tls {
-            connect_tls(&self.sni, tcp, self.verify).await?
+            if self.use_ws {
+                connect_tls_http1(&self.sni, tcp, self.verify).await?
+            } else {
+                connect_tls(&self.sni, tcp, self.verify).await?
+            }
         } else {
             Box::new(tcp)
         };
+        if self.use_ws {
+            stream = Box::new(
+                connect_ws(stream, &self.ws_host, &self.ws_path, &self.ws_headers).await?,
+            );
+        }
         stream.write_all(&header).await?;
         read_response_header(&mut stream, &resp_key, &resp_iv, resp_v).await?;
 

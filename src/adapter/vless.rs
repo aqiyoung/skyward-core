@@ -1,7 +1,7 @@
 //! VLESS outbound: UUID request header, optional TLS, response handshake.
 //!
-//! Mirrors `transport/vless/conn.go`. XTLS / REALITY flows and UDP are not
-//! implemented; this covers the common TCP shape with no addons.
+//! Mirrors `transport/vless/conn.go`. TCP and WebSocket (`network: ws`)
+//! transports are covered; XTLS / REALITY flows and UDP are not implemented.
 
 use std::io;
 use std::net::IpAddr;
@@ -10,9 +10,11 @@ use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::adapter::tls::connect_tls;
+use crate::adapter::tls::{connect_tls, connect_tls_http1};
+use crate::adapter::ws::connect_ws;
 use crate::adapter::{BoxedStream, Outbound};
 use crate::common::TargetAddr;
+use crate::config::WsOpts;
 
 const VERSION: u8 = 0x00;
 const COMMAND_TCP: u8 = 0x01;
@@ -69,6 +71,10 @@ pub struct VlessOutbound {
     use_tls: bool,
     sni: String,
     verify: bool,
+    use_ws: bool,
+    ws_path: String,
+    ws_host: String,
+    ws_headers: Vec<(String, String)>,
 }
 
 impl VlessOutbound {
@@ -80,14 +86,46 @@ impl VlessOutbound {
         use_tls: bool,
         sni: Option<&str>,
         verify: bool,
+        network: Option<&str>,
+        ws_opts: Option<&WsOpts>,
     ) -> Option<Self> {
         let uuid = parse_uuid(uuid)?;
         let sni = sni.filter(|s| !s.is_empty()).unwrap_or(server).to_string();
-        let server = match server.parse::<IpAddr>() {
+        let server_addr = match server.parse::<IpAddr>() {
             Ok(ip) => TargetAddr::Ip(ip, port),
             Err(_) => TargetAddr::Domain(server.to_string(), port),
         };
-        Some(Self { name: name.to_string(), server, uuid, use_tls, sni, verify })
+        let use_ws = network.map(|n| n.eq_ignore_ascii_case("ws")).unwrap_or(false);
+        let (ws_path, ws_host, ws_headers) = if use_ws {
+            let path = ws_opts
+                .and_then(|w| w.path.clone())
+                .unwrap_or_else(|| "/".to_string());
+            let headers: Vec<(String, String)> = ws_opts
+                .and_then(|w| w.headers.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            let host = headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| sni.clone());
+            (path, host, headers)
+        } else {
+            (String::new(), String::new(), Vec::new())
+        };
+        Some(Self {
+            name: name.to_string(),
+            server: server_addr,
+            uuid,
+            use_tls,
+            sni,
+            verify,
+            use_ws,
+            ws_path,
+            ws_host,
+            ws_headers,
+        })
     }
 }
 
@@ -131,10 +169,22 @@ impl Outbound for VlessOutbound {
                     self.verify
                 ));
             }
-            connect_tls(&self.sni, tcp, self.verify).await?
+            // A WebSocket upgrade is HTTP/1.1; offering h2 in ALPN could make
+            // the server negotiate HTTP/2 and reject the upgrade outright.
+            if self.use_ws {
+                connect_tls_http1(&self.sni, tcp, self.verify).await?
+            } else {
+                connect_tls(&self.sni, tcp, self.verify).await?
+            }
         } else {
             Box::new(tcp)
         };
+
+        if self.use_ws {
+            stream = Box::new(
+                connect_ws(stream, &self.ws_host, &self.ws_path, &self.ws_headers).await?,
+            );
+        }
 
         stream.write_all(&encode_request(&self.uuid, target)).await?;
 
@@ -196,12 +246,38 @@ mod tests {
 
     #[test]
     fn tls_and_sni_defaults() {
-        let plain = VlessOutbound::try_new("v", "example.com", 443, "b831381d-6324-4d53-ad4f-8cda48b30811", false, None, true).unwrap();
+        let plain = VlessOutbound::try_new("v", "example.com", 443, "b831381d-6324-4d53-ad4f-8cda48b30811", false, None, true, None, None).unwrap();
         assert!(!plain.use_tls);
+        assert!(!plain.use_ws);
         assert_eq!(plain.sni, "example.com");
-        let secured = VlessOutbound::try_new("v", "example.com", 443, "b831381d63244d53ad4f8cda48b30811", true, Some("cdn.example.com"), true).unwrap();
+        let secured = VlessOutbound::try_new("v", "example.com", 443, "b831381d63244d53ad4f8cda48b30811", true, Some("cdn.example.com"), true, None, None).unwrap();
         assert!(secured.use_tls);
         assert_eq!(secured.sni, "cdn.example.com");
-        assert!(VlessOutbound::try_new("v", "h", 443, "bad", true, None, true).is_none());
+        assert!(VlessOutbound::try_new("v", "h", 443, "bad", true, None, true, None, None).is_none());
+        // WS transport picks up the path and the Host header from ws-opts.
+        let ws_opts = WsOpts {
+            path: Some("/ray".into()),
+            headers: Some(
+                [("Host".to_string(), "cdn.example.com".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let ws = VlessOutbound::try_new(
+            "v",
+            "example.com",
+            443,
+            "b831381d-6324-4d53-ad4f-8cda48b30811",
+            true,
+            None,
+            true,
+            Some("ws"),
+            Some(&ws_opts),
+        )
+        .unwrap();
+        assert!(ws.use_ws);
+        assert_eq!(ws.ws_path, "/ray");
+        assert_eq!(ws.ws_host, "cdn.example.com");
     }
 }
