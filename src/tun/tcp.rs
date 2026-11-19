@@ -265,7 +265,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
         let from_net = flow.from_net.clone();
         let cancel = flow.cancel.clone();
         let done = flow.done.clone();
-        let engine = self.engine.clone();
+        let fallback_engine = self.engine.clone();
         let io = self.io.clone();
         // If the destination is a fake-ip we handed out in DNS, recover the
         // original hostname so rules match by domain and proxies receive the
@@ -278,6 +278,14 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
         // log export names the site a flow belongs to.
         let addr = target.address();
         tokio::spawn(async move {
+            // Use the engine that is current NOW, not the one the TUN started
+            // with: setupConfig swaps the engine when the profile changes,
+            // and the App does not restart the TUN for that. Capturing the
+            // start engine would route new flows through the previous
+            // profile's nodes indefinitely.
+            let engine = crate::runtime_state::engine()
+                .await
+                .unwrap_or(fallback_engine);
             // Rules and the chain are decided before dialling so the connection
             // the App lists names the same route the packet actually took.
             let rule = engine.decide(&target).await;
