@@ -226,15 +226,33 @@ impl Config {
         if !MODES.contains(&self.mode.as_str()) {
             anyhow::bail!("invalid mode '{}' (expected rule/direct/global)", self.mode);
         }
-        let mut names: Vec<&str> = vec!["DIRECT", "REJECT", "GLOBAL"];
-        names.extend(self.proxies.iter().map(|p| p.name.as_str()));
-        names.extend(self.proxy_groups.iter().map(|g| g.name.as_str()));
-        for (i, name) in names.iter().enumerate() {
+        // mihomo keys proxies and groups by name and lets a later entry replace
+        // an earlier one, so a repeat is a warning here rather than a load
+        // failure. Real subscriptions rely on it: naming a group GLOBAL (a
+        // built-in group) or reusing a proxy's name parses fine there, and
+        // rejecting it left the core with no config at all.
+        let mut seen: Vec<&str> = vec!["DIRECT", "REJECT", "GLOBAL"];
+        for (i, name) in self.proxies.iter().map(|p| p.name.as_str()).enumerate() {
             if name.is_empty() {
                 anyhow::bail!("proxy name at index {} is empty", i);
             }
-            if names[..i].contains(name) {
-                anyhow::bail!("duplicate proxy/group name '{}'", name);
+            if seen.contains(&name) {
+                tracing::warn!("duplicate proxy name '{}' (the last one wins, as mihomo does)", name);
+            } else {
+                seen.push(name);
+            }
+        }
+        for (i, name) in self.proxy_groups.iter().map(|g| g.name.as_str()).enumerate() {
+            if name.is_empty() {
+                anyhow::bail!("proxy group name at index {} is empty", i);
+            }
+            if seen.contains(&name) {
+                tracing::warn!(
+                    "proxy group '{}' shares its name with a proxy or a built-in group (mihomo allows this)",
+                    name
+                );
+            } else {
+                seen.push(name);
             }
         }
         Ok(())
@@ -289,13 +307,21 @@ rules:
     }
 
     #[test]
-    fn rejects_duplicate_proxy_names() {
+    fn duplicate_names_load_like_mihomo() {
+        // A group named GLOBAL is a built-in group's name; mihomo accepts it.
+        let yaml = r#"
+proxy-groups:
+  - {name: GLOBAL, type: select, proxies: [DIRECT]}
+"#;
+        assert!(Config::from_str(yaml).is_ok());
+        // A repeated proxy name is last-wins, not a load failure.
         let yaml = r#"
 proxies:
   - {name: dup, type: ss, server: a, port: 1}
   - {name: dup, type: ss, server: b, port: 2}
 "#;
-        assert!(Config::from_str(yaml).is_err());
+        let c = Config::from_str(yaml).unwrap();
+        assert_eq!(c.proxies.len(), 2);
     }
 
     #[test]

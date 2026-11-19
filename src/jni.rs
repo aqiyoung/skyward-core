@@ -371,12 +371,36 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
     }
 }
 
-/// Build a minimal engine for the relay loop. Once `setupConfig` is ported it
-/// will build from the real config; this keeps the TUN path runnable now.
+/// Build the engine the relay loop uses when no config has been applied yet.
+/// The App writes the assembled profile to `<home>/config.yaml`, so prefer that
+/// over the built-in DIRECT-only default: a profile that failed to apply would
+/// otherwise leave the tunnel silently routing everything straight out.
 async fn build_default_engine() -> Arc<crate::tunnel::Engine> {
-    let config = crate::config::Config::default();
+    let home = crate::mobile::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let config_path = home.join("config.yaml");
+    let config = match std::fs::read_to_string(&config_path) {
+        Ok(text) => match crate::config::Config::from_str(&text) {
+            Ok(c) => {
+                emit_log_event(&format!(
+                    "[rust-core] startTun: no engine yet, loaded {}",
+                    config_path.display()
+                ));
+                c
+            }
+            Err(e) => {
+                emit_log_event(&format!(
+                    "[rust-core] startTun: {} did not parse ({}), using DIRECT-only default",
+                    config_path.display(),
+                    e
+                ));
+                crate::config::Config::default()
+            }
+        },
+        Err(_) => crate::config::Config::default(),
+    };
     let traffic = crate::runtime_state::traffic();
-    Arc::new(crate::tunnel::Engine::new(config, traffic, std::path::Path::new(".")).await)
+    let data_dir = config_path.parent().map(|p| p.to_path_buf()).unwrap_or(home);
+    Arc::new(crate::tunnel::Engine::new(config, traffic, &data_dir).await)
 }
 
 fn traffic_json(total: bool) -> String {

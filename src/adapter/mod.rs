@@ -368,6 +368,17 @@ impl OutboundManager {
         let mut global_members: Vec<String> = config.proxies.iter().map(|p| p.name.clone()).collect();
         global_members.push("DIRECT".into());
         let mut groups: HashMap<String, GroupState> = HashMap::new();
+        // GLOBAL is a synthetic group over every named proxy, like mihomo. It
+        // goes in first so a config that defines its own GLOBAL replaces it,
+        // which is what mihomo does.
+        groups.insert("GLOBAL".into(), GroupState {
+            name: "GLOBAL".into(),
+            kind: "select".into(),
+            members: global_members,
+            url: None,
+            cursor: AtomicUsize::new(0),
+            explicit: AtomicBool::new(false),
+        });
         for g in &config.proxy_groups {
             groups.insert(g.name.clone(), GroupState {
                 name: g.name.clone(),
@@ -378,14 +389,6 @@ impl OutboundManager {
                 explicit: AtomicBool::new(false),
             });
         }
-        groups.insert("GLOBAL".into(), GroupState {
-            name: "GLOBAL".into(),
-            kind: "select".into(),
-            members: global_members,
-            url: None,
-            cursor: AtomicUsize::new(0),
-            explicit: AtomicBool::new(false),
-        });
 
         // Some subscriptions express url-test/fallback membership through a
         // construct our minimal schema doesn't expand, leaving the group's
@@ -556,5 +559,15 @@ mod tests {
         // A concrete outbound resolves to itself.
         assert_eq!(manager.resolve("n1").await, "n1");
         assert_eq!(manager.resolve("DIRECT").await, "DIRECT");
+    }
+
+    #[test]
+    fn config_global_group_replaces_the_synthetic_one() {
+        let config = crate::config::Config::from_str(
+            "proxies:\n  - {name: n1, type: direct}\nproxy-groups:\n  - {name: GLOBAL, type: select, proxies: [n1]}\n",
+        ).unwrap();
+        let manager = OutboundManager::new(&config);
+        let global = manager.groups.get("GLOBAL").expect("GLOBAL group");
+        assert_eq!(global.members, vec!["n1".to_string()]);
     }
 }
