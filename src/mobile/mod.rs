@@ -380,29 +380,44 @@ fn handle_outbound_ip(call: &MethodCall) -> Vec<u8> {
 
 fn handle_memory_stats(call: &MethodCall) -> Vec<u8> {
     let rss = process_mem_kb("VmRSS:").unwrap_or(0) * 1024;
-    // The App (Android, core-in-process) computes app = rss - runtimeTotal and
-    // coreTotal = runtimeTotal. Report a plausible split so the dashboard can
-    // distinguish app/core memory instead of showing app 0B / core 100%.
-    let data_kb = process_mem_kb("VmData:").unwrap_or(0);
-    let core_heap = (data_kb * 1024).min(rss.saturating_sub(1024 * 1024));
-    // Split the core footprint across the buckets the App displays; keep a
-    // small device_total so `hasBudget` is true and the card renders fully.
-    let heap_inuse = core_heap * 75 / 100;
-    let heap_idle = core_heap * 20 / 100;
-    let stack_inuse = core_heap * 4 / 100;
-    let runtime_other = core_heap.saturating_sub(heap_inuse + heap_idle + stack_inuse);
-    let budget: i64 = (rss.max(512 * 1024 * 1024)) as i64;
-    let device_total: u64 = rss.max(4 * 1024 * 1024 * 1024) as u64;
+    // Report the Rust core's own footprint, the way Go reports runtime.MemStats.
+    // The App carves this out of the process RSS and shows the remainder as the
+    // app, so claiming the whole process here inverted the two numbers.
+    let heap_inuse = crate::alloc::allocated_bytes();
+    // Thread stacks (tokio workers, the TUN relay, the JNI thread) and the
+    // allocator/runtime bookkeeping are not part of the counted heap.
+    let stack_inuse = 4 * 1024 * 1024;
+    let runtime_other = 2 * 1024 * 1024;
+    let heap_idle = 0u64;
+    let device_total = device_mem_total().unwrap_or(4 * 1024 * 1024 * 1024);
+    let budget = (device_total / 4) as i64;
     let result = json!({
-        "rss": rss, "heapInuse": heap_inuse, "heapIdle": heap_idle,
-        "stackInuse": stack_inuse, "runtimeOther": runtime_other,
-        "budget": budget, "gcPercent": 100i32, "deviceTotal": device_total,
+        "rss": rss,
+        "heapInuse": heap_inuse,
+        "heapIdle": heap_idle,
+        "stackInuse": stack_inuse,
+        "runtimeOther": runtime_other,
+        "budget": budget,
+        "gcPercent": 0i32,
+        "deviceTotal": device_total,
     });
     crate::jni::emit_log_event(&format!(
         "[rust-core] memory rss={} core_heap={} returning={}",
-        rss, core_heap, result
+        rss, heap_inuse, result
     ));
     ok(&call.id, result)
+}
+
+/// Total physical RAM, from `/proc/meminfo` (0 when unreadable).
+fn device_mem_total() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
 }
 
 /// Read a kB-valued field from /proc/self/status (e.g. "VmRSS:").

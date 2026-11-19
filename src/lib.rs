@@ -1,6 +1,7 @@
 //! skyward-core (Rust) — a mihomo-compatible proxy kernel, rewritten incrementally.
 
 pub mod adapter;
+pub mod alloc;
 pub mod common;
 pub mod config;
 pub mod dns;
@@ -20,6 +21,9 @@ pub mod tun;
 
 // Re-export for the REST controller.
 pub use tunnel::connection::{ConnectionInfo, Network};
+
+#[global_allocator]
+static GLOBAL: crate::alloc::Counting = crate::alloc::Counting;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
