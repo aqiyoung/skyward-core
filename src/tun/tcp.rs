@@ -161,6 +161,8 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                 } else {
                     let n = payload.len() as u32;
                     flow.client_next = flow.client_next.wrapping_add(n);
+                    // Application bytes leaving the device toward the network.
+                    self.engine.traffic.add_upload(payload.len() as u64);
                     flow.to_net.push(payload);
                     Some((flow.local_next, flow.client_next, false))
                 }
@@ -192,6 +194,8 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             if n > 0 {
                 let seq = flow.local_next;
                 let ack = flow.client_next;
+                // Application bytes arriving from the network into the device.
+                self.engine.traffic.add_download(n as u64);
                 self.send(key, seq, ack, PSH | ACK, &buf[..n]);
                 if let Some(flow) = self.flows.get_mut(&key) {
                     flow.local_next = flow.local_next.wrapping_add(n as u32);
