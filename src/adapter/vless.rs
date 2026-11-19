@@ -118,6 +118,19 @@ impl Outbound for VlessOutbound {
         })?;
 
         let mut stream: BoxedStream = if self.use_tls {
+            // Name the server name and verification mode: a handshake the server
+            // rejects looks identical for a wrong SNI and for a strict verifier.
+            static DIAG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+                crate::jni::emit_log_event(&format!(
+                    "[rust-core] vless {} -> {}:{} sni={} verify={}",
+                    self.name,
+                    self.server.address(),
+                    self.server.port(),
+                    self.sni,
+                    self.verify
+                ));
+            }
             connect_tls(&self.sni, tcp, self.verify).await?
         } else {
             Box::new(tcp)

@@ -251,6 +251,7 @@ mod tests {
             tls: None,
             server_name: None,
             skip_cert_verify: None,
+            ..Default::default()
         }
     }
 

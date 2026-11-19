@@ -125,6 +125,36 @@ pub async fn apply_config_from_path(path: &str) -> Result<(), String> {
         config.rules.len(),
         config.proxy_providers.len()
     ));
+    // A node whose transport or TLS settings we do not map still builds an
+    // outbound, then fails the handshake with no hint why. Name what each kind
+    // asked for (secrets redacted) so a subscription's shape is visible.
+    {
+        let mut kinds: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for p in &config.proxies {
+            *kinds.entry(p.kind.clone()).or_insert(0) += 1;
+        }
+        log(&format!("apply_config: proxy kinds {:?}", kinds));
+        for p in &config.proxies {
+            let network = p.network.as_deref().unwrap_or("tcp");
+            if network != "tcp" || p.security.is_some() || p.reality_opts.is_some() {
+                log(&format!(
+                    "apply_config: node {:?} kind={} server={:?}:{:?} network={} tls={:?} security={:?} flow={:?} sni={:?} reality={:?} ws={:?} grpc={:?}",
+                    p.name,
+                    p.kind,
+                    p.server,
+                    p.port,
+                    network,
+                    p.tls,
+                    p.security,
+                    p.flow,
+                    p.sni.as_deref().or(p.servername.as_deref()).or(p.server_name.as_deref()),
+                    p.reality_opts.as_ref().map(|r| (r.public_key.is_some(), r.short_id.is_some())),
+                    p.ws_opts.as_ref().and_then(|w| w.path.clone()),
+                    p.grpc_opts.as_ref().and_then(|g| g.service_name.clone()),
+                ));
+            }
+        }
+    }
     let data_dir = config_path
         .parent()
         .map(|p| p.to_path_buf())

@@ -64,7 +64,7 @@ impl Default for Config {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct ProxyDef {
     pub name: String,
     #[serde(rename = "type")]
@@ -83,8 +83,64 @@ pub struct ProxyDef {
     pub tls: Option<bool>,
     #[serde(rename = "server-name")]
     pub server_name: Option<String>,
+    /// mihomo spells the TLS server name `servername` (no dash).
+    pub servername: Option<String>,
     #[serde(rename = "skip-cert-verify")]
     pub skip_cert_verify: Option<bool>,
+    /// Transport: `tcp` (default), `ws`, `grpc`, `h2`, `quic`, `http`.
+    pub network: Option<String>,
+    /// VLESS/VMess flow, e.g. `xtls-rprx-vision`.
+    pub flow: Option<String>,
+    /// VLESS security: `none`, `tls`, `reality`.
+    pub security: Option<String>,
+    #[serde(rename = "client-fingerprint")]
+    pub client_fingerprint: Option<String>,
+    pub fingerprint: Option<String>,
+    #[serde(rename = "reality-opts")]
+    pub reality_opts: Option<RealityOpts>,
+    #[serde(rename = "ws-opts")]
+    pub ws_opts: Option<WsOpts>,
+    #[serde(rename = "grpc-opts")]
+    pub grpc_opts: Option<GrpcOpts>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RealityOpts {
+    #[serde(default)]
+    pub public_key: Option<String>,
+    #[serde(default)]
+    pub short_id: Option<String>,
+    #[serde(default)]
+    pub spider_x: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct WsOpts {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub headers: Option<HashMap<String, String>>,
+    #[serde(rename = "max-early-data", default)]
+    pub max_early_data: Option<u64>,
+    #[serde(rename = "early-data-header-name", default)]
+    pub early_data_header_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct GrpcOpts {
+    #[serde(rename = "grpc-service-name", default)]
+    pub service_name: Option<String>,
+}
+
+impl ProxyDef {
+    /// The TLS server name the node asks for. mihomo spells it `servername`;
+    /// `sni` and `server-name` appear in older/other configs.
+    pub fn tls_server_name(&self) -> Option<&str> {
+        self.sni
+            .as_deref()
+            .or(self.servername.as_deref())
+            .or(self.server_name.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
