@@ -27,24 +27,46 @@ pub async fn run<T>(
 ) where
     T: Read + Write + Send + 'static,
 {
-    let _ = &config;
     let io = Arc::new(Mutex::new(device.io));
     let mut tcp = TcpManager::new(engine, io.clone());
+    tcp.set_mtu(config.options.mtu);
     let mut buf = vec![0u8; 65536];
 
     loop {
-        let read = {
-            let mut guard = io.lock().unwrap();
-            guard.read(&mut buf)
-        };
-        match read {
-            Ok(0) => {}
-            Ok(n) => handle_packet(&buf[..n], &mut tcp, &io),
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            Err(_) => {}
+        // Drain every packet the device has queued before sleeping: reading
+        // a single packet per cycle and then sleeping 10 ms capped the TUN
+        // at ~100 packets/s, which strangles ACK clocking and throughput.
+        let mut drained = 0usize;
+        loop {
+            let read = {
+                let mut guard = io.lock().unwrap();
+                guard.read(&mut buf)
+            };
+            match read {
+                Ok(n) if n > 0 => {
+                    handle_packet(&buf[..n], &mut tcp, &io);
+                    drained += 1;
+                    if drained >= 512 {
+                        break;
+                    }
+                }
+                _ => break,
+            }
         }
 
         tcp.pump();
+
+        if drained > 0 {
+            // Busy: loop again immediately, but still honour cancellation.
+            tokio::select! {
+                _ = std::future::ready(()) => {}
+                _ = cancel.notified() => {
+                    tcp.shutdown();
+                    return;
+                }
+            }
+            continue;
+        }
 
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(10)) => {}

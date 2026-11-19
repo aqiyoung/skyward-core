@@ -77,6 +77,11 @@ pub struct TcpManager<T> {
     flows: HashMap<FlowKey, Flow>,
     engine: Arc<Engine>,
     io: Arc<Mutex<T>>,
+    /// Largest payload one packet written back to the TUN may carry: the
+    /// interface MTU minus the IPv4+TCP headers. A larger packet is dropped
+    /// by the kernel, and this stack keeps no retransmission state, so the
+    /// bytes would be lost for good and the flow would stall.
+    mtu_payload: usize,
 }
 
 impl<T: Read + Write + Send + 'static> TcpManager<T> {
@@ -85,7 +90,13 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             flows: HashMap::new(),
             engine,
             io,
+            mtu_payload: 1460,
         }
+    }
+
+    /// Set the payload cap from the TUN interface MTU.
+    pub fn set_mtu(&mut self, mtu: usize) {
+        self.mtu_payload = mtu.saturating_sub(40).max(536);
     }
 
     /// Handle one raw IPv4 packet read from the TUN.
@@ -188,17 +199,37 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             }
         }
         for (key, _) in ready {
-            let Some(flow) = self.flows.get(&key) else { continue };
-            let mut buf = vec![0u8; 16 * 1024];
-            let n = flow.from_net.pop(&mut buf);
-            if n > 0 {
-                let seq = flow.local_next;
-                let ack = flow.client_next;
+            // Work on a cloned queue handle so the flow map stays borrow-free
+            // while sequence numbers are updated between packets.
+            let Some(from_net) = self.flows.get(&key).map(|f| f.from_net.clone()) else {
+                continue;
+            };
+            // One packet per pop, capped at the interface MTU (see
+            // `mtu_payload`): anything larger is dropped by the kernel and
+            // the bytes would never reach the app.
+            let mut buf = vec![0u8; self.mtu_payload];
+            // Drain the flow's queue in MTU-sized packets (bounded per pump
+            // so one busy flow cannot starve the others).
+            for _ in 0..256 {
+                let n = from_net.pop(&mut buf);
+                if n == 0 {
+                    break;
+                }
+                let Some((seq, ack)) = self
+                    .flows
+                    .get(&key)
+                    .map(|f| (f.local_next, f.client_next))
+                else {
+                    break;
+                };
                 // Application bytes arriving from the network into the device.
                 self.engine.traffic.add_download(n as u64);
                 self.send(key, seq, ack, PSH | ACK, &buf[..n]);
                 if let Some(flow) = self.flows.get_mut(&key) {
                     flow.local_next = flow.local_next.wrapping_add(n as u32);
+                }
+                if from_net.is_empty() {
+                    break;
                 }
             }
         }
@@ -564,6 +595,16 @@ mod tests {
         );
         let io = Arc::new(Mutex::new(TestIo { out: Vec::new() }));
         (TcpManager::new(engine, io.clone()), io)
+    }
+
+    #[tokio::test]
+    async fn mtu_cap_subtracts_headers() {
+        let (mut tcp, _io) = manager().await;
+        assert_eq!(tcp.mtu_payload, 1460);
+        tcp.set_mtu(9000);
+        assert_eq!(tcp.mtu_payload, 8960);
+        tcp.set_mtu(576);
+        assert_eq!(tcp.mtu_payload, 536);
     }
 
     #[tokio::test]
