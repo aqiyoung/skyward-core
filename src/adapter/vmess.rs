@@ -317,6 +317,21 @@ struct AeadStream {
     expect_payload: bool,
     plain: Vec<u8>,
     plain_off: usize,
+
+    // The AEAD response header is consumed lazily on the first read:
+    // servers attach it to the first response chunk rather than sending it
+    // as soon as the request lands, so reading it inside connect() would
+    // deadlock the same way as VLESS's eager header read did.
+    resp_key: [u8; 16],
+    resp_v: u8,
+    resp_header_done: bool,
+    /// Set once the terminating empty chunk has been decrypted: VMess marks
+    /// end of stream with a chunk whose plaintext is empty.
+    read_eof: bool,
+    resp_len_buf: [u8; 18],
+    resp_len_filled: usize,
+    resp_body: Vec<u8>,
+    resp_body_filled: usize,
 }
 
 impl AeadStream {
@@ -326,6 +341,8 @@ impl AeadStream {
         write_iv: [u8; 16],
         read_cipher: BodyCipher,
         read_iv: [u8; 16],
+        resp_key: [u8; 16],
+        resp_v: u8,
     ) -> Self {
         Self {
             inner,
@@ -346,7 +363,63 @@ impl AeadStream {
             expect_payload: false,
             plain: Vec::new(),
             plain_off: 0,
+            resp_key,
+            resp_v,
+            resp_header_done: false,
+            read_eof: false,
+            resp_len_buf: [0u8; 18],
+            resp_len_filled: 0,
+            resp_body: Vec::new(),
+            resp_body_filled: 0,
         }
+    }
+
+    /// Consume the AEAD response header. Ready(Ok) once it has been read
+    /// and verified; the body chunk reader runs only after this succeeds.
+    fn poll_consume_resp_header(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.resp_header_done {
+            return Poll::Ready(Ok(()));
+        }
+        match poll_read_exact(&mut self.inner, cx, &mut self.resp_len_buf, &mut self.resp_len_filled) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => {}
+        }
+        if self.resp_body.is_empty() {
+            // resp_iv for the header KDFs is the stream's read_iv.
+            let len_key = kdf(&self.resp_key, &[b"AEAD Resp Header Len Key"]);
+            let len_iv = kdf(&self.read_iv, &[b"AEAD Resp Header Len IV"]);
+            let length_plain =
+                match aes_gcm_decrypt(&len_key[..16], &len_iv[..12], &self.resp_len_buf, &[]) {
+                    Ok(v) => v,
+                    Err(e) => return Poll::Ready(Err(e)),
+                };
+            if length_plain.len() < 2 {
+                return Poll::Ready(Err(aead_error()));
+            }
+            let length = u16::from_be_bytes([length_plain[0], length_plain[1]]) as usize;
+            self.resp_body = vec![0u8; length + TAG_LEN];
+            self.resp_body_filled = 0;
+        }
+        match poll_read_exact(&mut self.inner, cx, &mut self.resp_body, &mut self.resp_body_filled) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => {}
+        }
+        let key = kdf(&self.resp_key, &[b"AEAD Resp Header Key"]);
+        let iv = kdf(&self.read_iv, &[b"AEAD Resp Header IV"]);
+        let plain = match aes_gcm_decrypt(&key[..16], &iv[..12], &self.resp_body, &[]) {
+            Ok(v) => v,
+            Err(e) => return Poll::Ready(Err(e)),
+        };
+        if plain.len() < 4 || plain[0] != self.resp_v || plain[2] != 0 {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected VMess response header",
+            )));
+        }
+        self.resp_header_done = true;
+        Poll::Ready(Ok(()))
     }
 
     fn encrypt_chunk(&mut self, data: &[u8]) -> io::Result<Vec<u8>> {
@@ -377,6 +450,11 @@ impl AeadStream {
 impl AsyncRead for AeadStream {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        match this.poll_consume_resp_header(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => {}
+        }
         loop {
             if this.plain_off < this.plain.len() {
                 let n = buf.remaining().min(this.plain.len() - this.plain_off);
@@ -386,6 +464,10 @@ impl AsyncRead for AeadStream {
             }
             this.plain.clear();
             this.plain_off = 0;
+
+            if this.read_eof {
+                return Poll::Ready(Ok(()));
+            }
 
             if !this.expect_payload {
                 match poll_read_exact(&mut this.inner, cx, &mut this.size_buf, &mut this.size_filled) {
@@ -416,6 +498,11 @@ impl AsyncRead for AeadStream {
             };
             this.expect_payload = false;
             this.payload_filled = 0;
+            if this.plain.is_empty() {
+                // Terminating empty chunk: clean end of stream, not an error.
+                this.read_eof = true;
+                return Poll::Ready(Ok(()));
+            }
         }
     }
 }
@@ -469,33 +556,6 @@ impl AsyncWrite for AeadStream {
             Poll::Ready(Ok(())) => Pin::new(&mut this.inner).poll_shutdown(cx),
         }
     }
-}
-
-async fn read_response_header(
-    tcp: &mut BoxedStream,
-    resp_key: &[u8; 16],
-    resp_iv: &[u8; 16],
-    resp_v: u8,
-) -> io::Result<()> {
-    let len_key = kdf(resp_key, &[b"AEAD Resp Header Len Key"]);
-    let len_iv = kdf(resp_iv, &[b"AEAD Resp Header Len IV"]);
-    let mut encrypted_length = [0u8; 18];
-    tcp.read_exact(&mut encrypted_length).await?;
-    let length_plain = aes_gcm_decrypt(&len_key[..16], &len_iv[..12], &encrypted_length, &[])?;
-    if length_plain.len() < 2 {
-        return Err(aead_error());
-    }
-    let length = u16::from_be_bytes([length_plain[0], length_plain[1]]) as usize;
-
-    let key = kdf(resp_key, &[b"AEAD Resp Header Key"]);
-    let iv = kdf(resp_iv, &[b"AEAD Resp Header IV"]);
-    let mut encrypted = vec![0u8; length + TAG_LEN];
-    tcp.read_exact(&mut encrypted).await?;
-    let plain = aes_gcm_decrypt(&key[..16], &iv[..12], &encrypted, &[])?;
-    if plain.len() < 4 || plain[0] != resp_v || plain[2] != 0 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected VMess response header"));
-    }
-    Ok(())
 }
 
 fn parse_uuid(text: &str) -> Option<[u8; 16]> {
@@ -646,7 +706,8 @@ impl Outbound for VmessOutbound {
             );
         }
         stream.write_all(&header).await?;
-        read_response_header(&mut stream, &resp_key, &resp_iv, resp_v).await?;
+        // The response header is consumed lazily by AeadStream's first read
+        // (servers send it with the first response chunk, not on request).
 
         let (write_cipher, read_cipher) = match self.security {
             SECURITY_AES_128_GCM => (
@@ -670,6 +731,8 @@ impl Outbound for VmessOutbound {
             req_iv,
             read_cipher,
             resp_iv,
+            resp_key,
+            resp_v,
         )))
     }
 }

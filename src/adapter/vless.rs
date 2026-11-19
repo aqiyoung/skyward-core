@@ -5,6 +5,8 @@
 
 use std::io;
 use std::net::IpAddr;
+use std::pin::Pin;
+use std::task::Poll;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -189,18 +191,123 @@ impl Outbound for VlessOutbound {
         stream.write_all(&encode_request(&self.uuid, target)).await?;
 
         // The server replies with [version, addons_len, addons...] before any
-        // payload. Consume it so the tunnel only relays application bytes.
-        let mut response = [0u8; 2];
-        stream.read_exact(&mut response).await?;
-        if response[0] != VERSION {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected VLESS response version"));
-        }
-        if response[1] > 0 {
-            let mut addons = vec![0u8; response[1] as usize];
-            stream.read_exact(&mut addons).await?;
-        }
+        // payload — but only together with the first payload bytes: servers
+        // (xray, sing-box) attach the response header to the first response
+        // chunk instead of sending it as soon as the request lands. Reading
+        // it eagerly here would deadlock: the caller writes its request only
+        // after connect() returns, and the target answers only after that.
+        // mihomo consumes the header lazily on first read; do the same.
+        Ok(Box::new(VlessStream::new(stream)))
+    }
+}
 
-        Ok(stream)
+/// Byte stream that strips the VLESS response header on its first read.
+struct VlessStream<S> {
+    inner: S,
+    header: [u8; 258],
+    header_filled: usize,
+    /// Bytes to consume: 2 for [version, addons_len], then 2 + addons_len.
+    header_needed: usize,
+    header_done: bool,
+}
+
+impl<S> VlessStream<S> {
+    fn new(inner: S) -> Self {
+        Self {
+            inner,
+            header: [0u8; 258],
+            header_filled: 0,
+            header_needed: 2,
+            header_done: false,
+        }
+    }
+}
+
+impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> VlessStream<S> {
+    fn poll_consume_header(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        while !this.header_done {
+            while this.header_filled < this.header_needed {
+                let start = this.header_filled;
+                let end = this.header_needed;
+                let mut buf = tokio::io::ReadBuf::new(&mut this.header[start..end]);
+                match Pin::new(&mut this.inner).poll_read(cx, &mut buf) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(())) => {
+                        if buf.filled().is_empty() {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "vless: closed before response header",
+                            )));
+                        }
+                        this.header_filled += buf.filled().len();
+                    }
+                }
+            }
+            if this.header_needed == 2 {
+                if this.header[0] != VERSION {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unexpected VLESS response version",
+                    )));
+                }
+                let addons = this.header[1] as usize;
+                if addons == 0 {
+                    this.header_done = true;
+                } else {
+                    this.header_needed = 2 + addons;
+                }
+            } else {
+                this.header_done = true;
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> tokio::io::AsyncRead
+    for VlessStream<S>
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.as_mut().poll_consume_header(cx) {
+            Poll::Ready(Ok(())) => {}
+            other => return other,
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite
+    for VlessStream<S>
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
