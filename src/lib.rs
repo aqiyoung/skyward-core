@@ -5,6 +5,7 @@ pub mod common;
 pub mod config;
 pub mod dns;
 pub mod ffi;
+pub mod fake_ip;
 pub mod fetch;
 pub mod geo;
 pub mod hub;

@@ -233,7 +233,13 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
         let engine = self.engine.clone();
         let io = self.io.clone();
         let addr = key_target_addr(&key).address();
-        let target = key_target_addr(&key);
+        // If the destination is a fake-ip we handed out in DNS, recover the
+        // original hostname so rules match by domain and proxies receive the
+        // real host instead of a synthetic address.
+        let target = match crate::fake_ip::hostname_for(key.target_ip) {
+            Some(host) => TargetAddr::Domain(host, key.target_port),
+            None => TargetAddr::Ip(std::net::IpAddr::V4(key.target_ip), key.target_port),
+        };
         tokio::spawn(async move {
             let mut stream: BoxedStream = tokio::select! {
                 _ = cancel.notified() => return,

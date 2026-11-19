@@ -79,14 +79,14 @@ fn handle_packet<T: Read + Write + Send + 'static>(
     }
 }
 
-/// Answer a DNS query that arrived on the TUN. Resolution runs on a spawned
-/// task because the resolver performs network I/O.
+/// Answer a DNS query that arrived on the TUN with a fake-ip immediately.
 fn handle_dns_packet<T: Read + Write + Send + 'static>(
     packet: &[u8],
     ip: &super::tcp::Ipv4Info,
     engine: &Arc<Engine>,
     io: &Arc<Mutex<T>>,
 ) {
+    let _ = engine;
     let udp = match packet.get(ip.ihl..) {
         Some(u) if u.len() >= 8 => u,
         _ => return,
@@ -103,18 +103,18 @@ fn handle_dns_packet<T: Read + Write + Send + 'static>(
     let name = String::from_utf8_lossy(&qname).into_owned();
     diag(format!("DNS query {} type {}", name, qtype));
 
-    let resolver = engine.resolver.clone();
     let io = io.clone();
     let src_ip = ip.src;
     let dst_ip = ip.dst;
     let query = payload.to_vec();
     tokio::spawn(async move {
-        let answer_ip = match resolver.resolve(&name).await {
-            Ok(addrs) => addrs.into_iter().find(|ip| match qtype {
-                28 => ip.is_ipv6(),
-                _ => ip.is_ipv4(),
-            }),
-            Err(_) => None,
+        // Fake-ip: answer A queries immediately with a synthetic address so the
+        // client never waits on a real DNS round-trip before connecting. The
+        // TCP flow maps the fake address back to this hostname before dialing.
+        let answer_ip = match qtype {
+            1 => Some(std::net::IpAddr::V4(crate::fake_ip::fake_ip_for(&name))),
+            28 => None, // no AAAA fake; clients fall back to IPv4
+            _ => None,
         };
         let response = build_dns_response(&query, answer_ip);
         let packet = crate::tun::tcp::build_udp_packet(src_ip, dst_ip, 53, src_port, &response);
