@@ -218,7 +218,18 @@ impl Engine {
         let outbound = self.outbounds.outbound(&final_name).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("unknown outbound '{}'", final_name))
         })?;
-        outbound.connect(target).await
+        match outbound.connect(target).await {
+            Ok(stream) => Ok(stream),
+            Err(e) => {
+                dial_diag(format!(
+                    "dial {} via {} FAILED: {}",
+                    target.address(),
+                    final_name,
+                    e
+                ));
+                Err(e)
+            }
+        }
     }
 
     /// Dial a target through a specific outbound/group name (used by delay tests).
@@ -255,6 +266,15 @@ impl Engine {
         let result = match outbound {
             Some(outbound) => {
                 match outbound.connect(&target).await {
+                    Err(e) => {
+                        dial_diag(format!(
+                            "dial {} via {} FAILED: {}",
+                            target.address(),
+                            final_name,
+                            e
+                        ));
+                        Err(e)
+                    }
                     Ok(mut remote) => {
                         if !prefix.is_empty() {
                             remote.write_all(prefix).await?;
@@ -271,7 +291,6 @@ impl Engine {
                         let _ = win.shutdown().await;
                         result
                     }
-                    Err(e) => Err(e),
                 }
             }
             None => Err(io::Error::new(io::ErrorKind::NotFound, format!("unknown outbound '{}'", final_name))),
