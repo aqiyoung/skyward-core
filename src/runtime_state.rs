@@ -16,7 +16,9 @@ static CONFIG_PATH: RwLock<Option<PathBuf>> = RwLock::const_new(None);
 static TRAFFIC: std::sync::OnceLock<Arc<TrafficStats>> = std::sync::OnceLock::new();
 
 fn traffic() -> Arc<TrafficStats> {
-    TRAFFIC.get_or_init(|| Arc::new(TrafficStats::default())).clone()
+    TRAFFIC
+        .get_or_init(|| Arc::new(TrafficStats::default()))
+        .clone()
 }
 
 /// Bumped every time the engine is (re)installed. The App watches this to know
@@ -79,17 +81,27 @@ pub async fn apply_config_from_path(path: &str) -> Result<(), String> {
             seq_len("rules")
         ));
         // Show one url-test group verbatim to reveal how its members are stored.
-        if let Some(groups) = map.get(serde_yaml::Value::String("proxy-groups".into()))
+        if let Some(groups) = map
+            .get(serde_yaml::Value::String("proxy-groups".into()))
             .and_then(|v| v.as_sequence())
         {
             for g in groups {
                 let kind = g.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 if kind.eq_ignore_ascii_case("url-test") {
                     let name = g.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                    let keys: Vec<String> = g.as_mapping()
-                        .map(|m| m.keys().filter_map(|k| k.as_str().map(str::to_string)).collect())
+                    let keys: Vec<String> = g
+                        .as_mapping()
+                        .map(|m| {
+                            m.keys()
+                                .filter_map(|k| k.as_str().map(str::to_string))
+                                .collect()
+                        })
                         .unwrap_or_default();
-                    let proxies_len = g.get("proxies").and_then(|v| v.as_sequence()).map(|s| s.len()).unwrap_or(0);
+                    let proxies_len = g
+                        .get("proxies")
+                        .and_then(|v| v.as_sequence())
+                        .map(|s| s.len())
+                        .unwrap_or(0);
                     log(&format!(
                         "apply_config: url-test group {:?} keys={:?} proxies_len={} raw={:?}",
                         name, keys, proxies_len, g
@@ -106,43 +118,23 @@ pub async fn apply_config_from_path(path: &str) -> Result<(), String> {
             return Err(e.to_string());
         }
     };
-    log(&format!("apply_config: parsed {} proxies, {} groups, {} rules, {} providers",
-        config.proxies.len(), config.proxy_groups.len(), config.rules.len(),
-        config.proxy_providers.len()));
+    log(&format!(
+        "apply_config: parsed {} proxies, {} groups, {} rules, {} providers",
+        config.proxies.len(),
+        config.proxy_groups.len(),
+        config.rules.len(),
+        config.proxy_providers.len()
+    ));
     let data_dir = config_path
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
 
-    // Make sure GEOIP/GEOSITE data exists before building the engine, otherwise
-    // those rules never match and every connection falls through to DIRECT.
-    // The App normally downloads these via updateGeoData, but that may not have
-    // happened yet (e.g. first run), so fetch on demand here.
-    let needs_geo = config.rules.iter().any(|r| {
-        let u = r.to_ascii_uppercase();
-        u.starts_with("GEOIP,") || u.starts_with("GEOSITE,") || u.starts_with("RULE-SET,")
-    });
-    // Only attempt the on-demand geo fetch once per process. If the network
-    // can't reach GitHub (common here), retrying on every config load added
-    // ~10s of dead time to each subscription switch. The user can still retry
-    // explicitly via updateGeoData.
-    static GEO_FETCH_ATTEMPTED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-    if needs_geo
-        && !GEO_FETCH_ATTEMPTED.swap(true, std::sync::atomic::Ordering::Relaxed)
-    {
-        if let Some(home) = crate::mobile::home_dir() {
-            for (geo_type, file) in [("GEOIP", "geoip.dat"), ("GEOSITE", "geosite.dat")] {
-                if !home.join(file).exists() && !data_dir.join(file).exists() {
-                    log(&format!("apply_config: downloading {} on demand", file));
-                    match crate::geo::download_geo(geo_type, &home).await {
-                        Ok(n) => log(&format!("apply_config: {} downloaded ({} bytes)", file, n)),
-                        Err(e) => log(&format!("apply_config: {} download failed: {}", file, e)),
-                    }
-                }
-            }
-        }
-    }
+    // Do not download GeoX files while setupConfig is waiting for the engine.
+    // At this point startTun has not installed Android's protect() callback,
+    // so the download socket can be routed back into the VPN and stall startup.
+    // Existing local files are still loaded by Engine::new; downloading remains
+    // available through the explicit updateGeoData API after the VPN is up.
 
     log("apply_config: building engine...");
     apply_config(config, config_path, data_dir).await;
