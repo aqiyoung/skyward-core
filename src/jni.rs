@@ -64,7 +64,7 @@ fn protect_diag(message: &str) {
     }
 }
 
-fn tokio_runtime() -> Option<&'static tokio::runtime::Runtime> {
+pub(crate) fn tokio_runtime() -> Option<&'static tokio::runtime::Runtime> {
     TOKIO_RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()

@@ -221,8 +221,12 @@ impl Engine {
             "establish"
         );
 
+        let source = inbound
+            .peer_addr()
+            .ok()
+            .map(|addr| (addr.ip().to_string(), addr.port()));
         let (id, up_counter, down_counter) = self.connections
-            .add(&target, &rule_target, vec![final_name.clone(), rule_target.clone()], Network::Tcp)
+            .add(&target, &rule_target, "", vec![final_name.clone(), rule_target.clone()], Network::Tcp, source)
             .await;
 
         let outbound = self.outbounds.outbound(&final_name);

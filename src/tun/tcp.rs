@@ -245,9 +245,13 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             None => TargetAddr::Ip(std::net::IpAddr::V4(key.target_ip), key.target_port),
         };
         tokio::spawn(async move {
+            // Rules and the chain are decided before dialling so the connection
+            // the App lists names the same route the packet actually took.
+            let rule = engine.decide(&target).await;
+            let final_name = engine.outbounds.resolve(&rule).await;
             let mut stream: BoxedStream = tokio::select! {
                 _ = cancel.notified() => return,
-                result = tokio::time::timeout(std::time::Duration::from_secs(10), engine.dial(&target)) => {
+                result = tokio::time::timeout(std::time::Duration::from_secs(10), engine.dial_named(&final_name, &target)) => {
                     match result {
                         Ok(Ok(s)) => {
                             flow_diag(format!("flow {} connected", addr));
@@ -265,6 +269,17 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                     }
                 }
             };
+            let (id, up_counter, down_counter) = engine
+                .connections
+                .add(
+                    &target,
+                    &rule,
+                    "",
+                    vec![final_name, rule.clone()],
+                    crate::tunnel::connection::Network::Tcp,
+                    Some((key.client_ip.to_string(), key.client_port)),
+                )
+                .await;
             let mut read_buf = vec![0u8; 16 * 1024];
             loop {
                 let mut write_buf = vec![0u8; 16 * 1024];
@@ -273,6 +288,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                     if stream.write_all(&write_buf[..n]).await.is_err() {
                         break;
                     }
+                    up_counter.fetch_add(n as u64, Ordering::Relaxed);
                     continue;
                 }
                 tokio::select! {
@@ -280,10 +296,14 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                     _ = to_net.notified() => {}
                     result = stream.read(&mut read_buf) => match result {
                         Ok(0) | Err(_) => break,
-                        Ok(n) => from_net.push(&read_buf[..n]),
+                        Ok(n) => {
+                            down_counter.fetch_add(n as u64, Ordering::Relaxed);
+                            from_net.push(&read_buf[..n]);
+                        }
                     }
                 }
             }
+            engine.connections.remove(&id).await;
             done.store(true, Ordering::Relaxed);
         });
     }

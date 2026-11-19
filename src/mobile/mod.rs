@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use crate::common::VERSION;
 
@@ -349,6 +349,10 @@ fn handle_outbound_ip(call: &MethodCall) -> Vec<u8> {
         params.urls.clone()
     };
     let future = async move {
+        // The App rejects a probe whose stamp is older than the route it is
+        // drawing, so every answer has to carry the counters it was made under.
+        let (_, version) = route_snapshot().await;
+        let epoch = crate::runtime_state::core_epoch();
         // First URL that answers wins (Dart supplies the parsers).
         for url in &urls {
             let probe_url = if url.starts_with("http://") || url.starts_with("https://") {
@@ -358,11 +362,18 @@ fn handle_outbound_ip(call: &MethodCall) -> Vec<u8> {
             };
             if let Some((status, body, delay)) = http_probe(&params.proxy_name, &probe_url, params.timeout).await {
                 if status >= 200 && status < 400 {
-                    return json!({"url": url, "body": body, "delay": delay, "chains": []});
+                    return json!({
+                        "url": url, "body": body, "delay": delay, "chains": [],
+                        "core-epoch": epoch, "picks-version": version,
+                    });
                 }
             }
         }
-        json!({"url": urls.first().cloned().unwrap_or_default(), "body": "", "delay": -2i64, "chains": [], "error": "probe failed"})
+        json!({
+            "url": urls.first().cloned().unwrap_or_default(), "body": "", "delay": -2i64,
+            "chains": [], "error": "probe failed",
+            "core-epoch": epoch, "picks-version": version,
+        })
     };
     ok(&call.id, block_on(future).unwrap_or_else(|_| json!({"error": "probe failed"})))
 }
@@ -416,36 +427,109 @@ fn handle_stop_log(call: &MethodCall) -> Vec<u8> {
 }
 
 fn handle_watch_route(call: &MethodCall) -> Vec<u8> {
-    let future = async {
-        let picks = match crate::runtime_state::engine().await {
-            Some(engine) => {
-                let mut map = serde_json::Map::new();
-                for (name, group) in &engine.outbounds.groups {
-                    if let Some(sel) = group.selected() {
-                        map.insert(name.clone(), Value::String(sel));
-                    }
+    // The App keeps the route map fresh from two things: this snapshot and the
+    // `routeChanged` events the core publishes while a watch is open. Go's core
+    // re-reads the picks once a second; without the events the map only moves
+    // when something else makes the App call watchRoute again.
+    let watch = call.arguments.as_bool().unwrap_or(false);
+    if watch {
+        start_route_watch();
+    } else {
+        stop_route_watch();
+    }
+    let (picks, version) = block_on(route_snapshot()).unwrap_or_else(|_| (serde_json::Map::new(), 0));
+    ok(&call.id, route_json(&picks, version))
+}
+
+/// The picks last reported to the App, with the monotonic version they carry.
+/// A probe is judged against these, so the version must only ever move forward
+/// (the App treats a higher stamp as "behind" and a differing one as stale).
+static ROUTE_REPORTED: std::sync::Mutex<Option<(serde_json::Map<String, Value>, u64)>> =
+    std::sync::Mutex::new(None);
+static ROUTE_WATCH_CANCEL: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>> =
+    std::sync::Mutex::new(None);
+
+fn route_json(picks: &serde_json::Map<String, Value>, version: u64) -> Value {
+    json!({
+        "core-epoch": crate::runtime_state::core_epoch(),
+        "picks-version": version,
+        "picks": picks,
+    })
+}
+
+/// Read the live picks and advance the reported version when they changed.
+async fn route_snapshot() -> (serde_json::Map<String, Value>, u64) {
+    let picks = match crate::runtime_state::engine().await {
+        Some(engine) => {
+            let mut map = serde_json::Map::new();
+            for (name, group) in &engine.outbounds.groups {
+                if let Some(sel) = group.selected() {
+                    map.insert(name.clone(), Value::String(sel));
                 }
-                map
             }
-            None => serde_json::Map::new(),
-        };
-        // Derive picks-version from the actual selection set so it changes when
-        // a group pick changes; a constant 0 makes the App think routing never
-        // changed and skip its route-map update.
-        let mut version: u64 = 1469598103934665603; // FNV offset basis
-        for (k, v) in &picks {
-            for b in k.as_bytes().iter().chain(v.as_str().unwrap_or("").as_bytes()) {
-                version ^= *b as u64;
-                version = version.wrapping_mul(1099511628211);
-            }
+            map
         }
-        json!({
-            "core-epoch": crate::runtime_state::core_epoch(),
-            "picks-version": version,
-            "picks": picks
-        })
+        None => serde_json::Map::new(),
     };
-    ok(&call.id, block_on(future).unwrap_or_else(|_| json!({"picks": {}})))
+    (picks.clone(), reported_version(&picks))
+}
+
+/// The version the App sees for `picks`: stable while they hold, and one step
+/// forward the moment any group's selection moves.
+fn reported_version(picks: &serde_json::Map<String, Value>) -> u64 {
+    let mut reported = ROUTE_REPORTED.lock().unwrap();
+    let version = match reported.as_ref() {
+        Some((last, v)) if *last == *picks => *v,
+        Some((_, v)) => {
+            let next = v.wrapping_add(1);
+            *reported = Some((picks.clone(), next));
+            next
+        }
+        None => {
+            *reported = Some((picks.clone(), 1));
+            1
+        }
+    };
+    version
+}
+
+fn start_route_watch() {
+    stop_route_watch();
+    let cancel = Arc::new(tokio::sync::Notify::new());
+    *ROUTE_WATCH_CANCEL.lock().unwrap() = Some(cancel.clone());
+    let Some(rt) = crate::jni::tokio_runtime() else { return };
+    rt.spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+        ticker.tick().await; // the first tick fires immediately
+        let (_, mut last_version) = route_snapshot().await;
+        let mut last_epoch = crate::runtime_state::core_epoch();
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = cancel.notified() => return,
+            }
+            let (picks, version) = route_snapshot().await;
+            let epoch = crate::runtime_state::core_epoch();
+            if version == last_version && epoch == last_epoch {
+                continue;
+            }
+            last_version = version;
+            last_epoch = epoch;
+            crate::jni::emit_event_json(
+                &json!({
+                    "type": "routeChanged",
+                    "data": route_json(&picks, version),
+                })
+                .to_string(),
+            );
+        }
+    });
+}
+
+fn stop_route_watch() {
+    if let Some(cancel) = ROUTE_WATCH_CANCEL.lock().unwrap().take() {
+        cancel.notify_one();
+    }
 }
 
 fn handle_clear_effect(call: &MethodCall) -> Vec<u8> {
@@ -739,6 +823,8 @@ fn handle_service_check(call: &MethodCall) -> Vec<u8> {
             Some(e) => e,
             None => return Value::Array(Vec::new()),
         };
+        let (_, version) = route_snapshot().await;
+        let epoch = crate::runtime_state::core_epoch();
         let mut items = Vec::new();
         for name in names {
             let Some(url) = service_check_url(&name) else { continue };
@@ -758,8 +844,8 @@ fn handle_service_check(call: &MethodCall) -> Vec<u8> {
                 "delay": delay,
                 "chains": Vec::<String>::new(),
                 "checked-at": checked_at,
-                "core-epoch": 0,
-                "picks-version": 0,
+                "core-epoch": epoch,
+                "picks-version": version,
             }));
         }
         Value::Array(items)
@@ -1301,6 +1387,22 @@ mod tests {
         let r = response(invoke(br#"{"method":"coreVersion"}"#));
         assert!(r["result"].as_str().unwrap().starts_with("clash.meta/"));
         assert!(r["error"].is_null());
+    }
+
+    #[test]
+    fn route_version_advances_only_when_picks_move() {
+        let _guard = crate::runtime_state::TEST_LOCK.lock().unwrap();
+        *ROUTE_REPORTED.lock().unwrap() = None;
+        let mut a = serde_json::Map::new();
+        a.insert("g".to_string(), Value::String("a".to_string()));
+        let mut b = serde_json::Map::new();
+        b.insert("g".to_string(), Value::String("b".to_string()));
+        let v1 = reported_version(&a);
+        assert_eq!(reported_version(&a), v1, "unchanged picks must keep their version");
+        let v2 = reported_version(&b);
+        assert!(v2 > v1, "a moved pick must move the version forward");
+        assert_eq!(reported_version(&b), v2);
+        *ROUTE_REPORTED.lock().unwrap() = None;
     }
 
     #[test]
