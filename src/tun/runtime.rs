@@ -87,6 +87,16 @@ fn diag(message: String) {
     }
 }
 
+/// Refused-packet diagnostics, on their own counter so the health-check
+/// storm that saturates `diag` cannot hide which apps are being refused
+/// (and how: v6 TCP, v6 UDP, or v4 UDP) while a failure is investigated.
+fn diag_refuse(message: String) {
+    static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+        crate::jni::emit_log_event(&format!("[rust-core] {}", message));
+    }
+}
+
 fn handle_packet<T: Read + Write + Send + 'static>(
     packet: &[u8],
     tcp: &mut TcpManager<T>,
@@ -107,6 +117,9 @@ fn handle_packet<T: Read + Write + Send + 'static>(
     match ip.proto {
         6 => tcp.handle_packet(packet),
         17 => {
+            let src_port = packet
+                .get(ip.ihl..ip.ihl + 2)
+                .map(|b| u16::from_be_bytes([b[0], b[1]]));
             let dst_port = packet
                 .get(ip.ihl + 2..ip.ihl + 4)
                 .map(|b| u16::from_be_bytes([b[0], b[1]]));
@@ -116,6 +129,13 @@ fn handle_packet<T: Read + Write + Send + 'static>(
                 // UDP relay is not implemented; refuse fast (ICMP port
                 // unreachable) so QUIC and other UDP apps fall back to TCP
                 // immediately instead of timing out on a silent drop.
+                diag_refuse(format!(
+                    "udp4 refuse {}:{} -> {}:{}",
+                    ip.src,
+                    src_port.unwrap_or(0),
+                    ip.dst,
+                    dst_port.unwrap_or(0)
+                ));
                 if let Some(reply) = crate::tun::tcp::build_icmp_port_unreachable(packet, ip.ihl)
                 {
                     let _ = io.lock().unwrap().write_all(&reply);
@@ -159,15 +179,26 @@ fn handle_ipv6_packet<T: Read + Write + Send + 'static>(packet: &[u8], io: &Arc<
     src.copy_from_slice(&packet[8..24]);
     dst.copy_from_slice(&packet[24..40]);
     let payload = &packet[40..];
+    let src_port = payload
+        .get(0..2)
+        .map(|b| u16::from_be_bytes([b[0], b[1]]))
+        .unwrap_or(0);
+    let dst_port = payload
+        .get(2..4)
+        .map(|b| u16::from_be_bytes([b[0], b[1]]))
+        .unwrap_or(0);
+    let src6 = std::net::Ipv6Addr::from(src);
+    let dst6 = std::net::Ipv6Addr::from(dst);
     match next_header {
         17 => {
             // UDP
-            let dst_port = payload
-                .get(2..4)
-                .map(|b| u16::from_be_bytes([b[0], b[1]]));
-            if dst_port == Some(53) {
+            if dst_port == 53 {
                 handle_dns_packet6(packet, src, dst, io);
             } else if icmp_budget() {
+                diag_refuse(format!(
+                    "udp6 refuse {}:{} -> {}:{}",
+                    src6, src_port, dst6, dst_port
+                ));
                 if let Some(reply) = build_icmp6_unreachable(packet, 4) {
                     let _ = io.lock().unwrap().write_all(&reply);
                 }
@@ -177,6 +208,10 @@ fn handle_ipv6_packet<T: Read + Write + Send + 'static>(packet: &[u8], io: &Arc<
             // TCP: address unreachable is a hard error for connect(), so the
             // app fails over to IPv4 immediately instead of timing out.
             if icmp_budget() {
+                diag_refuse(format!(
+                    "tcp6 refuse {}:{} -> {}:{}",
+                    src6, src_port, dst6, dst_port
+                ));
                 if let Some(reply) = build_icmp6_unreachable(packet, 3) {
                     let _ = io.lock().unwrap().write_all(&reply);
                 }
