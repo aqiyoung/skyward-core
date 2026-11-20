@@ -585,9 +585,25 @@ pub struct VmessOutbound {
     ws_headers: Vec<(String, String)>,
     use_grpc: bool,
     grpc_service: String,
+    use_xhttp: bool,
+    xhttp_path: String,
+    xhttp_host: String,
 }
 
 impl VmessOutbound {
+    async fn dial_server(&self) -> io::Result<tokio::net::TcpStream> {
+        let mut last_error = None;
+        for addr in self.server.resolve_all().await? {
+            match crate::net::connect_tcp(addr).await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => last_error = Some(e),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "no VMess server address")
+        }))
+    }
+
     pub fn try_new(
         name: &str,
         server: &str,
@@ -600,6 +616,7 @@ impl VmessOutbound {
         network: Option<&str>,
         ws_opts: Option<&WsOpts>,
         grpc_opts: Option<&crate::config::GrpcOpts>,
+        xhttp_opts: Option<&crate::config::XHttpOpts>,
     ) -> Option<Self> {
         let uuid = parse_uuid(uuid)?;
         let use_grpc = network
@@ -609,12 +626,23 @@ impl VmessOutbound {
             .and_then(|g| g.service_name.clone())
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "GunService".to_string());
+        let use_xhttp = network
+            .map(|n| n.eq_ignore_ascii_case("xhttp"))
+            .unwrap_or(false);
+        let xhttp_path = xhttp_opts
+            .and_then(|x| x.path.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "/".to_string());
         let security = match security.to_ascii_lowercase().as_str() {
             "" | "auto" | "aes-128-gcm" => SECURITY_AES_128_GCM,
             "chacha20-poly1305" => SECURITY_CHACHA20_POLY1305,
             _ => return None,
         };
         let sni = sni.filter(|s| !s.is_empty()).unwrap_or(server).to_string();
+        let xhttp_host = xhttp_opts
+            .and_then(|x| x.host.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| sni.clone());
         let server = match server.parse::<IpAddr>() {
             Ok(ip) => TargetAddr::Ip(ip, port),
             Err(_) => TargetAddr::Domain(server.to_string(), port),
@@ -652,6 +680,9 @@ impl VmessOutbound {
             ws_headers,
             use_grpc,
             grpc_service,
+            use_xhttp,
+            xhttp_path,
+            xhttp_host,
         })
     }
 }
@@ -703,26 +734,52 @@ impl Outbound for VmessOutbound {
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "system clock before epoch"))?
             .as_secs() as i64);
 
-        let mut stream: BoxedStream = if self.use_tls {
-            if self.use_ws {
-                connect_tls_http1(&self.sni, tcp, self.verify).await?
-            } else {
-                connect_tls(&self.sni, tcp, self.verify).await?
-            }
-        } else {
-            Box::new(tcp)
-        };
-        if self.use_ws {
-            stream = Box::new(
-                connect_ws(stream, &self.ws_host, &self.ws_path, &self.ws_headers).await?,
-            );
-        }
-        if self.use_grpc {
-            stream = Box::new(
-                crate::adapter::grpc::connect_grpc(stream, &self.sni, &self.grpc_service)
+        let mut stream: BoxedStream = if self.use_xhttp {
+            // XHTTP opens two connections; the first dial reuses the TCP
+            // stream opened above, later dials connect fresh.
+            let mut first = Some(tcp);
+            let outbound = self;
+            let dial = move || {
+                let taken = first.take();
+                async move {
+                    let tcp = match taken {
+                        Some(tcp) => tcp,
+                        None => outbound.dial_server().await?,
+                    };
+                    if outbound.use_tls {
+                        connect_tls_http1(&outbound.sni, tcp, outbound.verify).await
+                    } else {
+                        Ok(Box::new(tcp) as BoxedStream)
+                    }
+                }
+            };
+            Box::new(
+                crate::adapter::xhttp::connect_xhttp(dial, &self.xhttp_host, &self.xhttp_path)
                     .await?,
-            );
-        }
+            )
+        } else {
+            let mut stream: BoxedStream = if self.use_tls {
+                if self.use_ws {
+                    connect_tls_http1(&self.sni, tcp, self.verify).await?
+                } else {
+                    connect_tls(&self.sni, tcp, self.verify).await?
+                }
+            } else {
+                Box::new(tcp)
+            };
+            if self.use_ws {
+                stream = Box::new(
+                    connect_ws(stream, &self.ws_host, &self.ws_path, &self.ws_headers).await?,
+                );
+            }
+            if self.use_grpc {
+                stream = Box::new(
+                    crate::adapter::grpc::connect_grpc(stream, &self.sni, &self.grpc_service)
+                        .await?,
+                );
+            }
+            stream
+        };
         stream.write_all(&header).await?;
         // The response header is consumed lazily by AeadStream's first read
         // (servers send it with the first response chunk, not on request).

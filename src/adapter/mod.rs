@@ -16,6 +16,7 @@ use crate::config::{Config, ProxyDef};
 
 pub mod grpc;
 pub mod http_proxy;
+pub mod xhttp;
 pub mod provider;
 pub mod shadowsocks;
 pub mod snell;
@@ -92,7 +93,7 @@ impl Outbound for RejectOutbound {
 
 /// Why a vless/vmess def cannot be spoken by this core, as an
 /// UnimplementedOutbound kind string, or None if it can. TCP, WebSocket and
-/// gRPC transports are implemented; xhttp/vision/REALITY defs used to
+/// gRPC and XHTTP transports are implemented; vision/REALITY defs used to
 /// degrade silently to plain TCP, which connects at the transport level
 /// and then dies mid-handshake against the real server — apps see a fake
 /// "connected" flow that never carries data. Failing the dial honestly lets
@@ -101,7 +102,7 @@ fn unsupported_transport(def: &crate::config::ProxyDef) -> Option<String> {
     let kind = def.kind.as_str();
     if let Some(network) = def.network.as_deref() {
         let n = network.trim().to_ascii_lowercase();
-        if !n.is_empty() && n != "tcp" && n != "ws" && n != "grpc" {
+        if !n.is_empty() && n != "tcp" && n != "ws" && n != "grpc" && n != "xhttp" {
             return Some(format!("{} (network={})", kind, network));
         }
     }
@@ -336,6 +337,7 @@ pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
                             def.network.as_deref(),
                             def.ws_opts.as_ref(),
                             def.grpc_opts.as_ref(),
+                            def.xhttp_opts.as_ref(),
                         ),
                         _ => None,
                         }
@@ -366,6 +368,7 @@ pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
                             def.network.as_deref(),
                             def.ws_opts.as_ref(),
                             def.grpc_opts.as_ref(),
+                            def.xhttp_opts.as_ref(),
                         ),
                         _ => None,
                         }
@@ -609,9 +612,14 @@ mod tests {
             "proxies:\n  - {name: h, type: vless, server: s, port: 443, uuid: u, network: xhttp}\n",
         )
         .unwrap();
+        assert_eq!(unsupported_transport(&xhttp.proxies[0]), None);
+        let h2 = crate::config::Config::from_str(
+            "proxies:\n  - {name: h2, type: vless, server: s, port: 443, uuid: u, network: h2}\n",
+        )
+        .unwrap();
         assert_eq!(
-            unsupported_transport(&xhttp.proxies[0]).as_deref(),
-            Some("vless (network=xhttp)")
+            unsupported_transport(&h2.proxies[0]).as_deref(),
+            Some("vless (network=h2)")
         );
         assert_eq!(
             unsupported_transport(by_name("v")).as_deref(),
@@ -622,10 +630,7 @@ mod tests {
             Some("vless (security=reality)")
         );
         assert_eq!(unsupported_transport(by_name("w")), None);
-        assert_eq!(
-            unsupported_transport(by_name("x")).as_deref(),
-            Some("vmess (network=xhttp)")
-        );
+        assert_eq!(unsupported_transport(by_name("x")), None);
     }
 
     #[tokio::test]

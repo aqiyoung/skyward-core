@@ -102,6 +102,19 @@ pub struct ProxyDef {
     pub ws_opts: Option<WsOpts>,
     #[serde(rename = "grpc-opts")]
     pub grpc_opts: Option<GrpcOpts>,
+    #[serde(rename = "xhttp-opts")]
+    pub xhttp_opts: Option<XHttpOpts>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct XHttpOpts {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    /// auto | packet-up | stream-up | stream-one
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

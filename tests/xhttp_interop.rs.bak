@@ -1,0 +1,89 @@
+//! Local interop tests against a real xray server (fixture in
+//! ~/workspace/tools/xray-test: xhttp inbounds on 2449/2451/2452, origin
+//! HTTP server on 18080). Kept as .bak in the repo so CI never runs them.
+
+use skyward_core::adapter::vless::VlessOutbound;
+use skyward_core::adapter::vmess::VmessOutbound;
+use skyward_core::adapter::Outbound;
+use skyward_core::common::TargetAddr;
+use skyward_core::config::XHttpOpts;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const UUID: &str = "11111111-2222-3333-4444-555555555555";
+
+async fn fetch<S>(mut stream: S) -> String
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    tokio::time::timeout(Duration::from_secs(5), async {
+        stream
+            .write_all(b"GET /hello HTTP/1.1\r\nHost: origin.test\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("write timed out");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.unwrap();
+        String::from_utf8_lossy(&out).to_string()
+    })
+    .await
+    .expect("read timed out")
+}
+
+fn target() -> TargetAddr {
+    TargetAddr::Ip("127.0.0.1".parse().unwrap(), 18080)
+}
+
+#[tokio::test]
+async fn vless_xhttp_plain() {
+    let xhttp = XHttpOpts {
+        path: Some("/xhttp".into()),
+        host: None,
+        mode: None,
+    };
+    let ob = VlessOutbound::try_new(
+        "t", "127.0.0.1", 2449, UUID, false, None, false,
+        Some("xhttp"), None, None, Some(&xhttp),
+    )
+    .unwrap();
+    let stream = ob.connect(&target()).await.unwrap();
+    let body = fetch(stream).await;
+    assert!(body.contains("GRPC-INTEROP-OK"), "got: {}", body);
+}
+
+#[tokio::test]
+async fn vmess_xhttp_plain() {
+    let xhttp = XHttpOpts {
+        path: Some("/up".into()),
+        host: None,
+        mode: None,
+    };
+    let ob = VmessOutbound::try_new(
+        "t", "127.0.0.1", 2451, UUID, "auto", false, None, false,
+        Some("xhttp"), None, None, Some(&xhttp),
+    )
+    .unwrap();
+    let stream = ob.connect(&target()).await.unwrap();
+    let body = fetch(stream).await;
+    assert!(body.contains("GRPC-INTEROP-OK"), "got: {}", body);
+}
+
+#[tokio::test]
+async fn vless_xhttp_tls() {
+    let xhttp = XHttpOpts {
+        path: Some("/xhttp".into()),
+        host: None,
+        mode: None,
+    };
+    let ob = VlessOutbound::try_new(
+        "t", "127.0.0.1", 2452, UUID, true, Some("localhost"), false,
+        Some("xhttp"), None, None, Some(&xhttp),
+    )
+    .unwrap();
+    let stream = ob.connect(&target()).await.unwrap();
+    let body = fetch(stream).await;
+    assert!(body.contains("GRPC-INTEROP-OK"), "got: {}", body);
+}
