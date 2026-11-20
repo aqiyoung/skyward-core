@@ -130,7 +130,10 @@ pub struct ProxyDef {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct HttpOpts {
-    #[serde(default)]
+    /// mihomo allows path as a string or a list of candidate paths
+    /// (one is picked per connection); a list appears in real
+    /// subscriptions and must not fail the whole config parse.
+    #[serde(default, deserialize_with = "de_host_list")]
     pub path: Option<String>,
     /// mihomo spells host as a list; a single string also appears.
     #[serde(default, deserialize_with = "de_host_list")]
@@ -402,6 +405,31 @@ pub struct Overrides {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_opts_path_accepts_string_or_list() {
+        // Real-world subscriptions spell http-opts.path as a YAML
+        // list; that must parse (first entry wins), not fail the
+        // whole config (device log 2026-11-20: proxies[245]).
+        let yaml = r#"
+proxies:
+  - name: h2node
+    type: vless
+    server: example.com
+    port: 443
+    network: h2
+    http-opts:
+      path:
+        - /first
+        - /second
+      host:
+        - example.com
+"#;
+        let c = Config::from_str(yaml).unwrap();
+        let opts = c.proxies[0].http_opts.as_ref().unwrap();
+        assert_eq!(opts.path.as_deref(), Some("/first"));
+        assert_eq!(opts.host.as_deref(), Some("example.com"));
+    }
 
     #[test]
     fn parses_mihomo_kebab_case_keys() {
