@@ -5,7 +5,11 @@
 //! direction, and an idle timeout. Replies are written back into the
 //! TUN device as fresh IPv4/UDP packets. Before this existed, non-DNS
 //! UDP was refused with ICMP port-unreachable so apps fell back to
-//! TCP; now QUIC, voice, and game traffic can flow for real.
+//! TCP; now QUIC, voice, and game traffic can flow for real. When a
+//! session cannot be dialed at all (the chosen outbound cannot carry
+//! UDP), the first datagram is still refused with ICMP port-unreachable
+//! so the app falls back to TCP immediately instead of retrying its
+//! QUIC handshake into a black hole.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -50,8 +54,10 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
             } else {
                 let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
                 sessions.insert(key, tx.clone());
-                self.spawn_session(key, rx);
-                tx
+                // The first payload travels with the session task: if the
+                // dial fails it is the datagram the ICMP refusal answers.
+                self.spawn_session(key, rx, payload.to_vec());
+                return;
             }
         };
         // A full queue means the session is wedged; dropping one packet
@@ -59,7 +65,7 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
         let _ = sender.try_send(payload.to_vec());
     }
 
-    fn spawn_session(&self, key: SessionKey, mut rx: mpsc::Receiver<Vec<u8>>) {
+    fn spawn_session(&self, key: SessionKey, mut rx: mpsc::Receiver<Vec<u8>>, first_payload: Vec<u8>) {
         let engine = self.engine.clone();
         let io = self.io.clone();
         let sessions = self.sessions.clone();
@@ -75,6 +81,7 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
                         "udp session {}:{} -> {} failed: {}",
                         key.src, key.src_port, target.address(), e
                     ));
+                    refuse(&io, &key, first_payload.len());
                     sessions.lock().unwrap().remove(&key);
                     return;
                 }
@@ -83,10 +90,19 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
                         "udp session {}:{} -> {} dial timed out",
                         key.src, key.src_port, target.address()
                     ));
+                    refuse(&io, &key, first_payload.len());
                     sessions.lock().unwrap().remove(&key);
                     return;
                 }
             };
+            if let Err(e) = conn.send(&first_payload).await {
+                crate::tun::runtime::diag_udp(format!(
+                    "udp session {}:{} -> {} first send failed: {}",
+                    key.src, key.src_port, target.address(), e
+                ));
+                sessions.lock().unwrap().remove(&key);
+                return;
+            }
             crate::tun::runtime::diag_udp(format!(
                 "udp session {}:{} -> {} open",
                 key.src, key.src_port, target.address()
@@ -126,6 +142,34 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
             sessions.lock().unwrap().remove(&key);
         });
     }
+}
+
+/// Answer a datagram that could not be relayed with an ICMP
+/// port-unreachable, rate-limited like the runtime's other refusals, so
+/// the sending app gives up on QUIC and falls back to TCP at once.
+fn refuse<T: Write>(io: &Arc<Mutex<T>>, key: &SessionKey, payload_len: usize) {
+    if !crate::tun::runtime::icmp_budget() {
+        return;
+    }
+    if let Some(packet) = refuse_packet(key, payload_len) {
+        let _ = io.lock().unwrap().write_all(&packet);
+    }
+}
+
+/// The refusal quotes a synthetic copy of the triggering datagram; the
+/// IPv4 and UDP headers are all the receiving stack matches on.
+fn refuse_packet(key: &SessionKey, payload_len: usize) -> Option<Vec<u8>> {
+    let mut original = vec![0u8; 28];
+    original[0] = 0x45;
+    original[2..4].copy_from_slice(&((28 + payload_len) as u16).to_be_bytes());
+    original[8] = 64;
+    original[9] = 17;
+    original[12..16].copy_from_slice(&key.src.octets());
+    original[16..20].copy_from_slice(&key.dst.octets());
+    original[20..22].copy_from_slice(&key.src_port.to_be_bytes());
+    original[22..24].copy_from_slice(&key.dst_port.to_be_bytes());
+    original[24..26].copy_from_slice(&((8 + payload_len) as u16).to_be_bytes());
+    crate::tun::tcp::build_icmp_port_unreachable(&original, 20)
 }
 
 /// Build a complete IPv4/UDP packet carrying `payload` from
@@ -206,5 +250,25 @@ mod tests {
             0
         );
         assert_eq!(&packet[28..], b"hello");
+    }
+
+    #[test]
+    fn refuse_packet_is_icmp_port_unreachable() {
+        let key = SessionKey {
+            src: "198.18.0.1".parse().unwrap(),
+            src_port: 53210,
+            dst: "198.18.0.9".parse().unwrap(),
+            dst_port: 443,
+        };
+        let packet = refuse_packet(&key, 1200).unwrap();
+        assert_eq!(packet[0], 0x45);
+        assert_eq!(packet[9], 1); // ICMP
+        assert_eq!(&packet[12..16], &[198, 18, 0, 9]); // from the target
+        assert_eq!(&packet[16..20], &[198, 18, 0, 1]); // to the app
+        assert_eq!(packet[20], 3); // destination unreachable
+        assert_eq!(packet[21], 3); // port unreachable
+        // The quote carries the original UDP header (ports the app matches).
+        assert_eq!(&packet[48..50], &53210u16.to_be_bytes());
+        assert_eq!(&packet[50..52], &443u16.to_be_bytes());
     }
 }

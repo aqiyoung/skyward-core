@@ -795,10 +795,10 @@ pub(crate) fn build_udp_packet(
 }
 
 /// Build an ICMP destination/port-unreachable packet answering `original`
-/// (a full IPv4 packet). Non-DNS UDP is not relayed by this core; refusing
-/// it immediately lets QUIC-capable apps fall back to TCP at once instead
-/// of waiting out their handshake timeouts on a silently black-holed
-/// datagram.
+/// (a full IPv4 packet). Used where a UDP datagram cannot be relayed —
+/// refusing it immediately lets QUIC-capable apps fall back to TCP at once
+/// instead of waiting out their handshake timeouts on a silently
+/// black-holed datagram.
 pub(crate) fn build_icmp_port_unreachable(original: &[u8], ihl: usize) -> Option<Vec<u8>> {
     if original.len() < ihl + 8 {
         return None;

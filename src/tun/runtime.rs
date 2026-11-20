@@ -149,7 +149,7 @@ fn handle_packet<T: Read + Write + Send + 'static>(
 
 /// Rate limit for ICMP refusals (~50/s), so a UDP flood cannot turn into a
 /// TUN write flood.
-fn icmp_budget() -> bool {
+pub(crate) fn icmp_budget() -> bool {
     use std::sync::Mutex as StdMutex;
     static STATE: StdMutex<(Option<std::time::Instant>, u32)> = StdMutex::new((None, 0));
     let mut state = STATE.lock().unwrap();
