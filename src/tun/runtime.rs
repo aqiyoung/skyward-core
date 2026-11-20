@@ -14,6 +14,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 use super::tcp::TcpManager;
+use super::udp::UdpManager;
 use super::{TunConfig, TunDevice};
 use crate::tunnel::Engine;
 
@@ -28,7 +29,8 @@ pub async fn run<T>(
     T: Read + Write + Send + 'static,
 {
     let io = Arc::new(Mutex::new(device.io));
-    let mut tcp = TcpManager::new(engine, io.clone());
+    let mut tcp = TcpManager::new(engine.clone(), io.clone());
+    let udp = UdpManager::new(engine, io.clone());
     tcp.set_mtu(config.options.mtu);
     let mut buf = vec![0u8; 65536];
 
@@ -44,7 +46,7 @@ pub async fn run<T>(
             };
             match read {
                 Ok(n) if n > 0 => {
-                    handle_packet(&buf[..n], &mut tcp, &io);
+                    handle_packet(&buf[..n], &mut tcp, &udp, &io);
                     drained += 1;
                     if drained >= 512 {
                         break;
@@ -87,6 +89,14 @@ fn diag(message: String) {
     }
 }
 
+/// UDP session diagnostics (own counter, like diag_refuse).
+pub fn diag_udp(message: String) {
+    static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 100 {
+        crate::jni::emit_log_event(&format!("[rust-core] {}", message));
+    }
+}
+
 /// Refused-packet diagnostics, on their own counter so the health-check
 /// storm that saturates `diag` cannot hide which apps are being refused
 /// (and how: v6 TCP, v6 UDP, or v4 UDP) while a failure is investigated.
@@ -100,6 +110,7 @@ fn diag_refuse(message: String) {
 fn handle_packet<T: Read + Write + Send + 'static>(
     packet: &[u8],
     tcp: &mut TcpManager<T>,
+    udp: &UdpManager<T>,
     io: &Arc<Mutex<T>>,
 ) {
     // The VPN service routes IPv6 into the TUN whenever the profile enables
@@ -125,20 +136,10 @@ fn handle_packet<T: Read + Write + Send + 'static>(
                 .map(|b| u16::from_be_bytes([b[0], b[1]]));
             if dst_port == Some(53) {
                 handle_dns_packet(packet, &ip, io);
-            } else if icmp_budget() {
-                // UDP relay is not implemented; refuse fast (ICMP port
-                // unreachable) so QUIC and other UDP apps fall back to TCP
-                // immediately instead of timing out on a silent drop.
-                diag_refuse(format!(
-                    "udp4 refuse {}:{} -> {}:{}",
-                    ip.src,
-                    src_port.unwrap_or(0),
-                    ip.dst,
-                    dst_port.unwrap_or(0)
-                ));
-                if let Some(reply) = crate::tun::tcp::build_icmp_port_unreachable(packet, ip.ihl)
-                {
-                    let _ = io.lock().unwrap().write_all(&reply);
+            } else if let (Some(src_port), Some(dst_port)) = (src_port, dst_port) {
+                let payload_start = ip.ihl + 8;
+                if let Some(payload) = packet.get(payload_start..) {
+                    udp.handle_packet(ip.src, src_port, ip.dst, dst_port, payload);
                 }
             }
         }

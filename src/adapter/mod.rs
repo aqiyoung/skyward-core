@@ -15,6 +15,7 @@ use crate::common::TargetAddr;
 use crate::config::{Config, ProxyDef};
 
 pub mod grpc;
+pub mod packet;
 pub mod tls13;
 pub mod vision;
 pub mod http_proxy;
@@ -43,11 +44,22 @@ pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncStream for T {}
 pub type BoxedStream = Box<dyn AsyncStream>;
 
+pub use packet::PacketConn;
+
 #[async_trait]
 pub trait Outbound: Send + Sync {
     fn name(&self) -> &str;
     fn kind(&self) -> &str;
     async fn connect(&self, target: &TargetAddr) -> io::Result<BoxedStream>;
+    /// Open a UDP packet session bound to `target`. Most protocols ride
+    /// their TCP stream for this; the default is an honest refusal so
+    /// the TUN layer can fall back instead of black-holing packets.
+    async fn connect_udp(&self, _target: &TargetAddr) -> io::Result<Box<dyn PacketConn>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("{}: UDP relay not supported", self.kind()),
+        ))
+    }
 }
 
 pub struct DirectOutbound {
@@ -58,6 +70,22 @@ impl DirectOutbound {
         Self { name: name.into() }
     }
 }
+/// UDP session over a real protected socket (DIRECT outbound).
+pub struct DirectPacketConn {
+    socket: tokio::net::UdpSocket,
+}
+
+#[async_trait]
+impl PacketConn for DirectPacketConn {
+    async fn send(&self, data: &[u8]) -> io::Result<()> {
+        self.socket.send(data).await.map(|_| ())
+    }
+
+    async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.socket.recv(buf).await
+    }
+}
+
 #[async_trait]
 impl Outbound for DirectOutbound {
     fn name(&self) -> &str { &self.name }
@@ -67,6 +95,32 @@ impl Outbound for DirectOutbound {
         for addr in target.resolve_all().await? {
             match crate::net::connect_tcp(addr).await {
                 Ok(stream) => return Ok(Box::new(stream)),
+                Err(e) => last_error = Some(e),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "no reachable address")
+        }))
+    }
+
+    async fn connect_udp(&self, target: &TargetAddr) -> io::Result<Box<dyn PacketConn>> {
+        let mut last_error = None;
+        for addr in target.resolve_all().await? {
+            let socket = if addr.is_ipv4() {
+                tokio::net::UdpSocket::bind("0.0.0.0:0").await
+            } else {
+                tokio::net::UdpSocket::bind("[::]:0").await
+            };
+            let socket = match socket {
+                Ok(s) => s,
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
+            };
+            crate::jni::protect_fd(std::os::fd::AsRawFd::as_raw_fd(&socket));
+            match socket.connect(addr).await {
+                Ok(()) => return Ok(Box::new(DirectPacketConn { socket })),
                 Err(e) => last_error = Some(e),
             }
         }

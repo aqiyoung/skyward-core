@@ -75,10 +75,41 @@ impl Outbound for TrojanOutbound {
         stream.write_all(&header).await?;
         Ok(stream)
     }
+
+    async fn connect_udp(
+        &self,
+        target: &TargetAddr,
+    ) -> io::Result<Box<dyn crate::adapter::PacketConn>> {
+        let mut last_error = None;
+        let mut tcp = None;
+        for addr in self.server.resolve_all().await? {
+            match crate::net::connect_tcp(addr).await {
+                Ok(stream) => {
+                    tcp = Some(stream);
+                    break;
+                }
+                Err(e) => last_error = Some(e),
+            }
+        }
+        let tcp = tcp.ok_or_else(|| {
+            last_error
+                .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no Trojan server address"))
+        })?;
+        let mut stream = connect_tls(&self.sni, tcp, self.verify).await?;
+        // UDP associate header: same shape as CONNECT but command 0x03;
+        // the address here is a placeholder (each packet carries its own).
+        let mut header = self.password_hash.as_bytes().to_vec();
+        header.extend_from_slice(b"\r\n");
+        header.push(0x03); // CommandUDP
+        header.extend_from_slice(&encode_socks_target(target));
+        header.extend_from_slice(b"\r\n");
+        stream.write_all(&header).await?;
+        Ok(Box::new(crate::adapter::packet::TrojanPacketConn::new(stream, target)))
+    }
 }
 
 /// SOCKS5-style target header: 1=IPv4, 3=domain, 4=IPv6, then port.
-fn encode_socks_target(target: &TargetAddr) -> Vec<u8> {
+pub(crate) fn encode_socks_target(target: &TargetAddr) -> Vec<u8> {
     let mut out = Vec::new();
     match target {
         TargetAddr::Ip(IpAddr::V4(ip), _) => {

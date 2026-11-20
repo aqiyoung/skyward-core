@@ -18,6 +18,7 @@ pub mod relay;
 pub mod runtime;
 pub mod stack;
 pub mod tcp;
+pub mod udp;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TunOptions {

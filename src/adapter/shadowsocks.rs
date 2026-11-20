@@ -442,6 +442,99 @@ impl Outbound for ShadowsocksOutbound {
         stream.write_all(&encode_target(target)).await?;
         Ok(Box::new(stream))
     }
+
+    async fn connect_udp(
+        &self,
+        target: &TargetAddr,
+    ) -> io::Result<Box<dyn crate::adapter::PacketConn>> {
+        let mut last_error = None;
+        for addr in self.server.resolve_all().await? {
+            let socket = if addr.is_ipv4() {
+                tokio::net::UdpSocket::bind("0.0.0.0:0").await
+            } else {
+                tokio::net::UdpSocket::bind("[::]:0").await
+            };
+            let socket = match socket {
+                Ok(s) => s,
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
+            };
+            crate::jni::protect_fd(std::os::fd::AsRawFd::as_raw_fd(&socket));
+            match socket.connect(addr).await {
+                Ok(()) => {
+                    return Ok(Box::new(SsPacketConn {
+                        socket,
+                        method: self.method,
+                        psk: kdf(self.password.as_bytes(), self.method.key_len()),
+                        target_header: encode_target(target),
+                    }))
+                }
+                Err(e) => last_error = Some(e),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "no SS server address")
+        }))
+    }
+}
+
+/// Shadowsocks UDP session: every datagram is independently sealed as
+/// `salt || AEAD(addr || payload)` with a zero nonce, the salt making
+/// the derived subkey unique per datagram.
+pub struct SsPacketConn {
+    socket: tokio::net::UdpSocket,
+    method: Method,
+    psk: Vec<u8>,
+    target_header: Vec<u8>,
+}
+
+#[async_trait]
+impl crate::adapter::PacketConn for SsPacketConn {
+    async fn send(&self, data: &[u8]) -> io::Result<()> {
+        let mut salt = vec![0u8; self.method.salt_len()];
+        OsRng.fill_bytes(&mut salt);
+        let subkey = hkdf_sha1(&self.psk, &salt, b"ss-subkey", self.method.key_len());
+        let cipher = Cipher::new(self.method, &subkey)?;
+        let mut plain = Vec::with_capacity(self.target_header.len() + data.len());
+        plain.extend_from_slice(&self.target_header);
+        plain.extend_from_slice(data);
+        let nonce = vec![0u8; self.method.nonce_len()];
+        let sealed = cipher.encrypt(&nonce, &plain)?;
+        let mut datagram = salt;
+        datagram.extend_from_slice(&sealed);
+        self.socket.send(&datagram).await.map(|_| ())
+    }
+
+    async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut raw = vec![0u8; 65536];
+        loop {
+            let n = self.socket.recv(&mut raw).await?;
+            let raw = &raw[..n];
+            let salt_len = self.method.salt_len();
+            if raw.len() <= salt_len {
+                continue;
+            }
+            let (salt, sealed) = raw.split_at(salt_len);
+            let subkey = hkdf_sha1(&self.psk, salt, b"ss-subkey", self.method.key_len());
+            let cipher = Cipher::new(self.method, &subkey)?;
+            let nonce = vec![0u8; self.method.nonce_len()];
+            let Ok(plain) = cipher.decrypt(&nonce, sealed) else {
+                continue;
+            };
+            let Some(addr_len) = crate::adapter::packet::socks_addr_len(&plain) else {
+                continue;
+            };
+            if addr_len == 0 || plain.len() <= addr_len {
+                continue;
+            }
+            let payload = &plain[addr_len..];
+            let take = payload.len().min(buf.len());
+            buf[..take].copy_from_slice(&payload[..take]);
+            return Ok(take);
+        }
+    }
 }
 
 #[cfg(test)]

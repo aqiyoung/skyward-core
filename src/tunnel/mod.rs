@@ -232,6 +232,28 @@ impl Engine {
         }
     }
 
+    /// Open a UDP packet session to `target` through the rule/outbound
+    /// pipeline. Used by the TUN stack's UDP session manager.
+    pub async fn dial_udp(
+        &self,
+        target: &TargetAddr,
+    ) -> io::Result<Box<dyn crate::adapter::PacketConn>> {
+        let rule_target = self.decide(target).await;
+        let final_name = self.outbounds.resolve(&rule_target).await;
+        let outbound = self.outbounds.outbound(&final_name).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("unknown outbound '{}'", final_name))
+        })?;
+        outbound.connect_udp(target).await.map_err(|e| {
+            dial_diag(format!(
+                "dial_udp {} via {} FAILED: {}",
+                target.address(),
+                final_name,
+                e
+            ));
+            e
+        })
+    }
+
     /// Dial a target through a specific outbound/group name (used by delay tests).
     pub async fn dial_named(&self, name: &str, target: &TargetAddr) -> io::Result<BoxedStream> {
         let final_name = self.outbounds.resolve(name).await;

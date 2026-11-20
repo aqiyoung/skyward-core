@@ -31,6 +31,7 @@ use crate::config::WsOpts;
 const VERSION: u8 = 0x01;
 const OPTION_CHUNK_STREAM: u8 = 0x01;
 const COMMAND_TCP: u8 = 0x01;
+const COMMAND_UDP: u8 = 0x02;
 const SECURITY_AES_128_GCM: u8 = 0x03;
 const SECURITY_CHACHA20_POLY1305: u8 = 0x04;
 const CHUNK_SIZE: usize = 1 << 14;
@@ -186,6 +187,7 @@ fn serialize_request(
     security: u8,
     target: &TargetAddr,
     padding_len: usize,
+    command: u8,
 ) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.push(VERSION);
@@ -195,7 +197,7 @@ fn serialize_request(
     buf.push(OPTION_CHUNK_STREAM);
     buf.push(((padding_len as u8) << 4) | security);
     buf.push(0); // reserve
-    buf.push(COMMAND_TCP);
+    buf.push(command);
     buf.extend_from_slice(&target.port().to_be_bytes());
 
     match target {
@@ -698,6 +700,20 @@ impl Outbound for VmessOutbound {
     }
 
     async fn connect(&self, target: &TargetAddr) -> io::Result<BoxedStream> {
+        self.connect_cmd(target, COMMAND_TCP).await
+    }
+
+    async fn connect_udp(
+        &self,
+        target: &TargetAddr,
+    ) -> io::Result<Box<dyn crate::adapter::PacketConn>> {
+        let stream = self.connect_cmd(target, COMMAND_UDP).await?;
+        Ok(Box::new(crate::adapter::packet::LengthFramedPacketConn::new(stream)))
+    }
+}
+
+impl VmessOutbound {
+    async fn connect_cmd(&self, target: &TargetAddr, command: u8) -> io::Result<BoxedStream> {
         let mut last_error = None;
         let mut tcp = None;
         for addr in self.server.resolve_all().await? {
@@ -727,7 +743,7 @@ impl Outbound for VmessOutbound {
         resp_iv.copy_from_slice(&Sha256::digest(&req_iv)[..16]);
 
         let padding = (OsRng.next_u32() % 16) as usize;
-        let request = serialize_request(&req_iv, &req_key, resp_v, self.security, target, padding);
+        let request = serialize_request(&req_iv, &req_key, resp_v, self.security, target, padding, command);
         let key = cmd_key(&self.uuid);
         let header = seal_vmess_aead_header(&key, &request, std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -844,7 +860,7 @@ mod tests {
         let iv = [1u8; 16];
         let key = [2u8; 16];
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
-        let header = serialize_request(&iv, &key, 0x7f, SECURITY_AES_128_GCM, &TargetAddr::Ip(ip, 443), 0);
+        let header = serialize_request(&iv, &key, 0x7f, SECURITY_AES_128_GCM, &TargetAddr::Ip(ip, 443), 0, COMMAND_TCP);
         assert_eq!(header[0], VERSION);
         assert_eq!(&header[1..17], &iv);
         assert_eq!(&header[17..33], &key);

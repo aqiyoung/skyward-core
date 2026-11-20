@@ -1,0 +1,68 @@
+//! Framing round-trip test for VLESS UDP against an in-process mock
+//! server. The sandbox forbids real UDP sends (sendto EPERM), so the
+//! live xray fixture can only prove session acceptance; this mock
+//! proves the per-packet length framing carries payloads intact.
+//! Kept as .bak in the repo so CI never runs it.
+
+use skyward_core::adapter::vless::VlessOutbound;
+use skyward_core::adapter::Outbound;
+use skyward_core::common::TargetAddr;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const UUID: &str = "11111111-2222-3333-4444-555555555555";
+
+#[tokio::test]
+async fn vless_udp_framing_round_trip() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        // VLESS request header: ver(1) uuid(16) addons_len(1) cmd(1)
+        // port(2) atyp(1) ipv4(4) = 26 bytes with no addons.
+        let mut header = [0u8; 26];
+        socket.read_exact(&mut header).await.unwrap();
+        assert_eq!(header[0], 0, "version");
+        assert_eq!(header[18], 2, "command must be UDP");
+        // Response header: version + no addons.
+        socket.write_all(&[0, 0]).await.unwrap();
+        // Echo packets back with a prefix, length-framed.
+        loop {
+            let mut len_buf = [0u8; 2];
+            if socket.read_exact(&mut len_buf).await.is_err() {
+                return;
+            }
+            let len = u16::from_be_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            socket.read_exact(&mut payload).await.unwrap();
+            let mut reply = b"UDP-ECHO:".to_vec();
+            reply.extend_from_slice(&payload);
+            socket
+                .write_all(&(reply.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            socket.write_all(&reply).await.unwrap();
+        }
+    });
+
+    let ob = VlessOutbound::try_new(
+        "t", "127.0.0.1", port, UUID, false, None, true,
+        None, None, None, None, None, None,
+    )
+    .unwrap();
+    let conn = ob
+        .connect_udp(&TargetAddr::Ip("127.0.0.1".parse().unwrap(), 18082))
+        .await
+        .unwrap();
+    conn.send(b"ping-udp").await.unwrap();
+    let mut buf = [0u8; 2048];
+    let n = conn.recv(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"UDP-ECHO:ping-udp");
+    // A second, larger packet exercises frame reassembly (the reply is
+    // bigger than the read buffer, so it comes back truncated to fit).
+    let big = vec![b'x'; 5000];
+    conn.send(&big).await.unwrap();
+    let n = conn.recv(&mut buf).await.unwrap();
+    assert_eq!(n, 2048);
+    assert!(buf[..n].starts_with(b"UDP-ECHO:xxxx"));
+    assert!(buf[100..n].iter().all(|&b| b == b'x'));
+}

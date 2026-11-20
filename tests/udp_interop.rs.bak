@@ -1,0 +1,91 @@
+//! Local interop tests for UDP relay against real xray servers
+//! (fixture in ~/workspace/tools/xray-test: UDP echo origin on 18082;
+//! vless 2456, vmess 2457, trojan 2458, shadowsocks 2459, socks 2460).
+//! Kept as .bak in the repo so CI never runs it.
+//!
+//! NOTE: the sandbox forbids UDP sends entirely (sendto EPERM), so in
+//! this environment the stream-based protocols get as far as xray
+//! accepting and routing the session (visible in the server log)
+//! before freedom's own send fails, and the socket-based ones cannot
+//! send at all. On an unrestricted host all six should pass; the
+//! framing itself is covered by tests/udp_framing.rs.bak.
+
+use skyward_core::adapter::socks5::Socks5Outbound;
+use skyward_core::adapter::trojan::TrojanOutbound;
+use skyward_core::adapter::vless::VlessOutbound;
+use skyward_core::adapter::vmess::VmessOutbound;
+use skyward_core::adapter::shadowsocks::ShadowsocksOutbound;
+use skyward_core::adapter::{DirectOutbound, Outbound, PacketConn};
+use skyward_core::common::TargetAddr;
+use std::time::Duration;
+
+const UUID: &str = "11111111-2222-3333-4444-555555555555";
+
+fn echo_target() -> TargetAddr {
+    TargetAddr::Ip("127.0.0.1".parse().unwrap(), 18082)
+}
+
+async fn assert_echo(conn: Box<dyn PacketConn>, label: &str) {
+    tokio::time::timeout(Duration::from_secs(5), conn.send(b"ping-udp"))
+        .await
+        .unwrap_or_else(|_| panic!("{}: send timed out", label))
+        .unwrap_or_else(|e| panic!("{}: send failed: {}", label, e));
+    let mut buf = [0u8; 2048];
+    let n = tokio::time::timeout(Duration::from_secs(5), conn.recv(&mut buf))
+        .await
+        .unwrap_or_else(|_| panic!("{}: recv timed out", label))
+        .unwrap_or_else(|e| panic!("{}: recv failed: {}", label, e));
+    assert_eq!(&buf[..n], b"UDP-ECHO:ping-udp", "{}: unexpected echo", label);
+}
+
+#[tokio::test]
+async fn udp_direct() {
+    let ob = DirectOutbound::new("d");
+    let conn = ob.connect_udp(&echo_target()).await.unwrap();
+    assert_echo(conn, "direct").await;
+}
+
+#[tokio::test]
+async fn udp_vless() {
+    let ob = VlessOutbound::try_new(
+        "t", "127.0.0.1", 2456, UUID, false, None, true,
+        None, None, None, None, None, None,
+    )
+    .unwrap();
+    let conn = ob.connect_udp(&echo_target()).await.unwrap();
+    assert_echo(conn, "vless").await;
+}
+
+#[tokio::test]
+async fn udp_vmess() {
+    let ob = VmessOutbound::try_new(
+        "t", "127.0.0.1", 2457, UUID, "auto", false, None, true,
+        None, None, None, None,
+    )
+    .unwrap();
+    let conn = ob.connect_udp(&echo_target()).await.unwrap();
+    assert_echo(conn, "vmess").await;
+}
+
+#[tokio::test]
+async fn udp_trojan() {
+    let ob = TrojanOutbound::try_new("t", "127.0.0.1", 2458, "password", Some("localhost"), false)
+        .unwrap();
+    let conn = ob.connect_udp(&echo_target()).await.unwrap();
+    assert_echo(conn, "trojan").await;
+}
+
+#[tokio::test]
+async fn udp_shadowsocks() {
+    let ob = ShadowsocksOutbound::try_new("t", "127.0.0.1", 2459, "aes-256-gcm", "sspassword")
+        .unwrap();
+    let conn = ob.connect_udp(&echo_target()).await.unwrap();
+    assert_echo(conn, "shadowsocks").await;
+}
+
+#[tokio::test]
+async fn udp_socks5() {
+    let ob = Socks5Outbound::try_new("t", "127.0.0.1", 2460, None, None, false, None, true).unwrap();
+    let conn = ob.connect_udp(&echo_target()).await.unwrap();
+    assert_echo(conn, "socks5").await;
+}

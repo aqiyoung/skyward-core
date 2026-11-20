@@ -20,6 +20,7 @@ use crate::config::WsOpts;
 
 const VERSION: u8 = 0x00;
 const COMMAND_TCP: u8 = 0x01;
+const COMMAND_UDP: u8 = 0x02;
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x02;
 const ATYP_IPV6: u8 = 0x03;
@@ -43,6 +44,15 @@ fn encode_request(uuid: &[u8; 16], target: &TargetAddr) -> Vec<u8> {
 }
 
 fn encode_request_with_flow(uuid: &[u8; 16], target: &TargetAddr, flow: Option<&str>) -> Vec<u8> {
+    encode_request_cmd(uuid, target, flow, COMMAND_TCP)
+}
+
+fn encode_request_cmd(
+    uuid: &[u8; 16],
+    target: &TargetAddr,
+    flow: Option<&str>,
+    command: u8,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + 16 + 1 + 20 + 1 + 2 + 1 + 8);
     out.push(VERSION);
     out.extend_from_slice(uuid);
@@ -58,7 +68,7 @@ fn encode_request_with_flow(uuid: &[u8; 16], target: &TargetAddr, flow: Option<&
         }
         None => out.push(0),
     }
-    out.push(COMMAND_TCP);
+    out.push(command);
     out.extend_from_slice(&target.port().to_be_bytes());
 
     match target {
@@ -152,6 +162,65 @@ impl VlessOutbound {
         Err(last_error.unwrap_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "no VLESS server address")
         }))
+    }
+}
+
+impl VlessOutbound {
+    /// Build the transport stream over an established TCP connection:
+    /// REALITY / TLS / plain, then WebSocket and gRPC wraps. No VLESS
+    /// header is written and vision is not applied (both are TCP-session
+    /// concerns handled by `connect`).
+    async fn wrap_transport(&self, tcp: tokio::net::TcpStream) -> io::Result<BoxedStream> {
+        let mut stream: BoxedStream = if let Some(reality) = &self.reality {
+            Box::new(
+                crate::adapter::tls13::connect_tls13(
+                    Box::new(tcp),
+                    &crate::adapter::tls13::Tls13Options {
+                        server_name: self.sni.clone(),
+                        alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+                        reality: Some(reality.clone()),
+                    },
+                )
+                .await?,
+            )
+        } else if self.use_tls {
+            // Name the server name and verification mode: a handshake the server
+            // rejects looks identical for a wrong SNI and for a strict verifier.
+            static DIAG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+                crate::jni::emit_log_event(&format!(
+                    "[rust-core] vless {} -> {}:{} sni={} verify={}",
+                    self.name,
+                    self.server.address(),
+                    self.server.port(),
+                    self.sni,
+                    self.verify
+                ));
+            }
+            // A WebSocket upgrade is HTTP/1.1; offering h2 in ALPN could make
+            // the server negotiate HTTP/2 and reject the upgrade outright.
+            if self.use_ws {
+                connect_tls_http1(&self.sni, tcp, self.verify).await?
+            } else {
+                connect_tls(&self.sni, tcp, self.verify).await?
+            }
+        } else {
+            Box::new(tcp)
+        };
+
+        if self.use_ws {
+            stream = Box::new(
+                connect_ws(stream, &self.ws_host, &self.ws_path, &self.ws_headers).await?,
+            );
+        }
+
+        if self.use_grpc {
+            stream = Box::new(
+                crate::adapter::grpc::connect_grpc(stream, &self.sni, &self.grpc_service)
+                    .await?,
+            );
+        }
+        Ok(stream)
     }
 }
 
@@ -334,55 +403,7 @@ impl Outbound for VlessOutbound {
             }
         }
 
-        let mut stream: BoxedStream = if let Some(reality) = &self.reality {
-            Box::new(
-                crate::adapter::tls13::connect_tls13(
-                    Box::new(tcp),
-                    &crate::adapter::tls13::Tls13Options {
-                        server_name: self.sni.clone(),
-                        alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-                        reality: Some(reality.clone()),
-                    },
-                )
-                .await?,
-            )
-        } else if self.use_tls {
-            // Name the server name and verification mode: a handshake the server
-            // rejects looks identical for a wrong SNI and for a strict verifier.
-            static DIAG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            if DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
-                crate::jni::emit_log_event(&format!(
-                    "[rust-core] vless {} -> {}:{} sni={} verify={}",
-                    self.name,
-                    self.server.address(),
-                    self.server.port(),
-                    self.sni,
-                    self.verify
-                ));
-            }
-            // A WebSocket upgrade is HTTP/1.1; offering h2 in ALPN could make
-            // the server negotiate HTTP/2 and reject the upgrade outright.
-            if self.use_ws {
-                connect_tls_http1(&self.sni, tcp, self.verify).await?
-            } else {
-                connect_tls(&self.sni, tcp, self.verify).await?
-            }
-        } else {
-            Box::new(tcp)
-        };
-
-        if self.use_ws {
-            stream = Box::new(
-                connect_ws(stream, &self.ws_host, &self.ws_path, &self.ws_headers).await?,
-            );
-        }
-
-        if self.use_grpc {
-            stream = Box::new(
-                crate::adapter::grpc::connect_grpc(stream, &self.sni, &self.grpc_service)
-                    .await?,
-            );
-        }
+        let mut stream = self.wrap_transport(tcp).await?;
 
         if self.vision && !self.use_ws && !self.use_grpc {
             // The request header travels outside the vision framing; the
@@ -409,6 +430,39 @@ impl Outbound for VlessOutbound {
         // after connect() returns, and the target answers only after that.
         // mihomo consumes the header lazily on first read; do the same.
         Ok(Box::new(VlessStream::new(stream)))
+    }
+
+    async fn connect_udp(
+        &self,
+        target: &TargetAddr,
+    ) -> io::Result<Box<dyn crate::adapter::PacketConn>> {
+        // Same transports as TCP (minus vision, which is a TCP flow),
+        // with a UDP-command request header; packets are length-framed
+        // over the stream once VlessStream has stripped the response
+        // header on first read.
+        let mut stream: BoxedStream = if self.use_xhttp {
+            let outbound = self;
+            let dial = move || async move {
+                let tcp = outbound.dial_server().await?;
+                if outbound.use_tls {
+                    connect_tls_http1(&outbound.sni, tcp, outbound.verify).await
+                } else {
+                    Ok(Box::new(tcp) as BoxedStream)
+                }
+            };
+            Box::new(
+                crate::adapter::xhttp::connect_xhttp(dial, &self.xhttp_host, &self.xhttp_path)
+                    .await?,
+            )
+        } else {
+            let tcp = self.dial_server().await?;
+            self.wrap_transport(tcp).await?
+        };
+        stream
+            .write_all(&encode_request_cmd(&self.uuid, target, None, COMMAND_UDP))
+            .await?;
+        let stream: BoxedStream = Box::new(VlessStream::new(stream));
+        Ok(Box::new(crate::adapter::packet::LengthFramedPacketConn::new(stream)))
     }
 }
 
