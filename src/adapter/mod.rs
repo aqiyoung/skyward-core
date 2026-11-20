@@ -17,6 +17,8 @@ use crate::config::{Config, ProxyDef};
 pub mod anytls;
 pub mod grpc;
 pub mod h2;
+pub mod h3;
+pub mod hysteria2;
 pub mod packet;
 pub mod tls13;
 pub mod vision;
@@ -34,6 +36,7 @@ pub mod vmess;
 pub mod ws;
 
 use http_proxy::HttpOutbound;
+use hysteria2::Hysteria2Outbound;
 use shadowsocks::ShadowsocksOutbound;
 use snell::SnellOutbound;
 use socks5::Socks5Outbound;
@@ -477,6 +480,33 @@ pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
                             name: def.name.clone(),
                             kind: "anytls (invalid config)".into(),
                         }))
+                }
+                "hysteria2" => {
+                    if let Some(obfs) = def.obfs.as_deref().filter(|o| !o.is_empty()) {
+                        Arc::new(UnimplementedOutbound {
+                            name: def.name.clone(),
+                            kind: format!("hysteria2 (obfs={})", obfs),
+                        })
+                    } else {
+                        let made = match (def.server.as_deref(), def.port, def.password.as_deref()) {
+                            (Some(server), Some(port), Some(password)) => Hysteria2Outbound::try_new(
+                                &def.name,
+                                server,
+                                port,
+                                password,
+                                def.tls_server_name(),
+                                verify,
+                                def.up.as_deref(),
+                                def.down.as_deref(),
+                            ),
+                            _ => None,
+                        };
+                        made.map(|o| Arc::new(o) as Arc<dyn Outbound>)
+                            .unwrap_or_else(|| Arc::new(UnimplementedOutbound {
+                                name: def.name.clone(),
+                                kind: "hysteria2 (invalid config)".into(),
+                            }))
+                    }
                 }
                 _ => Arc::new(UnimplementedOutbound {
                     name: def.name.clone(),

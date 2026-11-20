@@ -77,6 +77,30 @@ where
 /// TLS for the delay probe: HTTP/1.1 only. Advertising `h2` makes targets such
 /// as www.gstatic.com negotiate HTTP/2, and the probe speaks HTTP/1.1, so the
 /// response would be binary frames instead of a status line.
+/// rustls client config with ALPN `h3`, for QUIC-based outbounds
+/// (Hysteria2). Same trust model as the TCP TLS connector: webpki
+/// roots, or accept-anything when the node sets `skip-cert-verify`.
+pub fn quic_client_config(verify: bool) -> ClientConfig {
+    let builder = ClientConfig::builder();
+    let mut config = if verify {
+        builder
+            .with_root_certificates(RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            })
+            .with_no_client_auth()
+    } else {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate {
+                provider: provider.clone(),
+            }))
+            .with_no_client_auth()
+    };
+    config.alpn_protocols = vec![b"h3".to_vec()];
+    config
+}
+
 pub async fn connect_tls_http1<S>(host: &str, tcp: S, verify: bool) -> io::Result<BoxedStream>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,

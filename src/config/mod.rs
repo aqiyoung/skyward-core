@@ -77,6 +77,11 @@ pub struct ProxyDef {
     pub version: Option<i32>,
     pub protocol: Option<String>,
     pub obfs: Option<String>,
+    #[serde(rename = "obfs-password")]
+    pub obfs_password: Option<String>,
+    /// Hysteria2 bandwidth hints, e.g. `100 Mbps`.
+    pub up: Option<String>,
+    pub down: Option<String>,
     pub username: Option<String>,
     pub uuid: Option<String>,
     pub sni: Option<String>,
