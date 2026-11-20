@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::Ipv4Addr;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -74,8 +75,8 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
                 Some(host) => TargetAddr::Domain(host, key.dst_port),
                 None => TargetAddr::Ip(key.dst.into(), key.dst_port),
             };
-            let conn = match tokio::time::timeout(DIAL_TIMEOUT, engine.dial_udp(&target)).await {
-                Ok(Ok(conn)) => conn,
+            let (conn, rule, final_name) = match tokio::time::timeout(DIAL_TIMEOUT, engine.dial_udp(&target)).await {
+                Ok(Ok(dialed)) => dialed,
                 Ok(Err(e)) => {
                     crate::tun::runtime::diag_udp(format!(
                         "udp session {}:{} -> {} failed: {}",
@@ -95,14 +96,29 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
                     return;
                 }
             };
+            // Register with the connection tracker like a TCP flow, so UDP
+            // sessions show up in the App's connection and request lists.
+            let (track_id, up_counter, down_counter) = engine
+                .connections
+                .add(
+                    &target,
+                    &rule,
+                    "",
+                    vec![final_name, rule.clone()],
+                    crate::tunnel::connection::Network::Udp,
+                    Some((key.src.to_string(), key.src_port)),
+                )
+                .await;
             if let Err(e) = conn.send(&first_payload).await {
                 crate::tun::runtime::diag_udp(format!(
                     "udp session {}:{} -> {} first send failed: {}",
                     key.src, key.src_port, target.address(), e
                 ));
+                engine.connections.remove(&track_id).await;
                 sessions.lock().unwrap().remove(&key);
                 return;
             }
+            up_counter.fetch_add(first_payload.len() as u64, Ordering::Relaxed);
             crate::tun::runtime::diag_udp(format!(
                 "udp session {}:{} -> {} open",
                 key.src, key.src_port, target.address()
@@ -113,13 +129,17 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
                     tokio::select! {
                         outgoing = rx.recv() => {
                             match outgoing {
-                                Some(data) => conn.send(&data).await.map(|_| true),
+                                Some(data) => conn.send(&data).await.map(|_| {
+                                    up_counter.fetch_add(data.len() as u64, Ordering::Relaxed);
+                                    true
+                                }),
                                 None => Ok(false),
                             }
                         }
                         incoming = conn.recv(&mut buf) => {
                             match incoming {
                                 Ok(n) => {
+                                    down_counter.fetch_add(n as u64, Ordering::Relaxed);
                                     let packet = build_udp_reply(
                                         key.dst, key.dst_port, key.src, key.src_port, &buf[..n],
                                     );
@@ -139,6 +159,7 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
                     Err(_) => break,        // idle timeout
                 }
             }
+            engine.connections.remove(&track_id).await;
             sessions.lock().unwrap().remove(&key);
         });
     }
@@ -152,7 +173,12 @@ fn refuse<T: Write>(io: &Arc<Mutex<T>>, key: &SessionKey, payload_len: usize) {
         return;
     }
     if let Some(packet) = refuse_packet(key, payload_len) {
-        let _ = io.lock().unwrap().write_all(&packet);
+        if io.lock().unwrap().write_all(&packet).is_ok() {
+            crate::tun::runtime::diag_udp(format!(
+                "udp refuse {}:{} -> {}:{} (icmp port-unreachable)",
+                key.src, key.src_port, key.dst, key.dst_port
+            ));
+        }
     }
 }
 

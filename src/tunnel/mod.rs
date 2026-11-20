@@ -233,25 +233,37 @@ impl Engine {
     }
 
     /// Open a UDP packet session to `target` through the rule/outbound
-    /// pipeline. Used by the TUN stack's UDP session manager.
+    /// pipeline. Used by the TUN stack's UDP session manager. Returns the
+    /// session plus the rule and final outbound that served it, so the
+    /// caller can register the session with the connection tracker the
+    /// way TCP flows do.
     pub async fn dial_udp(
         &self,
         target: &TargetAddr,
-    ) -> io::Result<Box<dyn crate::adapter::PacketConn>> {
+    ) -> io::Result<(Box<dyn crate::adapter::PacketConn>, String, String)> {
         let rule_target = self.decide(target).await;
         let final_name = self.outbounds.resolve(&rule_target).await;
+        dial_diag(format!(
+            "dial_udp {} -> rule={} outbound={}",
+            target.address(),
+            rule_target,
+            final_name
+        ));
         let outbound = self.outbounds.outbound(&final_name).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("unknown outbound '{}'", final_name))
         })?;
-        outbound.connect_udp(target).await.map_err(|e| {
-            dial_diag(format!(
-                "dial_udp {} via {} FAILED: {}",
-                target.address(),
-                final_name,
-                e
-            ));
-            e
-        })
+        match outbound.connect_udp(target).await {
+            Ok(conn) => Ok((conn, rule_target, final_name)),
+            Err(e) => {
+                dial_diag(format!(
+                    "dial_udp {} via {} FAILED: {}",
+                    target.address(),
+                    final_name,
+                    e
+                ));
+                Err(e)
+            }
+        }
     }
 
     /// Dial a target through a specific outbound/group name (used by delay tests).

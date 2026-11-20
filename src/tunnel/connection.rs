@@ -153,7 +153,7 @@ impl ConnectionTracker {
         };
         let info = ConnectionInfo {
             id: id.to_string(),
-            kind: "tcp".to_string(),
+            kind: match network { Network::Tcp => "tcp".into(), Network::Udp => "udp".into() },
             metadata: ConnectionMeta {
                 network: match network { Network::Tcp => "tcp".into(), Network::Udp => "udp".into() },
                 source_ip,
