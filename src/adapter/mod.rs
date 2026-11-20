@@ -19,6 +19,7 @@ pub mod grpc;
 pub mod h2;
 pub mod h3;
 pub mod hysteria2;
+pub mod tuic;
 pub mod packet;
 pub mod tls13;
 pub mod vision;
@@ -37,6 +38,7 @@ pub mod ws;
 
 use http_proxy::HttpOutbound;
 use hysteria2::Hysteria2Outbound;
+use tuic::TuicOutbound;
 use shadowsocks::ShadowsocksOutbound;
 use snell::SnellOutbound;
 use socks5::Socks5Outbound;
@@ -507,6 +509,26 @@ pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
                                 kind: "hysteria2 (invalid config)".into(),
                             }))
                     }
+                }
+                "tuic" => {
+                    let made = match (def.server.as_deref(), def.port, def.uuid.as_deref(), def.password.as_deref()) {
+                        (Some(server), Some(port), Some(uuid), Some(password)) => TuicOutbound::try_new(
+                            &def.name,
+                            server,
+                            port,
+                            uuid,
+                            password,
+                            def.tls_server_name(),
+                            verify,
+                            def.udp_relay_mode.as_deref() == Some("quic"),
+                        ),
+                        _ => None,
+                    };
+                    made.map(|o| Arc::new(o) as Arc<dyn Outbound>)
+                        .unwrap_or_else(|| Arc::new(UnimplementedOutbound {
+                            name: def.name.clone(),
+                            kind: "tuic (invalid config)".into(),
+                        }))
                 }
                 _ => Arc::new(UnimplementedOutbound {
                     name: def.name.clone(),

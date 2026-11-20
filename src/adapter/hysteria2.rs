@@ -247,9 +247,16 @@ impl Hysteria2Outbound {
 }
 
 /// One proxied TCP stream over a QUIC bidirectional stream.
-struct Hy2Stream {
+/// Shared with the TUIC outbound, whose streams have the same shape.
+pub(crate) struct Hy2Stream {
     send: quinn::SendStream,
     recv: quinn::RecvStream,
+}
+
+impl Hy2Stream {
+    pub(crate) fn new(send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
+        Hy2Stream { send, recv }
+    }
 }
 
 impl AsyncRead for Hy2Stream {

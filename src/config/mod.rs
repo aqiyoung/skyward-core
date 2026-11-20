@@ -82,6 +82,10 @@ pub struct ProxyDef {
     /// Hysteria2 bandwidth hints, e.g. `100 Mbps`.
     pub up: Option<String>,
     pub down: Option<String>,
+    /// TUIC UDP relay mode: `native` (QUIC datagrams, default) or
+    /// `quic` (packet streams).
+    #[serde(rename = "udp-relay-mode")]
+    pub udp_relay_mode: Option<String>,
     pub username: Option<String>,
     pub uuid: Option<String>,
     pub sni: Option<String>,
