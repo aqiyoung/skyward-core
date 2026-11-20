@@ -89,6 +89,34 @@ impl Outbound for RejectOutbound {
     }
 }
 
+/// Why a vless/vmess def cannot be spoken by this core, as an
+/// UnimplementedOutbound kind string, or None if it can. Only plain TCP and
+/// WebSocket transports are implemented; grpc/xhttp/vision/REALITY defs used
+/// to degrade silently to plain TCP, which connects at the transport level
+/// and then dies mid-handshake against the real server — apps see a fake
+/// "connected" flow that never carries data. Failing the dial honestly lets
+/// url-test/fallback groups move on to a node that works.
+fn unsupported_transport(def: &crate::config::ProxyDef) -> Option<String> {
+    let kind = def.kind.as_str();
+    if let Some(network) = def.network.as_deref() {
+        let n = network.trim().to_ascii_lowercase();
+        if !n.is_empty() && n != "tcp" && n != "ws" {
+            return Some(format!("{} (network={})", kind, network));
+        }
+    }
+    if kind == "vless" {
+        if let Some(flow) = def.flow.as_deref() {
+            if !flow.trim().is_empty() {
+                return Some(format!("vless (flow={})", flow));
+            }
+        }
+        if def.security.as_deref() == Some("reality") || def.reality_opts.is_some() {
+            return Some("vless (security=reality)".to_string());
+        }
+    }
+    None
+}
+
 /// Placeholder for protocols that are not ported yet (ss, vless, vmess, …).
 pub struct UnimplementedOutbound {
     name: String,
@@ -291,7 +319,10 @@ pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
                         }))
                 }
                 "vmess" => {
-                    let made = match (def.server.as_deref(), def.port, def.uuid.as_deref()) {
+                    let made = if unsupported_transport(def).is_some() {
+                        None
+                    } else {
+                        match (def.server.as_deref(), def.port, def.uuid.as_deref()) {
                         (Some(server), Some(port), Some(uuid)) => VmessOutbound::try_new(
                             &def.name,
                             server,
@@ -305,15 +336,20 @@ pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
                             def.ws_opts.as_ref(),
                         ),
                         _ => None,
+                        }
                     };
                     made.map(|o| Arc::new(o) as Arc<dyn Outbound>)
                         .unwrap_or_else(|| Arc::new(UnimplementedOutbound {
                             name: def.name.clone(),
-                            kind: "vmess (invalid config)".into(),
+                            kind: unsupported_transport(def)
+                                .unwrap_or_else(|| "vmess (invalid config)".to_string()),
                         }))
                 }
                 "vless" => {
-                    let made = match (def.server.as_deref(), def.port, def.uuid.as_deref()) {
+                    let made = if unsupported_transport(def).is_some() {
+                        None
+                    } else {
+                        match (def.server.as_deref(), def.port, def.uuid.as_deref()) {
                         (Some(server), Some(port), Some(uuid)) => VlessOutbound::try_new(
                             &def.name,
                             server,
@@ -329,11 +365,13 @@ pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
                             def.ws_opts.as_ref(),
                         ),
                         _ => None,
+                        }
                     };
                     made.map(|o| Arc::new(o) as Arc<dyn Outbound>)
                         .unwrap_or_else(|| Arc::new(UnimplementedOutbound {
                             name: def.name.clone(),
-                            kind: "vless (invalid config)".into(),
+                            kind: unsupported_transport(def)
+                                .unwrap_or_else(|| "vless (invalid config)".to_string()),
                         }))
                 }
                 "trojan" => {
@@ -555,6 +593,32 @@ fn _ip_marker(_: Option<IpAddr>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_transports_are_named() {
+        let config = crate::config::Config::from_str(
+            "proxies:\n  - {name: g, type: vless, server: s, port: 443, uuid: u, network: grpc}\n  - {name: v, type: vless, server: s, port: 443, uuid: u, flow: xtls-rprx-vision}\n  - {name: r, type: vless, server: s, port: 443, uuid: u, security: reality}\n  - {name: w, type: vless, server: s, port: 443, uuid: u, network: ws, tls: true}\n  - {name: x, type: vmess, server: s, port: 443, uuid: u, network: xhttp}\n",
+        )
+        .unwrap();
+        let by_name = |n: &str| config.proxies.iter().find(|p| p.name == n).unwrap();
+        assert_eq!(
+            unsupported_transport(by_name("g")).as_deref(),
+            Some("vless (network=grpc)")
+        );
+        assert_eq!(
+            unsupported_transport(by_name("v")).as_deref(),
+            Some("vless (flow=xtls-rprx-vision)")
+        );
+        assert_eq!(
+            unsupported_transport(by_name("r")).as_deref(),
+            Some("vless (security=reality)")
+        );
+        assert_eq!(unsupported_transport(by_name("w")), None);
+        assert_eq!(
+            unsupported_transport(by_name("x")).as_deref(),
+            Some("vmess (network=xhttp)")
+        );
+    }
 
     #[tokio::test]
     async fn resolve_follows_nested_groups() {

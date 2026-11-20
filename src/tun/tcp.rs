@@ -494,7 +494,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                 result = tokio::time::timeout(std::time::Duration::from_secs(10), engine.dial_named(&final_name, &target)) => {
                     match result {
                         Ok(Ok(s)) => {
-                            flow_diag(format!("flow {} connected", addr));
+                            flow_diag(format!("flow {} connected via {}", addr, final_name));
                             s
                         }
                         Ok(Err(e)) => {
