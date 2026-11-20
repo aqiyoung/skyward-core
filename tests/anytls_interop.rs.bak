@@ -1,0 +1,39 @@
+//! Local interop test for AnyTLS against sing-box
+//! (fixture in ~/workspace/tools/xray-test/singbox.json: anytls
+//! inbound on 2464, TLS with the fixture cert, password "anypass";
+//! origin on 18080). Kept as .bak in the repo so CI never runs it.
+
+use skyward_core::adapter::anytls::AnytlsOutbound;
+use skyward_core::adapter::Outbound;
+use skyward_core::common::TargetAddr;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[tokio::test]
+async fn anytls_fetch_origin() {
+    let ob = AnytlsOutbound::try_new("t", "127.0.0.1", 2464, "anypass", Some("localhost"), false)
+        .unwrap();
+    let target = TargetAddr::Ip("127.0.0.1".parse().unwrap(), 18080);
+    let mut stream = tokio::time::timeout(Duration::from_secs(5), ob.connect(&target))
+        .await
+        .expect("connect timed out")
+        .expect("connect failed");
+    stream
+        .write_all(b"GET / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(n)) => out.extend_from_slice(&buf[..n]),
+            Ok(Err(e)) => panic!("read failed: {}", e),
+        }
+        if out.windows(4).any(|w| w == b"\r\n\r\n") && out.len() > 60 {
+            break;
+        }
+    }
+    let body = String::from_utf8_lossy(&out);
+    assert!(body.contains("GRPC-INTEROP-OK"), "unexpected body: {}", body);
+}

@@ -14,6 +14,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::common::TargetAddr;
 use crate::config::{Config, ProxyDef};
 
+pub mod anytls;
 pub mod grpc;
 pub mod h2;
 pub mod packet;
@@ -455,6 +456,26 @@ pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
                         .unwrap_or_else(|| Arc::new(UnimplementedOutbound {
                             name: def.name.clone(),
                             kind: "trojan (invalid config)".into(),
+                        }))
+                }
+                "anytls" => {
+                    let made = match (def.server.as_deref(), def.port, def.password.as_deref()) {
+                        (Some(server), Some(port), Some(password)) => {
+                            crate::adapter::anytls::AnytlsOutbound::try_new(
+                                &def.name,
+                                server,
+                                port,
+                                password,
+                                def.tls_server_name(),
+                                verify,
+                            )
+                        }
+                        _ => None,
+                    };
+                    made.map(|o| Arc::new(o) as Arc<dyn Outbound>)
+                        .unwrap_or_else(|| Arc::new(UnimplementedOutbound {
+                            name: def.name.clone(),
+                            kind: "anytls (invalid config)".into(),
                         }))
                 }
                 _ => Arc::new(UnimplementedOutbound {
