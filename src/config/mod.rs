@@ -86,6 +86,17 @@ pub struct ProxyDef {
     /// `quic` (packet streams).
     #[serde(rename = "udp-relay-mode")]
     pub udp_relay_mode: Option<String>,
+    /// WireGuard keys and interface addresses (classic single-peer
+    /// form; the `peers` list form is honoured too).
+    #[serde(rename = "private-key")]
+    pub private_key: Option<String>,
+    #[serde(rename = "public-key")]
+    pub public_key: Option<String>,
+    #[serde(rename = "preshared-key")]
+    pub preshared_key: Option<String>,
+    pub ip: Option<String>,
+    pub ipv6: Option<String>,
+    pub peers: Option<Vec<WireguardPeer>>,
     pub username: Option<String>,
     pub uuid: Option<String>,
     pub sni: Option<String>,
@@ -149,6 +160,16 @@ pub struct XHttpOpts {
     /// auto | packet-up | stream-up | stream-one
     #[serde(default)]
     pub mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct WireguardPeer {
+    pub server: Option<String>,
+    pub port: Option<u16>,
+    #[serde(rename = "public-key")]
+    pub public_key: Option<String>,
+    #[serde(rename = "preshared-key")]
+    pub preshared_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

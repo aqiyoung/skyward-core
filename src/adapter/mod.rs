@@ -20,6 +20,7 @@ pub mod h2;
 pub mod h3;
 pub mod hysteria2;
 pub mod tuic;
+pub mod wireguard;
 pub mod packet;
 pub mod tls13;
 pub mod vision;
@@ -39,6 +40,7 @@ pub mod ws;
 use http_proxy::HttpOutbound;
 use hysteria2::Hysteria2Outbound;
 use tuic::TuicOutbound;
+use wireguard::WireguardOutbound;
 use shadowsocks::ShadowsocksOutbound;
 use snell::SnellOutbound;
 use socks5::Socks5Outbound;
@@ -528,6 +530,47 @@ pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
                         .unwrap_or_else(|| Arc::new(UnimplementedOutbound {
                             name: def.name.clone(),
                             kind: "tuic (invalid config)".into(),
+                        }))
+                }
+                "wireguard" => {
+                    // Peers-list form wins; classic form uses the
+                    // def's own server/port/public-key.
+                    let peer = def.peers.as_ref().and_then(|peers| peers.first());
+                    let server_port = match peer {
+                        Some(peer) => match (peer.server.as_deref(), peer.port) {
+                            (Some(server), Some(port)) => Some((server.to_string(), port)),
+                            _ => None,
+                        },
+                        None => match (def.server.as_deref(), def.port) {
+                            (Some(server), Some(port)) => Some((server.to_string(), port)),
+                            _ => None,
+                        },
+                    };
+                    let public_key = peer
+                        .and_then(|p| p.public_key.as_deref())
+                        .or(def.public_key.as_deref());
+                    let preshared = peer
+                        .and_then(|p| p.preshared_key.as_deref())
+                        .or(def.preshared_key.as_deref());
+                    let made = match (server_port, def.private_key.as_deref(), public_key) {
+                        (Some((server, port)), Some(private_key), Some(public_key)) => {
+                            WireguardOutbound::try_new(
+                                &def.name,
+                                &server,
+                                port,
+                                private_key,
+                                public_key,
+                                preshared,
+                                def.ip.as_deref(),
+                                def.ipv6.as_deref(),
+                            )
+                        }
+                        _ => None,
+                    };
+                    made.map(|o| Arc::new(o) as Arc<dyn Outbound>)
+                        .unwrap_or_else(|| Arc::new(UnimplementedOutbound {
+                            name: def.name.clone(),
+                            kind: "wireguard (invalid config)".into(),
                         }))
                 }
                 _ => Arc::new(UnimplementedOutbound {
