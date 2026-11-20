@@ -16,9 +16,12 @@ use crate::mobile;
 
 static JAVA_VM: OnceLock<JavaVM> = OnceLock::new();
 static EVENT_LISTENER: Mutex<Option<GlobalRef>> = Mutex::new(None);
-static TUN_SESSION: Mutex<Option<(i32, crate::tun::TunConfig)>> = Mutex::new(None);
-static TUN_TASK: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
-static TUN_CANCEL: Mutex<Option<Arc<tokio::sync::Notify>>> = Mutex::new(None);
+struct TunSession {
+    cancel: Arc<tokio::sync::Notify>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+static TUN_SESSION: Mutex<Option<TunSession>> = Mutex::new(None);
 static TUN_HANDLER: Mutex<Option<GlobalRef>> = Mutex::new(None);
 static TOKIO_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static TUN_WAKE: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
@@ -230,19 +233,14 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_setEventListener
 pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_quickSetup(
     mut env: JNIEnv,
     _class: JObject,
-    _init_params: JString,
+    init_params: JString,
     setup_params: JString,
     handler: JObject,
 ) {
-    let setup_text = java_string(&mut env, &setup_params);
-    // quickSetup only carries per-run overrides (test-url/selected-map/
-    // skip-cert-verify); it must not reload or replace the loaded profile.
-    let payload = format!(
-        "{{\"method\":\"quickSetup\",\"arguments\":{}}}",
-        if setup_text.trim().is_empty() { "{}".to_string() } else { setup_text }
-    );
-    let result = mobile::invoke(payload.as_bytes());
-    if let Err(e) = fire_result(&mut env, &handler, &result) {
+    let init = java_string(&mut env, &init_params);
+    let setup = java_string(&mut env, &setup_params);
+    let result = mobile::android_quick_setup(&init, &setup);
+    if let Err(e) = fire_result(&mut env, &handler, result.as_bytes()) {
         let _ = env.throw_new("java/lang/RuntimeException", format!("quickSetup callback: {}", e));
     }
 }
@@ -268,14 +266,20 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_stopTun(
     _env: JNIEnv,
     _class: JObject,
 ) {
-    if let Some(cancel) = TUN_CANCEL.lock().unwrap().take() {
-        cancel.notify_one();
+    let mut session = TUN_SESSION.lock().unwrap();
+    if let Some(previous) = session.take() {
+        if let Some(rt) = tokio_runtime() {
+            finish_tun(rt, previous);
+        }
     }
-    if let Some(task) = TUN_TASK.lock().unwrap().take() {
-        task.abort();
-    }
-    *TUN_SESSION.lock().unwrap() = None;
     *TUN_HANDLER.lock().unwrap() = None;
+}
+
+fn finish_tun(rt: &tokio::runtime::Runtime, session: TunSession) {
+    session.cancel.notify_one();
+    if let Err(error) = rt.block_on(session.task) {
+        tracing::warn!(%error, "TUN task failed while stopping");
+    }
 }
 
 #[no_mangle]
@@ -294,14 +298,19 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
     let dns_text = java_string(&mut env, &dns);
     let options_text = java_string(&mut env, &options);
 
-    // Keep the Java protect() callback alive for the lifetime of the tunnel.
-    match env.new_global_ref(handler) {
-        Ok(global) => {
-            *TUN_HANDLER.lock().unwrap() = Some(global);
-            emit_log_event("[rust-core] protect handler installed");
+    let mut session = TUN_SESSION.lock().unwrap();
+    let Some(rt) = tokio_runtime() else { return JNI_FALSE };
+    let Some(engine) = rt.block_on(crate::runtime_state::engine()) else {
+        emit_log_event("[rust-core] startTun: no profile has been loaded");
+        return JNI_FALSE;
+    };
+    let handler = match env.new_global_ref(handler) {
+        Ok(global) => global,
+        Err(e) => {
+            emit_log_event(&format!("[rust-core] unable to retain protect handler: {}", e));
+            return JNI_FALSE;
         }
-        Err(e) => emit_log_event(&format!("[rust-core] unable to retain protect handler: {}", e)),
-    }
+    };
 
     let diag = format!(
         "[rust-core] startTun called: fd={} stack='{}' address='{}' dns='{}' options='{}'",
@@ -328,38 +337,19 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
             let msg = format!("[rust-core] TUN device opened: fd={} stack={} mtu={}", fd, config.stack, mtu);
             tracing::info!("{}", msg);
             emit_log_event(&msg);
-            let rt = match tokio_runtime() {
-                Some(rt) => rt,
-                None => {
-                    let e = "[rust-core] FATAL: no tokio runtime available";
-                    tracing::error!("{}", e);
-                    emit_log_event(e);
-                    return JNI_FALSE;
-                }
-            };
-            // Use the active engine if the App already applied a config;
-            // otherwise fall back to a default DIRECT-only engine.
-            let engine = rt
-                .block_on(crate::runtime_state::engine())
-                .unwrap_or_else(|| rt.block_on(build_default_engine()));
             let wake = TUN_WAKE
                 .get_or_init(|| Arc::new(tokio::sync::Notify::new()))
                 .clone();
-            *TUN_SESSION.lock().unwrap() = Some((fd, config.clone()));
-            emit_log_event("[rust-core] TUN runtime spawned, returning TRUE");
-            if let Some(previous) = TUN_TASK.lock().unwrap().take() {
-                previous.abort();
+            if let Some(previous) = session.take() {
+                finish_tun(rt, previous);
             }
+            *TUN_HANDLER.lock().unwrap() = Some(handler);
             let cancel = Arc::new(tokio::sync::Notify::new());
-            *TUN_CANCEL.lock().unwrap() = Some(cancel.clone());
+            let stop = cancel.clone();
             let task = rt.spawn(async move {
-                crate::tun::runtime::run(device, config, engine, wake, cancel).await;
-                let e = format!("[rust-core] TUN runtime EXITED for fd {}", fd);
-                tracing::warn!("{}", e);
-                emit_log_event(&e);
-                *TUN_SESSION.lock().unwrap() = None;
+                crate::tun::runtime::run(device, config, engine, wake, stop).await;
             });
-            *TUN_TASK.lock().unwrap() = Some(task);
+            *session = Some(TunSession { cancel, task });
             JNI_TRUE
         }
         Err(e) => {
@@ -369,38 +359,6 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
             JNI_FALSE
         }
     }
-}
-
-/// Build the engine the relay loop uses when no config has been applied yet.
-/// The App writes the assembled profile to `<home>/config.yaml`, so prefer that
-/// over the built-in DIRECT-only default: a profile that failed to apply would
-/// otherwise leave the tunnel silently routing everything straight out.
-async fn build_default_engine() -> Arc<crate::tunnel::Engine> {
-    let home = crate::mobile::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    let config_path = home.join("config.yaml");
-    let config = match std::fs::read_to_string(&config_path) {
-        Ok(text) => match crate::config::Config::from_str(&text) {
-            Ok(c) => {
-                emit_log_event(&format!(
-                    "[rust-core] startTun: no engine yet, loaded {}",
-                    config_path.display()
-                ));
-                c
-            }
-            Err(e) => {
-                emit_log_event(&format!(
-                    "[rust-core] startTun: {} did not parse ({}), using DIRECT-only default",
-                    config_path.display(),
-                    e
-                ));
-                crate::config::Config::default()
-            }
-        },
-        Err(_) => crate::config::Config::default(),
-    };
-    let traffic = crate::runtime_state::traffic();
-    let data_dir = config_path.parent().map(|p| p.to_path_buf()).unwrap_or(home);
-    Arc::new(crate::tunnel::Engine::new(config, traffic, &data_dir).await)
 }
 
 fn traffic_json(total: bool) -> String {
@@ -444,14 +402,19 @@ mod tests {
     }
 
     #[test]
-    fn tun_session_starts_with_valid_config() {
-        assert!(TUN_SESSION.lock().unwrap().is_none());
-        let cfg = crate::tun::TunConfig::parse("gvisor", "10.0.0.2/30", "198.51.100.1", "").unwrap();
-        *TUN_SESSION.lock().unwrap() = Some((42, cfg));
-        let guard = TUN_SESSION.lock().unwrap();
-        assert_eq!(guard.as_ref().unwrap().0, 42);
-        drop(guard);
-        *TUN_SESSION.lock().unwrap() = None;
+    fn stopping_tun_waits_for_the_task_to_release_its_resources() {
+        let rt = tokio_runtime().unwrap();
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        let stop = cancel.clone();
+        let resource = Arc::new(());
+        let task_resource = resource.clone();
+        let task = rt.spawn(async move {
+            stop.notified().await;
+            tokio::task::yield_now().await;
+            drop(task_resource);
+        });
+        finish_tun(rt, TunSession { cancel, task });
+        assert_eq!(Arc::strong_count(&resource), 1);
     }
 
     #[test]

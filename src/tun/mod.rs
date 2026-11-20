@@ -103,8 +103,8 @@ pub fn device_from_fd(fd: i32, mtu: usize) -> io::Result<TunDevice<std::fs::File
     // read() would freeze the tokio worker that drives the whole stack.
     unsafe {
         let flags = libc::fcntl(owned.as_raw_fd(), libc::F_GETFL, 0);
-        if flags >= 0 {
-            libc::fcntl(owned.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        if flags < 0 || libc::fcntl(owned.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(io::Error::last_os_error());
         }
     }
     // File wraps a raw fd and implements Read/Write; needed by the runtime loop.

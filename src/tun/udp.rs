@@ -38,11 +38,20 @@ pub struct UdpManager<T> {
     engine: Arc<Engine>,
     io: Arc<Mutex<T>>,
     sessions: Arc<Mutex<HashMap<SessionKey, mpsc::Sender<Vec<u8>>>>>,
+    tasks: Mutex<tokio::task::JoinSet<()>>,
 }
 
 impl<T: Read + Write + Send + 'static> UdpManager<T> {
     pub fn new(engine: Arc<Engine>, io: Arc<Mutex<T>>) -> Self {
-        UdpManager { engine, io, sessions: Arc::new(Mutex::new(HashMap::new())) }
+        UdpManager {
+            engine, io, sessions: Arc::new(Mutex::new(HashMap::new())),
+            tasks: Mutex::new(tokio::task::JoinSet::new()),
+        }
+    }
+
+    pub async fn shutdown(&mut self) {
+        self.tasks.get_mut().unwrap().shutdown().await;
+        self.sessions.lock().unwrap().clear();
     }
 
     /// Forward one outbound UDP payload from the TUN.
@@ -67,10 +76,13 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
     }
 
     fn spawn_session(&self, key: SessionKey, mut rx: mpsc::Receiver<Vec<u8>>, first_payload: Vec<u8>) {
-        let engine = self.engine.clone();
+        let fallback_engine = self.engine.clone();
         let io = self.io.clone();
         let sessions = self.sessions.clone();
-        tokio::spawn(async move {
+        let mut tasks = self.tasks.lock().unwrap();
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(async move {
+            let engine = crate::runtime_state::engine().await.unwrap_or(fallback_engine);
             let target = match crate::fake_ip::hostname_for(key.dst) {
                 Some(host) => TargetAddr::Domain(host, key.dst_port),
                 None => TargetAddr::Ip(key.dst.into(), key.dst_port),
@@ -98,7 +110,7 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
             };
             // Register with the connection tracker like a TCP flow, so UDP
             // sessions show up in the App's connection and request lists.
-            let (track_id, up_counter, down_counter) = engine
+            let (connection, up_counter, down_counter) = engine
                 .connections
                 .add(
                     &target,
@@ -109,13 +121,12 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
                     Some((key.src.to_string(), key.src_port)),
                 )
                 .await;
+            let relay = async {
             if let Err(e) = conn.send(&first_payload).await {
                 crate::tun::runtime::diag_udp(format!(
                     "udp session {}:{} -> {} first send failed: {}",
                     key.src, key.src_port, target.address(), e
                 ));
-                engine.connections.remove(&track_id).await;
-                sessions.lock().unwrap().remove(&key);
                 return;
             }
             up_counter.fetch_add(first_payload.len() as u64, Ordering::Relaxed);
@@ -159,7 +170,12 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
                     Err(_) => break,        // idle timeout
                 }
             }
-            engine.connections.remove(&track_id).await;
+            };
+            tokio::select! {
+                biased;
+                _ = connection.closed() => {}
+                _ = relay => {}
+            }
             sessions.lock().unwrap().remove(&key);
         });
     }

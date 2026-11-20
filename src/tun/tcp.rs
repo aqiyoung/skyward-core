@@ -102,6 +102,7 @@ pub struct TcpManager<T> {
     flows: HashMap<FlowKey, Flow>,
     engine: Arc<Engine>,
     io: Arc<Mutex<T>>,
+    tasks: Mutex<tokio::task::JoinSet<()>>,
     /// Largest payload one packet written back to the TUN may carry: the
     /// interface MTU minus the IPv4+TCP headers. A larger packet is dropped
     /// by the kernel, and this stack keeps no retransmission state, so the
@@ -115,6 +116,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             flows: HashMap::new(),
             engine,
             io,
+            tasks: Mutex::new(tokio::task::JoinSet::new()),
             mtu_payload: 1460,
         }
     }
@@ -430,11 +432,9 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
     }
 
     /// Stop every relay; used when the VPN goes down.
-    pub fn shutdown(&mut self) {
-        for flow in self.flows.values() {
-            flow.cancel.notify_one();
-        }
+    pub async fn shutdown(&mut self) {
         self.flows.clear();
+        self.tasks.get_mut().unwrap().shutdown().await;
     }
 
     fn remove(&mut self, key: &FlowKey) {
@@ -464,7 +464,9 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
         // Log the resolved target (domain when known), not the fake IP, so a
         // log export names the site a flow belongs to.
         let addr = target.address();
-        tokio::spawn(async move {
+        let mut tasks = self.tasks.lock().unwrap();
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(async move {
             // Use the engine that is current NOW, not the one the TUN started
             // with: setupConfig swaps the engine when the profile changes,
             // and the App does not restart the TUN for that. Capturing the
@@ -515,7 +517,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                     }
                 }
             };
-            let (id, up_counter, down_counter) = engine
+            let (connection, up_counter, down_counter) = engine
                 .connections
                 .add(
                     &target,
@@ -530,7 +532,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             let started = std::time::Instant::now();
             let mut end_reason = "cancelled";
             let mut write_shutdown = false;
-            'relay: loop {
+            let relay = async { 'relay: loop {
                 // App half-closed and its bytes are flushed: close the
                 // outbound write side so the server sees EOF, keep reading.
                 if !write_shutdown
@@ -583,6 +585,14 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                         }
                     }
                 }
+            }};
+            tokio::select! {
+                biased;
+                _ = connection.closed() => {
+                    end_reason = "connection_closed";
+                    relay_failed.store(true, Ordering::Relaxed);
+                }
+                _ = relay => {}
             }
             flow_diag(format!(
                 "flow {} done up={} down={} lived={}ms end={}",
@@ -592,7 +602,6 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                 started.elapsed().as_millis(),
                 end_reason
             ));
-            engine.connections.remove(&id).await;
             done.store(true, Ordering::Relaxed);
         });
     }

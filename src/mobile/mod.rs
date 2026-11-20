@@ -163,6 +163,36 @@ fn handle_init_clash(call: &MethodCall) -> Vec<u8> {
     ok(&call.id, Value::Bool(true))
 }
 
+pub(crate) fn android_quick_setup(init: &str, setup: &str) -> String {
+    let Ok(init) = serde_json::from_str::<Value>(init) else {
+        return "invalid core initialization parameters".into();
+    };
+    let Some(home) = init.get("home-dir").and_then(Value::as_str).filter(|p| !p.is_empty()) else {
+        return "core home directory is missing".into();
+    };
+    let Ok(mut arguments) = serde_json::from_str::<Value>(setup) else {
+        return "invalid saved setup parameters".into();
+    };
+    let Some(params) = arguments.as_object_mut() else {
+        return "invalid saved setup parameters".into();
+    };
+    let has_path = params.get("base").and_then(|base| base.get("path")).and_then(Value::as_str)
+        .is_some_and(|p| !p.is_empty()) || params.get("path").and_then(Value::as_str)
+        .is_some_and(|p| !p.is_empty());
+    if !has_path {
+        params.insert("path".into(), json!(PathBuf::from(home).join("config.yaml")));
+    }
+
+    let _ = HOME_DIR.set(home.to_owned());
+    IS_INIT.store(true, Ordering::Relaxed);
+    let result = handle_setup_config(&MethodCall {
+        id: String::new(), method: "setupConfig".into(), arguments,
+    });
+    serde_json::from_slice::<Value>(&result).ok()
+        .and_then(|value| value.get("result").and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_else(|| "invalid core setup response".into())
+}
+
 fn handle_get_proxies(call: &MethodCall) -> Vec<u8> {
     let future = async {
         let engine = crate::runtime_state::engine().await;
@@ -1236,6 +1266,7 @@ fn handle_setup_config(call: &MethodCall) -> Vec<u8> {
                 .get("base")
                 .and_then(|b| b.get("path"))
                 .and_then(|p| p.as_str())
+                .filter(|p| !p.is_empty())
         })
         .or_else(|| call.arguments.get("path").and_then(|p| p.as_str()));
 
@@ -1805,5 +1836,20 @@ mod tests {
         let r = response(invoke(payload.as_bytes()));
         assert_eq!(r["result"], "");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn android_quick_setup_requires_saved_config_and_returns_plain_message() {
+        let _guard = crate::runtime_state::TEST_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("skyward-quick-{}", rand::random::<u64>()));
+        std::fs::create_dir(&dir).unwrap();
+        let init = json!({"home-dir": dir}).to_string();
+        assert!(!android_quick_setup(&init, "null").is_empty());
+        assert!(!android_quick_setup(&init, "{}").is_empty());
+        let file = dir.join("config.yaml");
+        std::fs::write(&file, "mode: global\nrules:\n  - MATCH,REJECT\n").unwrap();
+        assert_eq!(android_quick_setup(&init, "{}"), "");
+        assert_eq!(block_on(crate::runtime_state::config_path()).unwrap(), Some(file));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
