@@ -1,0 +1,130 @@
+//! Local interop tests against real xray Vision servers (fixture in
+//! ~/workspace/tools/xray-test: vless+xtls-rprx-vision over TLS on 2454
+//! and over REALITY on 2455; plain origin on 18080, TLS origin on
+//! 18443). Kept as .bak in the repo so CI never runs it.
+
+use skyward_core::adapter::tls13::{connect_tls13, Tls13Options};
+use skyward_core::adapter::vless::VlessOutbound;
+use skyward_core::adapter::Outbound;
+use skyward_core::common::TargetAddr;
+use skyward_core::config::RealityOpts;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const UUID: &str = "11111111-2222-3333-4444-555555555555";
+const PUBLIC_KEY: &str = "4hN-a-HBq0m7lp-t1Wuel4VwRSrRkytUevO6VgMTz1Q";
+
+async fn fetch<S>(mut stream: S) -> String
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    tokio::time::timeout(Duration::from_secs(5), async {
+        stream
+            .write_all(b"GET /hello HTTP/1.1\r\nHost: origin.test\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("write timed out");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.unwrap();
+        String::from_utf8_lossy(&out).to_string()
+    })
+    .await
+    .expect("read timed out")
+}
+
+#[tokio::test]
+async fn vless_vision_tls_plain_inner() {
+    let ob = VlessOutbound::try_new(
+        "t", "127.0.0.1", 2454, UUID, true, Some("localhost"), false,
+        None, None, None, None, None, Some("xtls-rprx-vision"),
+    )
+    .unwrap();
+    let stream = ob
+        .connect(&TargetAddr::Ip("127.0.0.1".parse().unwrap(), 18080))
+        .await
+        .unwrap();
+    let body = fetch(stream).await;
+    assert!(body.contains("GRPC-INTEROP-OK"), "got: {}", body);
+}
+
+#[tokio::test]
+async fn vless_vision_reality_plain_inner() {
+    let reality = RealityOpts {
+        public_key: Some(PUBLIC_KEY.into()),
+        short_id: Some("0123456789abcdef".into()),
+        spider_x: None,
+    };
+    let ob = VlessOutbound::try_new(
+        "t", "127.0.0.1", 2455, UUID, true, Some("localhost"), false,
+        None, None, None, None, Some(&reality), Some("xtls-rprx-vision"),
+    )
+    .unwrap();
+    let stream = ob
+        .connect(&TargetAddr::Ip("127.0.0.1".parse().unwrap(), 18080))
+        .await
+        .unwrap();
+    let body = fetch(stream).await;
+    assert!(body.contains("GRPC-INTEROP-OK"), "got: {}", body);
+}
+
+/// Inner traffic is itself TLS 1.3: exercises the vision filter and the
+/// end/direct transition on both sides.
+#[tokio::test]
+async fn vless_vision_tls_inner_tls() {
+    let ob = VlessOutbound::try_new(
+        "t", "127.0.0.1", 2454, UUID, true, Some("localhost"), false,
+        None, None, None, None, None, Some("xtls-rprx-vision"),
+    )
+    .unwrap();
+    let stream = ob
+        .connect(&TargetAddr::Ip("127.0.0.1".parse().unwrap(), 18443))
+        .await
+        .unwrap();
+    let inner = connect_tls13(
+        stream,
+        &Tls13Options {
+            server_name: "localhost".to_string(),
+            alpn: vec![b"http/1.1".to_vec()],
+            reality: None,
+        },
+    )
+    .await
+    .unwrap();
+    let body = fetch(inner).await;
+    assert!(body.contains("GRPC-INTEROP-OK"), "got: {}", body);
+}
+
+/// Inner TLS over vision+REALITY: exercises direct mode, where the TLS
+/// layer is dropped and the inner stream continues on the raw socket.
+#[tokio::test]
+async fn vless_vision_reality_inner_tls() {
+    let reality = RealityOpts {
+        public_key: Some(PUBLIC_KEY.into()),
+        short_id: Some("0123456789abcdef".into()),
+        spider_x: None,
+    };
+    let ob = VlessOutbound::try_new(
+        "t", "127.0.0.1", 2455, UUID, true, Some("localhost"), false,
+        None, None, None, None, Some(&reality), Some("xtls-rprx-vision"),
+    )
+    .unwrap();
+    let stream = ob
+        .connect(&TargetAddr::Ip("127.0.0.1".parse().unwrap(), 18443))
+        .await
+        .unwrap();
+    let inner = connect_tls13(
+        stream,
+        &Tls13Options {
+            server_name: "localhost".to_string(),
+            alpn: vec![b"http/1.1".to_vec()],
+            reality: None,
+        },
+    )
+    .await
+    .unwrap();
+    let body = fetch(inner).await;
+    assert!(body.contains("GRPC-INTEROP-OK"), "got: {}", body);
+}

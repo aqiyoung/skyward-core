@@ -16,6 +16,7 @@ use crate::config::{Config, ProxyDef};
 
 pub mod grpc;
 pub mod tls13;
+pub mod vision;
 pub mod http_proxy;
 pub mod xhttp;
 pub mod provider;
@@ -109,7 +110,8 @@ fn unsupported_transport(def: &crate::config::ProxyDef) -> Option<String> {
     }
     if kind == "vless" {
         if let Some(flow) = def.flow.as_deref() {
-            if !flow.trim().is_empty() {
+            let f = flow.trim();
+            if !f.is_empty() && f != "xtls-rprx-vision" {
                 return Some(format!("vless (flow={})", flow));
             }
         }
@@ -368,6 +370,7 @@ pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
                             def.grpc_opts.as_ref(),
                             def.xhttp_opts.as_ref(),
                             def.reality_opts.as_ref(),
+                            def.flow.as_deref(),
                         ),
                         _ => None,
                         }
@@ -620,10 +623,7 @@ mod tests {
             unsupported_transport(&h2.proxies[0]).as_deref(),
             Some("vless (network=h2)")
         );
-        assert_eq!(
-            unsupported_transport(by_name("v")).as_deref(),
-            Some("vless (flow=xtls-rprx-vision)")
-        );
+        assert_eq!(unsupported_transport(by_name("v")), None);
         assert_eq!(unsupported_transport(by_name("r")), None);
         assert_eq!(unsupported_transport(by_name("w")), None);
         assert_eq!(unsupported_transport(by_name("x")), None);

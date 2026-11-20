@@ -886,6 +886,21 @@ pub struct Tls13Stream {
 }
 
 impl Tls13Stream {
+    /// Consume the stream and return (raw transport, bytes to read first,
+    /// sealed bytes still to write). Used by XTLS-Vision's direct mode,
+    /// where the TLS layer is dropped and the inner stream continues on
+    /// the raw socket: the read leftovers (decrypted bytes not yet
+    /// delivered, then raw bytes read but not yet decrypted) are the
+    /// inner stream's first bytes, and the pending sealed records must
+    /// still go out on the socket before any raw writes.
+    pub fn into_raw_parts(mut self) -> (BoxedStream, BytesMut, Vec<u8>) {
+        let mut read_first = BytesMut::new();
+        read_first.extend_from_slice(&self.plain_buf);
+        read_first.extend_from_slice(&self.raw_buf);
+        let pending_write = self.write_buf.split_off(self.write_pos);
+        (self.inner, read_first, pending_write)
+    }
+
     fn flush_write_buf(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while self.write_pos < self.write_buf.len() {
             match Pin::new(&mut self.inner).poll_write(cx, &self.write_buf[self.write_pos..]) {

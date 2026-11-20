@@ -39,10 +39,25 @@ fn parse_uuid(text: &str) -> Option<[u8; 16]> {
 }
 
 fn encode_request(uuid: &[u8; 16], target: &TargetAddr) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 16 + 1 + 1 + 2 + 1 + 8);
+    encode_request_with_flow(uuid, target, None)
+}
+
+fn encode_request_with_flow(uuid: &[u8; 16], target: &TargetAddr, flow: Option<&str>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 16 + 1 + 20 + 1 + 2 + 1 + 8);
     out.push(VERSION);
     out.extend_from_slice(uuid);
-    out.push(0); // addons length
+    // Addons are a protobuf message; field 1 (Flow) is the only one a
+    // vision server checks — it refuses the connection without it.
+    match flow {
+        Some(flow) => {
+            let addons_len = 2 + flow.len();
+            out.push(addons_len as u8);
+            out.push(0x0a); // field 1, length-delimited
+            out.push(flow.len() as u8);
+            out.extend_from_slice(flow.as_bytes());
+        }
+        None => out.push(0),
+    }
     out.push(COMMAND_TCP);
     out.extend_from_slice(&target.port().to_be_bytes());
 
@@ -83,6 +98,7 @@ pub struct VlessOutbound {
     xhttp_path: String,
     xhttp_host: String,
     reality: Option<crate::adapter::tls13::RealityParams>,
+    vision: bool,
 }
 
 /// Parse mihomo-style reality-opts into wire parameters.
@@ -153,6 +169,7 @@ impl VlessOutbound {
         grpc_opts: Option<&crate::config::GrpcOpts>,
         xhttp_opts: Option<&crate::config::XHttpOpts>,
         reality_opts: Option<&crate::config::RealityOpts>,
+        flow: Option<&str>,
     ) -> Option<Self> {
         let uuid = parse_uuid(uuid)?;
         let sni = sni.filter(|s| !s.is_empty()).unwrap_or(server).to_string();
@@ -218,6 +235,7 @@ impl VlessOutbound {
             xhttp_path,
             xhttp_host,
             reality,
+            vision: flow.map(|f| f.trim() == "xtls-rprx-vision").unwrap_or(false),
         })
     }
 }
@@ -268,6 +286,54 @@ impl Outbound for VlessOutbound {
             last_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no VLESS server address"))
         })?;
 
+        // Vision keeps the TLS stream unboxed so the wrapper can drop to
+        // the raw socket when direct mode engages. Over rustls that is
+        // impossible (its buffers are unreachable), and a splicing server
+        // breaks the connection, so plain-TLS vision uses the hand-rolled
+        // client whenever certificate verification is off. With verify on
+        // it falls through to rustls and end-padding (documented limit).
+        if self.vision && !self.use_ws && !self.use_grpc {
+            if self.reality.is_none() && self.use_tls && !self.verify {
+                let mut tls = crate::adapter::tls13::connect_tls13(
+                    Box::new(tcp),
+                    &crate::adapter::tls13::Tls13Options {
+                        server_name: self.sni.clone(),
+                        alpn: vec![b"http/1.1".to_vec()],
+                        reality: None,
+                    },
+                )
+                .await?;
+                tls.write_all(&encode_request_with_flow(
+                    &self.uuid,
+                    target,
+                    Some("xtls-rprx-vision"),
+                ))
+                .await?;
+                let stream = crate::adapter::vision::VisionStream::new_tls13(tls, self.uuid);
+                return Ok(Box::new(VlessStream::new(stream)));
+            }
+            if let Some(reality) = &self.reality {
+                let mut tls = crate::adapter::tls13::connect_tls13(
+                    Box::new(tcp),
+                    &crate::adapter::tls13::Tls13Options {
+                        server_name: self.sni.clone(),
+                        alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+                        reality: Some(reality.clone()),
+                    },
+                )
+                .await?;
+                // The request header travels outside the vision framing.
+                tls.write_all(&encode_request_with_flow(
+                    &self.uuid,
+                    target,
+                    Some("xtls-rprx-vision"),
+                ))
+                .await?;
+                let stream = crate::adapter::vision::VisionStream::new_tls13(tls, self.uuid);
+                return Ok(Box::new(VlessStream::new(stream)));
+            }
+        }
+
         let mut stream: BoxedStream = if let Some(reality) = &self.reality {
             Box::new(
                 crate::adapter::tls13::connect_tls13(
@@ -316,6 +382,21 @@ impl Outbound for VlessOutbound {
                 crate::adapter::grpc::connect_grpc(stream, &self.sni, &self.grpc_service)
                     .await?,
             );
+        }
+
+        if self.vision && !self.use_ws && !self.use_grpc {
+            // The request header travels outside the vision framing; the
+            // padding blocks (first one prefixed with the UUID) carry
+            // everything after it, in both directions.
+            stream
+                .write_all(&encode_request_with_flow(
+                    &self.uuid,
+                    target,
+                    Some("xtls-rprx-vision"),
+                ))
+                .await?;
+            let stream = Box::new(crate::adapter::vision::VisionStream::new(stream, self.uuid));
+            return Ok(Box::new(VlessStream::new(stream)));
         }
 
         stream.write_all(&encode_request(&self.uuid, target)).await?;
@@ -483,14 +564,14 @@ mod tests {
 
     #[test]
     fn tls_and_sni_defaults() {
-        let plain = VlessOutbound::try_new("v", "example.com", 443, "b831381d-6324-4d53-ad4f-8cda48b30811", false, None, true, None, None, None, None, None).unwrap();
+        let plain = VlessOutbound::try_new("v", "example.com", 443, "b831381d-6324-4d53-ad4f-8cda48b30811", false, None, true, None, None, None, None, None, None).unwrap();
         assert!(!plain.use_tls);
         assert!(!plain.use_ws);
         assert_eq!(plain.sni, "example.com");
-        let secured = VlessOutbound::try_new("v", "example.com", 443, "b831381d63244d53ad4f8cda48b30811", true, Some("cdn.example.com"), true, None, None, None, None, None).unwrap();
+        let secured = VlessOutbound::try_new("v", "example.com", 443, "b831381d63244d53ad4f8cda48b30811", true, Some("cdn.example.com"), true, None, None, None, None, None, None).unwrap();
         assert!(secured.use_tls);
         assert_eq!(secured.sni, "cdn.example.com");
-        assert!(VlessOutbound::try_new("v", "h", 443, "bad", true, None, true, None, None, None, None, None).is_none());
+        assert!(VlessOutbound::try_new("v", "h", 443, "bad", true, None, true, None, None, None, None, None, None).is_none());
         // WS transport picks up the path and the Host header from ws-opts.
         let ws_opts = WsOpts {
             path: Some("/ray".into()),
@@ -511,6 +592,7 @@ mod tests {
             true,
             Some("ws"),
             Some(&ws_opts),
+            None,
             None,
             None,
             None,
