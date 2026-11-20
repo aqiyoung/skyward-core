@@ -41,6 +41,9 @@ crc32fast = "1"
 base64 = "0.21"
 bytes = "1"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+# Pure-Rust zstd decoder for MRS rule-set files (no C toolchain in the
+# Android cross build).
+ruzstd = "0.8"
 ml-kem = "0.2"
 libc = "0.2"
 argon2 = "0.5"

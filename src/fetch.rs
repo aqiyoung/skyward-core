@@ -11,17 +11,18 @@ use crate::adapter::BoxedStream;
 
 pub async fn fetch_url(url: &str) -> io::Result<Vec<u8>> {
     // Hard cap the whole download so a dead upstream cannot stall core startup.
-    match tokio::time::timeout(Duration::from_secs(3), fetch_url_inner(url)).await {
-        Ok(r) => r,
-        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "provider download timed out")),
-    }
+    fetch_url_timeout(url, Duration::from_secs(3)).await
 }
 
 /// Download with a longer deadline, for large GeoX files (a few MB each).
 pub async fn fetch_url_large(url: &str) -> io::Result<Vec<u8>> {
-    match tokio::time::timeout(Duration::from_secs(60), fetch_url_inner(url)).await {
+    fetch_url_timeout(url, Duration::from_secs(60)).await
+}
+
+pub async fn fetch_url_timeout(url: &str, timeout: Duration) -> io::Result<Vec<u8>> {
+    match tokio::time::timeout(timeout, fetch_url_inner(url)).await {
         Ok(r) => r,
-        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "geo download timed out")),
+        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "download timed out")),
     }
 }
 

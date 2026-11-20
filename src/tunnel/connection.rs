@@ -1,9 +1,9 @@
 //! Live connection registry backing the `/connections` API.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tokio::sync::RwLock;
@@ -114,6 +114,16 @@ pub enum Network {
 pub struct ConnectionTracker {
     next_id: AtomicU64,
     entries: RwLock<HashMap<u64, Entry>>,
+    /// Last traffic totals reported to the App per connection id; the
+    /// request-traffic watch diffs against this map.
+    watch_reported: Mutex<HashMap<String, (u64, u64)>>,
+    watch_running: AtomicBool,
+}
+
+/// The App's request-list event for one new connection (its
+/// `CoreEventType.request` payload is a TrackerInfo object).
+fn request_event_json(info: &ConnectionInfo) -> String {
+    serde_json::json!({ "type": "request", "data": info }).to_string()
 }
 
 impl ConnectionTracker {
@@ -122,7 +132,7 @@ impl ConnectionTracker {
     }
 
     pub async fn add(
-        &self,
+        self: &Arc<Self>,
         target: &TargetAddr,
         rule: &str,
         rule_payload: &str,
@@ -164,10 +174,66 @@ impl ConnectionTracker {
             start: iso8601(now_millis()),
         };
         self.entries.write().await.insert(id, Entry {
-            info,
+            info: info.clone(),
             counters: Counters { upload: upload.clone(), download: download.clone() },
         });
+        // The App's request list is event-fed (the Go core announces each
+        // connection as it opens); without this event the list stays empty.
+        crate::jni::emit_event_json(&request_event_json(&info));
+        self.watch_reported.lock().unwrap().insert(id.to_string(), (0, 0));
+        if !self.watch_running.swap(true, Ordering::SeqCst) {
+            let tracker = self.clone();
+            tokio::spawn(async move { tracker.run_traffic_watch().await });
+        }
         (id.to_string(), upload, download)
+    }
+
+    /// One-second traffic reports for the App's request list, mirroring
+    /// the Go core's requestTraffic watch: only changed totals are sent,
+    /// and the watch stops once no connection remains.
+    async fn run_traffic_watch(self: Arc<Self>) {
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let live: HashMap<String, (u64, u64)> = self
+                .snapshot()
+                .await
+                .into_iter()
+                .map(|info| (info.id, (info.upload, info.download)))
+                .collect();
+            let mut changed = Vec::new();
+            let drained = {
+                let mut reported = self.watch_reported.lock().unwrap();
+                for (id, current) in &live {
+                    if reported.get(id) != Some(current) {
+                        changed.push(serde_json::json!({
+                            "id": id,
+                            "upload": current.0,
+                            "download": current.1,
+                        }));
+                        reported.insert(id.clone(), *current);
+                    }
+                }
+                reported.retain(|id, _| live.contains_key(id));
+                reported.is_empty()
+            };
+            if !changed.is_empty() {
+                crate::jni::emit_event_json(
+                    &serde_json::json!({ "type": "requestTraffic", "data": changed }).to_string(),
+                );
+            }
+            if drained {
+                self.watch_running.store(false, Ordering::SeqCst);
+                // An add() may have raced in after the drain; hand the
+                // watch over instead of leaving its entry unwatched.
+                let again = !self.watch_reported.lock().unwrap().is_empty();
+                if again && !self.watch_running.swap(true, Ordering::SeqCst) {
+                    continue;
+                }
+                return;
+            }
+        }
     }
 
     pub async fn remove(&self, id: &str) {
@@ -225,7 +291,7 @@ mod tests {
 
     #[tokio::test]
     async fn tracks_connection_lifecycle() {
-        let tracker = ConnectionTracker::new();
+        let tracker = Arc::new(ConnectionTracker::new());
         let target = TargetAddr::Domain("example.com".into(), 443);
         let (id, up, down) = tracker.add(&target, "MATCH", "", vec!["DIRECT".into()], Network::Tcp, None).await;
         up.store(12, Ordering::Relaxed);
@@ -243,6 +309,20 @@ mod tests {
         assert_eq!(wire["chains"][0], "DIRECT");
         tracker.remove(&id).await;
         assert!(tracker.snapshot().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_event_carries_tracker_info() {
+        let tracker = Arc::new(ConnectionTracker::new());
+        let target = TargetAddr::Domain("example.com".into(), 443);
+        let (id, _, _) = tracker.add(&target, "MATCH", "", vec!["DIRECT".into()], Network::Tcp, None).await;
+        let snapshot = tracker.snapshot().await;
+        let event: serde_json::Value =
+            serde_json::from_str(&request_event_json(&snapshot[0])).unwrap();
+        assert_eq!(event["type"], "request");
+        assert_eq!(event["data"]["id"], id);
+        assert_eq!(event["data"]["metadata"]["host"], "example.com");
+        assert_eq!(event["data"]["rule"], "MATCH");
     }
 
     #[test]

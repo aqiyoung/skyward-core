@@ -10,6 +10,7 @@ use std::str::FromStr;
 use crate::common::TargetAddr;
 use crate::geo::GeoData;
 
+pub mod mrs;
 pub mod provider;
 
 use provider::ProviderRegistry;
@@ -359,12 +360,16 @@ mod tests {
         registry.insert(RuleProvider::new(
             "ads".into(),
             Behavior::Domain,
-            vec!["ads.example.com".into()],
+            vec!["+.ads.example.com".into(), "bare.example.org".into()],
         ));
         let geo = GeoData::default();
         let set = RuleSet::new(&["RULE-SET,ads,REJECT".into(), "MATCH,DIRECT".into()]);
         let target = TargetAddr::Domain("cdn.ads.example.com".into(), 80);
         assert_eq!(set.find(&target, None, Some(&geo), Some(&registry)).unwrap().target, "REJECT");
+        let bare = TargetAddr::Domain("bare.example.org".into(), 80);
+        assert_eq!(set.find(&bare, None, Some(&geo), Some(&registry)).unwrap().target, "REJECT");
+        let bare_sub = TargetAddr::Domain("www.bare.example.org".into(), 80);
+        assert_eq!(set.find(&bare_sub, None, Some(&geo), Some(&registry)).unwrap().target, "DIRECT");
         let clean = TargetAddr::Domain("example.com".into(), 80);
         assert_eq!(set.find(&clean, None, Some(&geo), Some(&registry)).unwrap().target, "DIRECT");
     }
