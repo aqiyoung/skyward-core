@@ -37,6 +37,8 @@ aes = "0.8"
 crc32fast = "1"
 base64 = "0.21"
 bytes = "1"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ml-kem = "0.2"
 libc = "0.2"
 argon2 = "0.5"
 chacha20 = "0.9"

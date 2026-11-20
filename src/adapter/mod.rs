@@ -15,6 +15,7 @@ use crate::common::TargetAddr;
 use crate::config::{Config, ProxyDef};
 
 pub mod grpc;
+pub mod tls13;
 pub mod http_proxy;
 pub mod xhttp;
 pub mod provider;
@@ -93,7 +94,7 @@ impl Outbound for RejectOutbound {
 
 /// Why a vless/vmess def cannot be spoken by this core, as an
 /// UnimplementedOutbound kind string, or None if it can. TCP, WebSocket and
-/// gRPC and XHTTP transports are implemented; vision/REALITY defs used to
+/// gRPC and XHTTP transports and REALITY are implemented; vision defs used to
 /// degrade silently to plain TCP, which connects at the transport level
 /// and then dies mid-handshake against the real server — apps see a fake
 /// "connected" flow that never carries data. Failing the dial honestly lets
@@ -111,9 +112,6 @@ fn unsupported_transport(def: &crate::config::ProxyDef) -> Option<String> {
             if !flow.trim().is_empty() {
                 return Some(format!("vless (flow={})", flow));
             }
-        }
-        if def.security.as_deref() == Some("reality") || def.reality_opts.is_some() {
-            return Some("vless (security=reality)".to_string());
         }
     }
     None
@@ -369,6 +367,7 @@ pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
                             def.ws_opts.as_ref(),
                             def.grpc_opts.as_ref(),
                             def.xhttp_opts.as_ref(),
+                            def.reality_opts.as_ref(),
                         ),
                         _ => None,
                         }
@@ -625,10 +624,7 @@ mod tests {
             unsupported_transport(by_name("v")).as_deref(),
             Some("vless (flow=xtls-rprx-vision)")
         );
-        assert_eq!(
-            unsupported_transport(by_name("r")).as_deref(),
-            Some("vless (security=reality)")
-        );
+        assert_eq!(unsupported_transport(by_name("r")), None);
         assert_eq!(unsupported_transport(by_name("w")), None);
         assert_eq!(unsupported_transport(by_name("x")), None);
     }

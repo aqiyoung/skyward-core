@@ -82,6 +82,46 @@ pub struct VlessOutbound {
     use_xhttp: bool,
     xhttp_path: String,
     xhttp_host: String,
+    reality: Option<crate::adapter::tls13::RealityParams>,
+}
+
+/// Parse mihomo-style reality-opts into wire parameters.
+fn parse_reality(opts: &crate::config::RealityOpts) -> Option<crate::adapter::tls13::RealityParams> {
+    use base64::Engine;
+    let public_key_b64 = opts.public_key.as_ref()?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(public_key_b64)
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(public_key_b64))
+        .ok()?;
+    if decoded.len() != 32 {
+        return None;
+    }
+    let mut public_key = [0u8; 32];
+    public_key.copy_from_slice(&decoded);
+    let mut short_id = [0u8; 8];
+    if let Some(sid) = opts.short_id.as_ref().filter(|s| !s.is_empty()) {
+        let bytes = hex_decode(sid)?;
+        if bytes.len() > 8 {
+            return None;
+        }
+        short_id[8 - bytes.len()..].copy_from_slice(&bytes);
+    }
+    Some(crate::adapter::tls13::RealityParams { public_key, short_id })
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    for i in (0..bytes.len()).step_by(2) {
+        let hi = (bytes[i] as char).to_digit(16)?;
+        let lo = (bytes[i + 1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Some(out)
 }
 
 impl VlessOutbound {
@@ -112,6 +152,7 @@ impl VlessOutbound {
         ws_opts: Option<&WsOpts>,
         grpc_opts: Option<&crate::config::GrpcOpts>,
         xhttp_opts: Option<&crate::config::XHttpOpts>,
+        reality_opts: Option<&crate::config::RealityOpts>,
     ) -> Option<Self> {
         let uuid = parse_uuid(uuid)?;
         let sni = sni.filter(|s| !s.is_empty()).unwrap_or(server).to_string();
@@ -133,6 +174,10 @@ impl VlessOutbound {
             .and_then(|x| x.host.clone())
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| sni.clone());
+        let reality = match reality_opts {
+            Some(opts) => Some(parse_reality(opts)?),
+            None => None,
+        };
         let server_addr = match server.parse::<IpAddr>() {
             Ok(ip) => TargetAddr::Ip(ip, port),
             Err(_) => TargetAddr::Domain(server.to_string(), port),
@@ -172,6 +217,7 @@ impl VlessOutbound {
             use_xhttp,
             xhttp_path,
             xhttp_host,
+            reality,
         })
     }
 }
@@ -222,7 +268,19 @@ impl Outbound for VlessOutbound {
             last_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no VLESS server address"))
         })?;
 
-        let mut stream: BoxedStream = if self.use_tls {
+        let mut stream: BoxedStream = if let Some(reality) = &self.reality {
+            Box::new(
+                crate::adapter::tls13::connect_tls13(
+                    Box::new(tcp),
+                    &crate::adapter::tls13::Tls13Options {
+                        server_name: self.sni.clone(),
+                        alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+                        reality: Some(reality.clone()),
+                    },
+                )
+                .await?,
+            )
+        } else if self.use_tls {
             // Name the server name and verification mode: a handshake the server
             // rejects looks identical for a wrong SNI and for a strict verifier.
             static DIAG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -425,14 +483,14 @@ mod tests {
 
     #[test]
     fn tls_and_sni_defaults() {
-        let plain = VlessOutbound::try_new("v", "example.com", 443, "b831381d-6324-4d53-ad4f-8cda48b30811", false, None, true, None, None, None, None).unwrap();
+        let plain = VlessOutbound::try_new("v", "example.com", 443, "b831381d-6324-4d53-ad4f-8cda48b30811", false, None, true, None, None, None, None, None).unwrap();
         assert!(!plain.use_tls);
         assert!(!plain.use_ws);
         assert_eq!(plain.sni, "example.com");
-        let secured = VlessOutbound::try_new("v", "example.com", 443, "b831381d63244d53ad4f8cda48b30811", true, Some("cdn.example.com"), true, None, None, None, None).unwrap();
+        let secured = VlessOutbound::try_new("v", "example.com", 443, "b831381d63244d53ad4f8cda48b30811", true, Some("cdn.example.com"), true, None, None, None, None, None).unwrap();
         assert!(secured.use_tls);
         assert_eq!(secured.sni, "cdn.example.com");
-        assert!(VlessOutbound::try_new("v", "h", 443, "bad", true, None, true, None, None, None, None).is_none());
+        assert!(VlessOutbound::try_new("v", "h", 443, "bad", true, None, true, None, None, None, None, None).is_none());
         // WS transport picks up the path and the Host header from ws-opts.
         let ws_opts = WsOpts {
             path: Some("/ray".into()),
@@ -453,6 +511,7 @@ mod tests {
             true,
             Some("ws"),
             Some(&ws_opts),
+            None,
             None,
             None,
         )

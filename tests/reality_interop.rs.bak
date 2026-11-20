@@ -1,0 +1,76 @@
+//! Local interop test against a real xray REALITY server (fixture in
+//! ~/workspace/tools/xray-test: vless+REALITY inbound on 2453, REALITY
+//! public key below, serverNames localhost, shortIds "" and
+//! 0123456789abcdef; origin HTTP server on 18080). Kept as .bak in the
+//! repo so CI never runs it.
+
+use skyward_core::adapter::vless::VlessOutbound;
+use skyward_core::adapter::Outbound;
+use skyward_core::common::TargetAddr;
+use skyward_core::config::RealityOpts;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const UUID: &str = "11111111-2222-3333-4444-555555555555";
+const PUBLIC_KEY: &str = "4hN-a-HBq0m7lp-t1Wuel4VwRSrRkytUevO6VgMTz1Q";
+
+async fn fetch<S>(mut stream: S) -> String
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    tokio::time::timeout(Duration::from_secs(5), async {
+        stream
+            .write_all(b"GET /hello HTTP/1.1\r\nHost: origin.test\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("write timed out");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.unwrap();
+        String::from_utf8_lossy(&out).to_string()
+    })
+    .await
+    .expect("read timed out")
+}
+
+#[tokio::test]
+async fn vless_reality_short_id() {
+    let reality = RealityOpts {
+        public_key: Some(PUBLIC_KEY.into()),
+        short_id: Some("0123456789abcdef".into()),
+        spider_x: None,
+    };
+    let ob = VlessOutbound::try_new(
+        "t", "127.0.0.1", 2453, UUID, true, Some("localhost"), false,
+        None, None, None, None, Some(&reality),
+    )
+    .unwrap();
+    let stream = ob
+        .connect(&TargetAddr::Ip("127.0.0.1".parse().unwrap(), 18080))
+        .await
+        .unwrap();
+    let body = fetch(stream).await;
+    assert!(body.contains("GRPC-INTEROP-OK"), "got: {}", body);
+}
+
+#[tokio::test]
+async fn vless_reality_empty_short_id() {
+    let reality = RealityOpts {
+        public_key: Some(PUBLIC_KEY.into()),
+        short_id: Some(String::new()),
+        spider_x: None,
+    };
+    let ob = VlessOutbound::try_new(
+        "t", "127.0.0.1", 2453, UUID, true, Some("localhost"), false,
+        None, None, None, None, Some(&reality),
+    )
+    .unwrap();
+    let stream = ob
+        .connect(&TargetAddr::Ip("127.0.0.1".parse().unwrap(), 18080))
+        .await
+        .unwrap();
+    let body = fetch(stream).await;
+    assert!(body.contains("GRPC-INTEROP-OK"), "got: {}", body);
+}
