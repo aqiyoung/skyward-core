@@ -583,6 +583,8 @@ pub struct VmessOutbound {
     ws_path: String,
     ws_host: String,
     ws_headers: Vec<(String, String)>,
+    use_grpc: bool,
+    grpc_service: String,
 }
 
 impl VmessOutbound {
@@ -597,8 +599,16 @@ impl VmessOutbound {
         verify: bool,
         network: Option<&str>,
         ws_opts: Option<&WsOpts>,
+        grpc_opts: Option<&crate::config::GrpcOpts>,
     ) -> Option<Self> {
         let uuid = parse_uuid(uuid)?;
+        let use_grpc = network
+            .map(|n| n.eq_ignore_ascii_case("grpc"))
+            .unwrap_or(false);
+        let grpc_service = grpc_opts
+            .and_then(|g| g.service_name.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "GunService".to_string());
         let security = match security.to_ascii_lowercase().as_str() {
             "" | "auto" | "aes-128-gcm" => SECURITY_AES_128_GCM,
             "chacha20-poly1305" => SECURITY_CHACHA20_POLY1305,
@@ -640,6 +650,8 @@ impl VmessOutbound {
             ws_path,
             ws_host,
             ws_headers,
+            use_grpc,
+            grpc_service,
         })
     }
 }
@@ -703,6 +715,12 @@ impl Outbound for VmessOutbound {
         if self.use_ws {
             stream = Box::new(
                 connect_ws(stream, &self.ws_host, &self.ws_path, &self.ws_headers).await?,
+            );
+        }
+        if self.use_grpc {
+            stream = Box::new(
+                crate::adapter::grpc::connect_grpc(stream, &self.sni, &self.grpc_service)
+                    .await?,
             );
         }
         stream.write_all(&header).await?;

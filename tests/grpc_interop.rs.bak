@@ -1,0 +1,82 @@
+//! Local interop tests against a real xray server (fixture in
+//! ~/workspace/tools/xray-test: xray on 2446/2447/2448 + miniproxy on
+//! 18081). Kept as .bak in the repo so CI never runs them.
+
+use skyward_core::adapter::vless::VlessOutbound;
+use skyward_core::adapter::vmess::VmessOutbound;
+use skyward_core::adapter::Outbound;
+use skyward_core::common::TargetAddr;
+use skyward_core::config::GrpcOpts;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const UUID: &str = "11111111-2222-3333-4444-555555555555";
+
+async fn fetch<S>(mut stream: S) -> String
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    tokio::time::timeout(Duration::from_secs(5), async {
+        stream
+            .write_all(b"GET /hello HTTP/1.1\r\nHost: origin.test\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("write timed out");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.unwrap();
+        String::from_utf8_lossy(&out).to_string()
+    })
+    .await
+    .expect("read timed out")
+}
+
+#[tokio::test]
+async fn vless_grpc_plain() {
+    let ob = VlessOutbound::try_new(
+        "t", "127.0.0.1", 2446, UUID, false, None, false,
+        Some("grpc"), None, None,
+    )
+    .unwrap();
+    let stream = ob
+        .connect(&TargetAddr::Ip("127.0.0.1".parse().unwrap(), 18080))
+        .await
+        .unwrap();
+    let body = fetch(stream).await;
+    assert!(body.contains("GRPC-INTEROP-OK"), "got: {}", body);
+}
+
+#[tokio::test]
+async fn vmess_grpc_plain() {
+    let ob = VmessOutbound::try_new(
+        "t", "127.0.0.1", 2447, UUID, "auto", false, None, false,
+        Some("grpc"), None, None,
+    )
+    .unwrap();
+    let stream = ob
+        .connect(&TargetAddr::Ip("127.0.0.1".parse().unwrap(), 18080))
+        .await
+        .unwrap();
+    let body = fetch(stream).await;
+    assert!(body.contains("GRPC-INTEROP-OK"), "got: {}", body);
+}
+
+#[tokio::test]
+async fn vless_grpc_tls_custom_service() {
+    let grpc = GrpcOpts {
+        service_name: Some("mysvc".into()),
+    };
+    let ob = VlessOutbound::try_new(
+        "t", "127.0.0.1", 2448, UUID, true, Some("localhost"), false,
+        Some("grpc"), None, Some(&grpc),
+    )
+    .unwrap();
+    let stream = ob
+        .connect(&TargetAddr::Ip("127.0.0.1".parse().unwrap(), 18080))
+        .await
+        .unwrap();
+    let body = fetch(stream).await;
+    assert!(body.contains("GRPC-INTEROP-OK"), "got: {}", body);
+}
