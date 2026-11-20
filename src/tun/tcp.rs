@@ -478,8 +478,19 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             let rule = engine.decide(&target).await;
             let final_name = engine.outbounds.resolve(&rule).await;
             let mut stream: BoxedStream = tokio::select! {
-                _ = cancel.notified() => return,
-                _ = engine.close_signal.notified() => return,
+                _ = cancel.notified() => {
+                    relay_failed.store(true, Ordering::Relaxed);
+                    done.store(true, Ordering::Relaxed);
+                    return;
+                }
+                _ = engine.close_signal.notified() => {
+                    // The engine was swapped (profile switch): exit, and let
+                    // the manager reset the flow so the app reconnects under
+                    // the new engine instead of ACKing into a dead queue.
+                    relay_failed.store(true, Ordering::Relaxed);
+                    done.store(true, Ordering::Relaxed);
+                    return;
+                }
                 result = tokio::time::timeout(std::time::Duration::from_secs(10), engine.dial_named(&final_name, &target)) => {
                     match result {
                         Ok(Ok(s)) => {
@@ -541,11 +552,21 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                     up_counter.fetch_add(n as u64, Ordering::Relaxed);
                     continue;
                 }
+                // Backpressure: the manager may only hand the app one window
+                // of unacknowledged data, so a fast server and a slow app
+                // would otherwise pile bytes into from_net without bound.
+                // Stop reading until the queue drains below the cap.
+                let over_cap = from_net.len() > 256 * 1024;
                 tokio::select! {
                     _ = cancel.notified() => { end_reason = "cancel"; break 'relay; }
-                    _ = engine.close_signal.notified() => { end_reason = "engine_close"; break 'relay; }
+                    _ = engine.close_signal.notified() => {
+                        end_reason = "engine_close";
+                        relay_failed.store(true, Ordering::Relaxed);
+                        break 'relay;
+                    }
                     _ = to_net.notified() => {}
-                    result = stream.read(&mut read_buf) => match result {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)), if over_cap => {}
+                    result = stream.read(&mut read_buf), if !over_cap => match result {
                         Ok(0) => {
                             end_reason = "remote_eof";
                             remote_eof.store(true, Ordering::Relaxed);
