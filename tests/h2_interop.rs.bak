@@ -1,0 +1,54 @@
+//! Local interop test for the legacy HTTP/2 transport (network=h2)
+//! against sing-box (xray removed this transport in favor of XHTTP;
+//! sing-box and mihomo still serve it). Fixture: sing-box vless+http
+//! inbound on 2462 (path /h2path), origin on 18080.
+//! Kept as .bak in the repo so CI never runs it.
+
+use skyward_core::adapter::vless::VlessOutbound;
+use skyward_core::adapter::Outbound;
+use skyward_core::common::TargetAddr;
+use skyward_core::config::HttpOpts;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const UUID: &str = "11111111-2222-3333-4444-555555555555";
+
+async fn fetch(ob: &VlessOutbound) -> String {
+    let target = TargetAddr::Ip("127.0.0.1".parse().unwrap(), 18080);
+    let mut stream = tokio::time::timeout(Duration::from_secs(5), ob.connect(&target))
+        .await
+        .expect("connect timed out")
+        .expect("connect failed");
+    stream
+        .write_all(b"GET / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(n)) => out.extend_from_slice(&buf[..n]),
+            Ok(Err(e)) => panic!("read failed: {}", e),
+        }
+        if out.windows(4).any(|w| w == b"\r\n\r\n") && out.len() > 60 {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[tokio::test]
+async fn vless_over_h2() {
+    let http = HttpOpts {
+        path: Some("/h2path".to_string()),
+        host: Some("localhost".to_string()),
+    };
+    let ob = VlessOutbound::try_new(
+        "t", "127.0.0.1", 2462, UUID, false, None, true,
+        Some("h2"), None, None, None, None, None, Some(&http),
+    )
+    .unwrap();
+    let body = fetch(&ob).await;
+    assert!(body.contains("GRPC-INTEROP-OK"), "unexpected body: {}", body);
+}

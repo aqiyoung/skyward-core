@@ -46,7 +46,7 @@ async fn vless_xhttp_plain() {
     };
     let ob = VlessOutbound::try_new(
         "t", "127.0.0.1", 2449, UUID, false, None, false,
-        Some("xhttp"), None, None, Some(&xhttp),
+        Some("xhttp"), None, None, Some(&xhttp), None, None, None,
     )
     .unwrap();
     let stream = ob.connect(&target()).await.unwrap();
@@ -63,7 +63,7 @@ async fn vmess_xhttp_plain() {
     };
     let ob = VmessOutbound::try_new(
         "t", "127.0.0.1", 2451, UUID, "auto", false, None, false,
-        Some("xhttp"), None, None, Some(&xhttp),
+        Some("xhttp"), None, None, Some(&xhttp), None,
     )
     .unwrap();
     let stream = ob.connect(&target()).await.unwrap();
@@ -80,7 +80,7 @@ async fn vless_xhttp_tls() {
     };
     let ob = VlessOutbound::try_new(
         "t", "127.0.0.1", 2452, UUID, true, Some("localhost"), false,
-        Some("xhttp"), None, None, Some(&xhttp),
+        Some("xhttp"), None, None, Some(&xhttp), None, None, None,
     )
     .unwrap();
     let stream = ob.connect(&target()).await.unwrap();

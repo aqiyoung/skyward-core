@@ -39,7 +39,7 @@ where
 async fn vless_vision_tls_plain_inner() {
     let ob = VlessOutbound::try_new(
         "t", "127.0.0.1", 2454, UUID, true, Some("localhost"), false,
-        None, None, None, None, None, Some("xtls-rprx-vision"),
+        None, None, None, None, None, Some("xtls-rprx-vision"), None,
     )
     .unwrap();
     let stream = ob
@@ -59,7 +59,7 @@ async fn vless_vision_reality_plain_inner() {
     };
     let ob = VlessOutbound::try_new(
         "t", "127.0.0.1", 2455, UUID, true, Some("localhost"), false,
-        None, None, None, None, Some(&reality), Some("xtls-rprx-vision"),
+        None, None, None, None, Some(&reality), Some("xtls-rprx-vision"), None,
     )
     .unwrap();
     let stream = ob
@@ -76,7 +76,7 @@ async fn vless_vision_reality_plain_inner() {
 async fn vless_vision_tls_inner_tls() {
     let ob = VlessOutbound::try_new(
         "t", "127.0.0.1", 2454, UUID, true, Some("localhost"), false,
-        None, None, None, None, None, Some("xtls-rprx-vision"),
+        None, None, None, None, None, Some("xtls-rprx-vision"), None,
     )
     .unwrap();
     let stream = ob
@@ -108,7 +108,7 @@ async fn vless_vision_reality_inner_tls() {
     };
     let ob = VlessOutbound::try_new(
         "t", "127.0.0.1", 2455, UUID, true, Some("localhost"), false,
-        None, None, None, None, Some(&reality), Some("xtls-rprx-vision"),
+        None, None, None, None, Some(&reality), Some("xtls-rprx-vision"), None,
     )
     .unwrap();
     let stream = ob

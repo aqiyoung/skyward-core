@@ -15,6 +15,7 @@ use crate::common::TargetAddr;
 use crate::config::{Config, ProxyDef};
 
 pub mod grpc;
+pub mod h2;
 pub mod packet;
 pub mod tls13;
 pub mod vision;
@@ -158,7 +159,7 @@ fn unsupported_transport(def: &crate::config::ProxyDef) -> Option<String> {
     let kind = def.kind.as_str();
     if let Some(network) = def.network.as_deref() {
         let n = network.trim().to_ascii_lowercase();
-        if !n.is_empty() && n != "tcp" && n != "ws" && n != "grpc" && n != "xhttp" {
+        if !n.is_empty() && n != "tcp" && n != "ws" && n != "grpc" && n != "xhttp" && n != "h2" {
             return Some(format!("{} (network={})", kind, network));
         }
     }
@@ -392,6 +393,7 @@ pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
                             def.ws_opts.as_ref(),
                             def.grpc_opts.as_ref(),
                             def.xhttp_opts.as_ref(),
+                            def.http_opts.as_ref(),
                         ),
                         _ => None,
                         }
@@ -425,6 +427,7 @@ pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
                             def.xhttp_opts.as_ref(),
                             def.reality_opts.as_ref(),
                             def.flow.as_deref(),
+                            def.http_opts.as_ref(),
                         ),
                         _ => None,
                         }
@@ -673,10 +676,7 @@ mod tests {
             "proxies:\n  - {name: h2, type: vless, server: s, port: 443, uuid: u, network: h2}\n",
         )
         .unwrap();
-        assert_eq!(
-            unsupported_transport(&h2.proxies[0]).as_deref(),
-            Some("vless (network=h2)")
-        );
+        assert_eq!(unsupported_transport(&h2.proxies[0]), None);
         assert_eq!(unsupported_transport(by_name("v")), None);
         assert_eq!(unsupported_transport(by_name("r")), None);
         assert_eq!(unsupported_transport(by_name("w")), None);

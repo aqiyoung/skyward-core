@@ -37,7 +37,7 @@ where
 async fn vless_grpc_plain() {
     let ob = VlessOutbound::try_new(
         "t", "127.0.0.1", 2446, UUID, false, None, false,
-        Some("grpc"), None, None,
+        Some("grpc"), None, None, None, None, None, None,
     )
     .unwrap();
     let stream = ob
@@ -52,7 +52,7 @@ async fn vless_grpc_plain() {
 async fn vmess_grpc_plain() {
     let ob = VmessOutbound::try_new(
         "t", "127.0.0.1", 2447, UUID, "auto", false, None, false,
-        Some("grpc"), None, None,
+        Some("grpc"), None, None, None, None
     )
     .unwrap();
     let stream = ob
@@ -70,7 +70,7 @@ async fn vless_grpc_tls_custom_service() {
     };
     let ob = VlessOutbound::try_new(
         "t", "127.0.0.1", 2448, UUID, true, Some("localhost"), false,
-        Some("grpc"), None, Some(&grpc),
+        Some("grpc"), None, Some(&grpc), None, None, None, None,
     )
     .unwrap();
     let stream = ob

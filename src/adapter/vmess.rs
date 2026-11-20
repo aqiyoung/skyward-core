@@ -587,6 +587,9 @@ pub struct VmessOutbound {
     ws_headers: Vec<(String, String)>,
     use_grpc: bool,
     grpc_service: String,
+    use_h2: bool,
+    h2_path: String,
+    h2_host: String,
     use_xhttp: bool,
     xhttp_path: String,
     xhttp_host: String,
@@ -619,10 +622,14 @@ impl VmessOutbound {
         ws_opts: Option<&WsOpts>,
         grpc_opts: Option<&crate::config::GrpcOpts>,
         xhttp_opts: Option<&crate::config::XHttpOpts>,
+        http_opts: Option<&crate::config::HttpOpts>,
     ) -> Option<Self> {
         let uuid = parse_uuid(uuid)?;
         let use_grpc = network
             .map(|n| n.eq_ignore_ascii_case("grpc"))
+            .unwrap_or(false);
+        let use_h2 = network
+            .map(|n| n.eq_ignore_ascii_case("h2"))
             .unwrap_or(false);
         let grpc_service = grpc_opts
             .and_then(|g| g.service_name.clone())
@@ -642,6 +649,14 @@ impl VmessOutbound {
         };
         let sni = sni.filter(|s| !s.is_empty()).unwrap_or(server).to_string();
         let xhttp_host = xhttp_opts
+            .and_then(|x| x.host.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| sni.clone());
+        let h2_path = http_opts
+            .and_then(|x| x.path.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "/".to_string());
+        let h2_host = http_opts
             .and_then(|x| x.host.clone())
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| sni.clone());
@@ -682,6 +697,9 @@ impl VmessOutbound {
             ws_headers,
             use_grpc,
             grpc_service,
+            use_h2,
+            h2_path,
+            h2_host,
             use_xhttp,
             xhttp_path,
             xhttp_host,
@@ -792,6 +810,11 @@ impl VmessOutbound {
                 stream = Box::new(
                     crate::adapter::grpc::connect_grpc(stream, &self.sni, &self.grpc_service)
                         .await?,
+                );
+            }
+            if self.use_h2 {
+                stream = Box::new(
+                    crate::adapter::h2::connect_h2(stream, &self.h2_host, &self.h2_path).await?,
                 );
             }
             stream

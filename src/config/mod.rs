@@ -104,6 +104,31 @@ pub struct ProxyDef {
     pub grpc_opts: Option<GrpcOpts>,
     #[serde(rename = "xhttp-opts")]
     pub xhttp_opts: Option<XHttpOpts>,
+    #[serde(rename = "http-opts")]
+    pub http_opts: Option<HttpOpts>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct HttpOpts {
+    #[serde(default)]
+    pub path: Option<String>,
+    /// mihomo spells host as a list; a single string also appears.
+    #[serde(default, deserialize_with = "de_host_list")]
+    pub host: Option<String>,
+}
+
+fn de_host_list<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_yaml::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_yaml::Value::String(s)) => Some(s),
+        Some(serde_yaml::Value::Sequence(seq)) => seq
+            .first()
+            .and_then(|v| v.as_str().map(str::to_string)),
+        _ => None,
+    })
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

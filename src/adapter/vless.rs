@@ -104,6 +104,9 @@ pub struct VlessOutbound {
     ws_headers: Vec<(String, String)>,
     use_grpc: bool,
     grpc_service: String,
+    use_h2: bool,
+    h2_path: String,
+    h2_host: String,
     use_xhttp: bool,
     xhttp_path: String,
     xhttp_host: String,
@@ -220,6 +223,12 @@ impl VlessOutbound {
                     .await?,
             );
         }
+
+        if self.use_h2 {
+            stream = Box::new(
+                crate::adapter::h2::connect_h2(stream, &self.h2_host, &self.h2_path).await?,
+            );
+        }
         Ok(stream)
     }
 }
@@ -239,6 +248,7 @@ impl VlessOutbound {
         xhttp_opts: Option<&crate::config::XHttpOpts>,
         reality_opts: Option<&crate::config::RealityOpts>,
         flow: Option<&str>,
+        http_opts: Option<&crate::config::HttpOpts>,
     ) -> Option<Self> {
         let uuid = parse_uuid(uuid)?;
         let sni = sni.filter(|s| !s.is_empty()).unwrap_or(server).to_string();
@@ -257,6 +267,17 @@ impl VlessOutbound {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "/".to_string());
         let xhttp_host = xhttp_opts
+            .and_then(|x| x.host.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| sni.clone());
+        let use_h2 = network
+            .map(|n| n.eq_ignore_ascii_case("h2"))
+            .unwrap_or(false);
+        let h2_path = http_opts
+            .and_then(|x| x.path.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "/".to_string());
+        let h2_host = http_opts
             .and_then(|x| x.host.clone())
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| sni.clone());
@@ -300,6 +321,9 @@ impl VlessOutbound {
             ws_headers,
             use_grpc,
             grpc_service,
+            use_h2,
+            h2_path,
+            h2_host,
             use_xhttp,
             xhttp_path,
             xhttp_host,
@@ -361,7 +385,7 @@ impl Outbound for VlessOutbound {
         // breaks the connection, so plain-TLS vision uses the hand-rolled
         // client whenever certificate verification is off. With verify on
         // it falls through to rustls and end-padding (documented limit).
-        if self.vision && !self.use_ws && !self.use_grpc {
+        if self.vision && !self.use_ws && !self.use_grpc && !self.use_h2 {
             if self.reality.is_none() && self.use_tls && !self.verify {
                 let mut tls = crate::adapter::tls13::connect_tls13(
                     Box::new(tcp),
@@ -405,7 +429,7 @@ impl Outbound for VlessOutbound {
 
         let mut stream = self.wrap_transport(tcp).await?;
 
-        if self.vision && !self.use_ws && !self.use_grpc {
+        if self.vision && !self.use_ws && !self.use_grpc && !self.use_h2 {
             // The request header travels outside the vision framing; the
             // padding blocks (first one prefixed with the UUID) carry
             // everything after it, in both directions.
@@ -618,14 +642,14 @@ mod tests {
 
     #[test]
     fn tls_and_sni_defaults() {
-        let plain = VlessOutbound::try_new("v", "example.com", 443, "b831381d-6324-4d53-ad4f-8cda48b30811", false, None, true, None, None, None, None, None, None).unwrap();
+        let plain = VlessOutbound::try_new("v", "example.com", 443, "b831381d-6324-4d53-ad4f-8cda48b30811", false, None, true, None, None, None, None, None, None, None).unwrap();
         assert!(!plain.use_tls);
         assert!(!plain.use_ws);
         assert_eq!(plain.sni, "example.com");
-        let secured = VlessOutbound::try_new("v", "example.com", 443, "b831381d63244d53ad4f8cda48b30811", true, Some("cdn.example.com"), true, None, None, None, None, None, None).unwrap();
+        let secured = VlessOutbound::try_new("v", "example.com", 443, "b831381d63244d53ad4f8cda48b30811", true, Some("cdn.example.com"), true, None, None, None, None, None, None, None).unwrap();
         assert!(secured.use_tls);
         assert_eq!(secured.sni, "cdn.example.com");
-        assert!(VlessOutbound::try_new("v", "h", 443, "bad", true, None, true, None, None, None, None, None, None).is_none());
+        assert!(VlessOutbound::try_new("v", "h", 443, "bad", true, None, true, None, None, None, None, None, None, None).is_none());
         // WS transport picks up the path and the Host header from ws-opts.
         let ws_opts = WsOpts {
             path: Some("/ray".into()),
@@ -646,6 +670,7 @@ mod tests {
             true,
             Some("ws"),
             Some(&ws_opts),
+            None,
             None,
             None,
             None,

@@ -46,7 +46,7 @@ async fn vless_udp_framing_round_trip() {
 
     let ob = VlessOutbound::try_new(
         "t", "127.0.0.1", port, UUID, false, None, true,
-        None, None, None, None, None, None,
+        None, None, None, None, None, None, None,
     )
     .unwrap();
     let conn = ob
