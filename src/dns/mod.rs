@@ -10,6 +10,42 @@ use std::time::{Duration, Instant};
 use crate::config::DnsConfig;
 
 static SHARED: OnceLock<Resolver> = OnceLock::new();
+static SYSTEM_UPSTREAMS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static NETWORK_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn update_system_dns(servers: &str) {
+    *SYSTEM_UPSTREAMS.lock().unwrap() = servers.split(',').map(str::trim)
+        .filter(|server| parse_upstream(server).is_some()).map(str::to_owned).collect();
+    clear_caches();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_change_invalidates_engine_and_shared_dns_caches() {
+        let _guard = crate::runtime_state::TEST_LOCK.lock().unwrap();
+        let resolver = Resolver::new(DnsConfig::default());
+        resolver.cache.lock().unwrap().insert("test.example".into(), Entry {
+            expires: Instant::now() + Duration::from_secs(60),
+            addrs: vec!["192.0.2.1".parse().unwrap()],
+            epoch: NETWORK_EPOCH.load(std::sync::atomic::Ordering::SeqCst),
+        });
+        assert!(resolver.cached("test.example").is_some());
+        update_system_dns("192.0.2.53:53,not-a-server,[2001:db8::53]:53");
+        assert!(resolver.cached("test.example").is_none());
+        assert_eq!(resolver.upstreams(), vec!["192.0.2.53:53", "[2001:db8::53]:53"]);
+        update_system_dns("");
+    }
+}
+
+pub fn clear_caches() {
+    NETWORK_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if let Some(resolver) = SHARED.get() {
+        resolver.cache.lock().unwrap().clear();
+    }
+}
 
 /// Accept `host`, `host:port` or a bare IP; reject URLs and other schemes.
 fn parse_upstream(server: &str) -> Option<std::net::SocketAddr> {
@@ -36,6 +72,7 @@ pub async fn resolve_host(host: &str) -> std::io::Result<Vec<IpAddr>> {
 struct Entry {
     expires: Instant,
     addrs: Vec<IpAddr>,
+    epoch: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -64,16 +101,18 @@ impl Resolver {
             return Ok(addrs);
         }
 
+        let epoch = NETWORK_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
         let mut addrs = Vec::new();
         for server in self.upstreams() {
             let Some(addr) = parse_upstream(&server) else {
                 continue;
             };
-            for qtype in [1u16, 28u16] {
-                if let Ok(mut found) = crate::net::dns_query(addr, host, qtype).await {
-                    addrs.append(&mut found);
-                }
-            }
+            let (v4, v6) = tokio::join!(
+                crate::net::dns_query(addr, host, 1),
+                crate::net::dns_query(addr, host, 28),
+            );
+            addrs.extend(v4.unwrap_or_default());
+            addrs.extend(v6.unwrap_or_default());
             if !addrs.is_empty() {
                 break;
             }
@@ -91,6 +130,7 @@ impl Resolver {
             Entry {
                 expires: Instant::now() + self.ttl,
                 addrs: addrs.clone(),
+                epoch,
             },
         );
         Ok(addrs)
@@ -116,7 +156,12 @@ impl Resolver {
             .cloned()
             .collect();
         if valid.is_empty() {
-            vec!["223.5.5.5".to_string(), "8.8.8.8".to_string()]
+            let system = SYSTEM_UPSTREAMS.lock().unwrap().clone();
+            if system.is_empty() {
+                vec!["223.5.5.5".to_string(), "8.8.8.8".to_string()]
+            } else {
+                system
+            }
         } else {
             valid
         }
@@ -125,7 +170,8 @@ impl Resolver {
     fn cached(&self, host: &str) -> Option<Vec<IpAddr>> {
         let cache = self.cache.lock().unwrap();
         match cache.get(host) {
-            Some(entry) if entry.expires > Instant::now() => Some(entry.addrs.clone()),
+            Some(entry) if entry.expires > Instant::now()
+                && entry.epoch == NETWORK_EPOCH.load(std::sync::atomic::Ordering::SeqCst) => Some(entry.addrs.clone()),
             _ => None,
         }
     }

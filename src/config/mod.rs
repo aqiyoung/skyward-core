@@ -224,6 +224,17 @@ pub struct ProxyGroupDef {
     /// Provider names whose proxies should be included as members (`use:`).
     #[serde(rename = "use", default)]
     pub use_providers: Vec<String>,
+    #[serde(rename = "include-all", default)]
+    pub include_all: bool,
+    #[serde(rename = "include-all-proxies", default)]
+    pub include_all_proxies: bool,
+    #[serde(rename = "include-all-providers", default)]
+    pub include_all_providers: bool,
+    pub filter: Option<String>,
+    #[serde(rename = "exclude-filter")]
+    pub exclude_filter: Option<String>,
+    #[serde(rename = "exclude-type")]
+    pub exclude_type: Option<String>,
     pub url: Option<String>,
     pub interval: Option<u64>,
 }

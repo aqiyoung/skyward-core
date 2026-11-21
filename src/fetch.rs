@@ -4,7 +4,6 @@
 use std::io;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 use crate::adapter::tls::connect_tls;
 use crate::adapter::BoxedStream;
@@ -58,8 +57,9 @@ async fn fetch_url_inner(url: &str) -> io::Result<Vec<u8>> {
 
     let mut last_error = None;
     let mut tcp = None;
-    let addresses = tokio::net::lookup_host((host.as_str(), port)).await?;
-    for addr in addresses {
+    let addresses = crate::dns::resolve_host(&host).await?;
+    for ip in addresses {
+        let addr = std::net::SocketAddr::new(ip, port);
         match crate::net::connect_tcp(addr).await {
             Ok(stream) => {
                 tcp = Some(stream);

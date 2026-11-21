@@ -124,12 +124,22 @@ impl Engine {
             outbounds.register(name.clone(), outbound.clone());
         }
         for g in &config.proxy_groups {
-            if !g.use_providers.is_empty() {
+            if !g.use_providers.is_empty() || g.include_all || g.include_all_providers {
                 let mut members = g.proxies.clone();
-                members.extend(proxy_providers.member_names(&g.use_providers));
+                if g.include_all || g.include_all_proxies {
+                    members.extend(config.proxies.iter().map(|proxy| proxy.name.clone()));
+                }
+                if g.include_all || g.include_all_providers {
+                    let mut names: Vec<_> = provider_nodes.keys().cloned().collect();
+                    names.sort();
+                    members.extend(names);
+                } else {
+                    members.extend(proxy_providers.member_names(&g.use_providers));
+                }
                 outbounds.set_group_members(&g.name, members);
             }
         }
+        outbounds.filter_group_members(&config);
         if let Some(global) = outbounds.groups.get_mut("GLOBAL") {
             global.members.extend(provider_nodes.into_iter().map(|(name, _)| name));
         }

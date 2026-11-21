@@ -210,7 +210,8 @@ impl ProviderRegistry {
                     registry.providers.insert(name, provider);
                 }
                 Ok((name, Err(e))) => {
-                    tracing::warn!("failed to load rule provider {}: {}", name, e)
+                    tracing::warn!("failed to load rule provider {}: {}", name, e);
+                    crate::jni::emit_log_event(&format!("[rust-core] rule provider {} failed: {}", name, e));
                 }
                 Err(e) => tracing::warn!("rule provider task failed: {}", e),
             }

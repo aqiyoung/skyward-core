@@ -135,7 +135,10 @@ pub fn invoke(data: &[u8]) -> Vec<u8> {
         "closeConnections" => handle_close_connections(&call),
         "resetConnections" => handle_close_connections(&call),
         "closeConnection" => handle_close_connection(&call),
-        "clearDnsCache" => ok(&call.id, Value::Bool(true)),
+        "clearDnsCache" => {
+            crate::dns::clear_caches();
+            ok(&call.id, Value::Bool(true))
+        }
         "validateConfig" => handle_validate_config(&call),
         "setupConfig" => handle_setup_config(&call),
         "updateConfig" => handle_setup_config(&call),
@@ -1170,7 +1173,7 @@ fn handle_external_provider(call: &MethodCall) -> Vec<u8> {
 }
 
 fn handle_update_dns(call: &MethodCall) -> Vec<u8> {
-    // DNS reload is a no-op in this slice (the resolver cache is per-engine).
+    crate::dns::update_system_dns(call.arguments.as_str().unwrap_or(""));
     ok(&call.id, Value::Bool(true))
 }
 
