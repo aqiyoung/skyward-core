@@ -10,7 +10,7 @@ use std::io;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes128Gcm, KeyInit, Nonce as AesNonce};
@@ -375,7 +375,7 @@ impl Outbound for SnellOutbound {
                 Ok(Box::new(stream))
             }
             4 => connect_v4(base, &self.psk, target).await,
-            6 => connect_v6(base, &self.psk, V6Mode::Shaped, target).await,
+            6 => connect_v6(base, &self.psk, target).await,
             _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "unsupported Snell version")),
         }
     }
@@ -437,7 +437,6 @@ mod tests {
 const V4_SALT_SIZE: usize = 16;
 const V4_HEADER_PLAIN_SIZE: usize = 7;
 const V4_HEADER_CIPHER_SIZE: usize = V4_HEADER_PLAIN_SIZE + TAG_LEN;
-const V4_FRAME_SIZE: usize = 1460;
 const V4_INITIAL_PADDING_MIN: u16 = 0x100;
 const V4_INITIAL_PADDING_SPAN: u16 = 0x100;
 
@@ -583,8 +582,6 @@ struct V4Writer {
     salt: [u8; V4_SALT_SIZE],
     salt_sent: bool,
     initial_padding_length: u16,
-    payload_limit: u16,
-    last_write: Option<Instant>,
 }
 
 impl V4Writer {
@@ -600,29 +597,7 @@ impl V4Writer {
             salt,
             salt_sent: false,
             initial_padding_length,
-            payload_limit: 0,
-            last_write: None,
         })
-    }
-
-    /// Port of Go's `v4Writer.nextPayloadLimit`: the first frame carries the
-    /// random initial padding, later frames grow the payload limit.
-    fn next_payload_limit(&mut self) -> u16 {
-        let now = Instant::now();
-        let payload_limit: i64 = match self.last_write {
-            None => V4_FRAME_SIZE as i64 - 55 - self.initial_padding_length as i64,
-            Some(last) if now.duration_since(last) > Duration::from_secs(30) => V4_FRAME_SIZE as i64 - 39,
-            Some(_) => self.payload_limit as i64,
-        };
-        self.last_write = Some(now);
-        if payload_limit <= MAX_CHUNK as i64 - 1 {
-            let next = payload_limit + V4_FRAME_SIZE as i64 - 39;
-            self.payload_limit =
-                if next > MAX_CHUNK as i64 { MAX_CHUNK as u16 } else { next as u16 };
-        } else {
-            self.payload_limit = MAX_CHUNK as u16;
-        }
-        payload_limit as u16
     }
 
     fn next_frame_padding_length(&self, payload_length: usize) -> usize {
@@ -913,14 +888,6 @@ const V6_HEADER_VERSION: u8 = 4;
 const V6_HEADER_PLAIN_SIZE: usize = 7;
 const V6_HEADER_CIPHER_SIZE: usize = V6_HEADER_PLAIN_SIZE + TAG_LEN;
 const V6_MAX_PAYLOAD: usize = 0xffff;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum V6Mode {
-    /// The default: the profile-shaped record layer.
-    Shaped,
-    Unshaped,
-    UnsafeRaw,
-}
 
 // Domain separators for the profile PRFs (port of the Go constants).
 const V6_GOLDEN_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -1409,7 +1376,11 @@ impl V6Profile {
         self.namespaces.prf_bytes(V6_LABEL_PADDING, seq, output);
         match self.generator {
             0 => {
-                let bit_count = self.namespaces.prf32(V6_LABEL_BIT_PERCENT, seq, 0);
+                let bit_count = v6_pick_u32(
+                    self.namespaces.prf32(V6_LABEL_BIT_PERCENT, seq, 0),
+                    self.bit_min,
+                    self.bit_max,
+                );
                 let mut rotate = 1usize;
                 let scaled = (bit_count as usize) * 8;
                 if scaled > 0x31 {
@@ -1666,178 +1637,6 @@ trait V6RecordWriter: Send {
     ) -> Poll<io::Result<usize>>;
 }
 
-struct V6RawWriter;
-
-impl V6RawWriter {
-    fn record(payload: &[u8]) -> Vec<u8> {
-        let mut out = vec![0u8; V6_HEADER_PLAIN_SIZE + payload.len()];
-        v6_put_header(&mut out[..V6_HEADER_PLAIN_SIZE], 0, payload.len());
-        out[V6_HEADER_PLAIN_SIZE..].copy_from_slice(payload);
-        out
-    }
-}
-
-impl V6RecordWriter for V6RawWriter {
-    fn poll_write(&mut self, inner: &mut BoxedStream, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-        let n = buf.len().min(V6_MAX_PAYLOAD);
-        let out = V6RawWriter::record(&buf[..n]);
-        match poll_write_all(inner, cx, &out) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Ready(Ok(_)) => Poll::Ready(Ok(n)),
-        }
-    }
-}
-
-struct V6RawReader;
-
-impl V6RecordReader for V6RawReader {
-    fn poll_read_record(&mut self, inner: &mut BoxedStream, cx: &mut Context<'_>) -> Poll<io::Result<Vec<u8>>> {
-        let mut header = [0u8; V6_HEADER_PLAIN_SIZE];
-        match poll_read_all(inner, cx, &mut header) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Ready(Ok(())) => {}
-        }
-        let (padding_length, payload_length) = match v6_parse_header(&header, true) {
-            Ok(v) => v,
-            Err(e) => return Poll::Ready(Err(e)),
-        };
-        if padding_length != 0 {
-            return Poll::Ready(Err(v6_record_padding_error()));
-        }
-        if payload_length == 0 {
-            return Poll::Ready(Ok(Vec::new())); // zero chunk
-        }
-        let mut payload = vec![0u8; payload_length];
-        match poll_read_all(inner, cx, &mut payload) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Ready(Ok(())) => {}
-        }
-        Poll::Ready(Ok(payload))
-    }
-}
-
-struct V6UnshapedWriter {
-    aead: Aes128Gcm,
-    nonce: [u8; NONCE_SIZE],
-    salt: Vec<u8>,
-    salt_sent: bool,
-}
-
-impl V6UnshapedWriter {
-    fn new(psk: &[u8]) -> io::Result<V6UnshapedWriter> {
-        let mut salt = vec![0u8; V6_SALT_SIZE];
-        OsRng.fill_bytes(&mut salt);
-        let aead = v6_aead(psk, &salt.clone().try_into().map_err(|_| aead_error())?)?;
-        Ok(V6UnshapedWriter { aead, nonce: [0u8; NONCE_SIZE], salt, salt_sent: false })
-    }
-
-    /// Port of Go's `v6UnshapedWriter::appendRecord`.
-    fn append_record(&mut self, mut out: Vec<u8>, payload: &[u8]) -> io::Result<Vec<u8>> {
-        let start = out.len();
-        out.resize(start + V6_HEADER_PLAIN_SIZE, 0);
-        v6_put_header(&mut out[start..start + V6_HEADER_PLAIN_SIZE], 0, payload.len());
-        let header = out[start..start + V6_HEADER_PLAIN_SIZE].to_vec();
-        let sealed = seal_aead(&self.aead, &self.nonce, &header)?;
-        increment_nonce(&mut self.nonce);
-        out.truncate(start);
-        out.extend_from_slice(&sealed);
-        if !payload.is_empty() {
-            let sealed = seal_aead(&self.aead, &self.nonce, payload)?;
-            increment_nonce(&mut self.nonce);
-            out.extend_from_slice(&sealed);
-        }
-        Ok(out)
-    }
-}
-
-impl V6RecordWriter for V6UnshapedWriter {
-    fn poll_write(&mut self, inner: &mut BoxedStream, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-        let mut out = Vec::with_capacity(V6_HEADER_CIPHER_SIZE + buf.len() + TAG_LEN);
-        if !self.salt_sent {
-            out.extend_from_slice(&self.salt);
-            self.salt_sent = true;
-        }
-        match self.append_record(out, buf) {
-            Ok(o) => match poll_write_all(inner, cx, &o) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-                Poll::Ready(Ok(_)) => Poll::Ready(Ok(buf.len())),
-            },
-            Err(e) => Poll::Ready(Err(e)),
-        }
-    }
-}
-
-struct V6UnshapedReader {
-    psk: Vec<u8>,
-    aead: Option<Aes128Gcm>,
-    nonce: [u8; NONCE_SIZE],
-}
-
-impl V6UnshapedReader {
-    fn new(psk: &[u8]) -> V6UnshapedReader {
-        V6UnshapedReader { psk: psk.to_vec(), aead: None, nonce: [0u8; NONCE_SIZE] }
-    }
-}
-
-impl V6RecordReader for V6UnshapedReader {
-    fn poll_read_record(&mut self, inner: &mut BoxedStream, cx: &mut Context<'_>) -> Poll<io::Result<Vec<u8>>> {
-        if self.aead.is_none() {
-            let mut salt = [0u8; V6_SALT_SIZE];
-            match poll_read_all(inner, cx, &mut salt) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(())) => {}
-            }
-            self.aead = Some(v6_aead(&self.psk, &salt)?);
-        }
-        let aead = self.aead.as_ref().unwrap();
-        let mut header_cipher = vec![0u8; V6_HEADER_CIPHER_SIZE];
-        match poll_read_all(inner, cx, &mut header_cipher) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Ready(Ok(())) => {}
-        }
-        let header = match decrypt_aead(aead, &self.nonce, &header_cipher) {
-            Ok(h) => h,
-            Err(e) => return Poll::Ready(Err(e)),
-        };
-        increment_nonce(&mut self.nonce);
-        let (padding_length, payload_length) = match v6_parse_header(&header, true) {
-            Ok(v) => v,
-            Err(e) => return Poll::Ready(Err(e)),
-        };
-        if padding_length != 0 {
-            return Poll::Ready(Err(v6_record_padding_error()));
-        }
-        if payload_length == 0 {
-            return Poll::Ready(Ok(Vec::new())); // zero chunk
-        }
-        let mut payload_cipher = vec![0u8; payload_length + TAG_LEN];
-        match poll_read_all(inner, cx, &mut payload_cipher) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Ready(Ok(())) => {}
-        }
-        match decrypt_aead(aead, &self.nonce, &payload_cipher) {
-            Ok(payload) => {
-                increment_nonce(&mut self.nonce);
-                Poll::Ready(Ok(payload))
-            }
-            Err(e) => Poll::Ready(Err(e)),
-        }
-    }
-}
-
 struct V6ShapedWriter {
     profile: V6Profile,
     aead: Aes128Gcm,
@@ -1969,10 +1768,6 @@ impl V6ShapedWriter {
         self.seq += 1;
         Ok(out)
     }
-}
-
-fn record_padding(padding: &[u8]) -> &[u8] {
-    padding
 }
 
 impl V6RecordWriter for V6ShapedWriter {
@@ -2178,40 +1973,18 @@ async fn read_v6_reply(reader: &mut dyn V6RecordReader, inner: &mut BoxedStream)
     }
 }
 
-async fn connect_v6(mut base: BoxedStream, psk: &[u8], mode: V6Mode, target: &TargetAddr) -> io::Result<BoxedStream> {
+async fn connect_v6(mut base: BoxedStream, psk: &[u8], target: &TargetAddr) -> io::Result<BoxedStream> {
     let header = connect_command(target);
-    let (mut writer, mut reader): (Box<dyn V6RecordWriter>, Box<dyn V6RecordReader>) = match mode {
-        V6Mode::UnsafeRaw => (Box::new(V6RawWriter), Box::new(V6RawReader)),
-        V6Mode::Unshaped => {
-            let w = V6UnshapedWriter::new(psk)?;
-            let r = V6UnshapedReader::new(psk);
-            (Box::new(w), Box::new(r))
-        }
-        V6Mode::Shaped => {
-            let profile = V6Profile::new(psk);
-            let w = V6ShapedWriter::new(psk, profile.clone())?;
-            let r = V6ShapedReader::new(psk, profile);
-            (Box::new(w), Box::new(r))
-        }
-    };
-    match mode {
-        V6Mode::UnsafeRaw => {
-            base.write_all(&V6RawWriter::record(&header)).await?;
-        }
-        V6Mode::Unshaped | V6Mode::Shaped => {
-            v6_write_all(writer.as_mut(), &mut base, &header).await?;
-        }
-    }
-    let reply = match mode {
-        V6Mode::UnsafeRaw => {
-            let mut record_header = [0u8; V6_HEADER_PLAIN_SIZE];
-            base.read_exact(&mut record_header).await?;
-            let mut reply = [0u8; 1];
-            base.read_exact(&mut reply).await?;
-            reply[0]
-        }
-        V6Mode::Unshaped | V6Mode::Shaped => read_v6_reply(reader.as_mut(), &mut base).await?,
-    };
+    // The client always uses the default mode — the Go reference's client
+    // picks V6ModeDefault for v6 too; the server-side unshaped/raw modes are
+    // not applicable to outbounds.
+    let profile = V6Profile::new(psk);
+    let (mut writer, mut reader): (Box<dyn V6RecordWriter>, Box<dyn V6RecordReader>) = (
+        Box::new(V6ShapedWriter::new(psk, profile.clone())?),
+        Box::new(V6ShapedReader::new(psk, profile)),
+    );
+    v6_write_all(writer.as_mut(), &mut base, &header).await?;
+    let reply = read_v6_reply(reader.as_mut(), &mut base).await?;
     if reply != REPLY_TUNNEL {
         return Err(io::Error::new(io::ErrorKind::Other, format!("Snell server error reply {}", reply)));
     }
@@ -2277,20 +2050,6 @@ mod v46_tests {
         let mut reader = V4Reader::open(&mut b_box, b"pw").await.unwrap();
         let out = v4_read(&mut reader, &mut b_box, b"hello v4".len()).await.unwrap();
         assert_eq!(out, b"hello v4");
-    }
-
-    #[tokio::test]
-    async fn v6_unshaped_round_trips() {
-        let (a, b) = duplex(1 << 16);
-        let mut a_box: BoxedStream = Box::new(a);
-        let mut b_box: BoxedStream = Box::new(b);
-
-        let mut writer = V6UnshapedWriter::new(b"pw").unwrap();
-        let mut reader = V6UnshapedReader::new(b"pw");
-        v6_write_all(&mut writer, &mut a_box, b"hello v6 unshaped").await.unwrap();
-        let out =
-            read_v6_records(&mut reader, &mut b_box, b"hello v6 unshaped".len()).await.unwrap();
-        assert_eq!(out, b"hello v6 unshaped");
     }
 
     #[test]
