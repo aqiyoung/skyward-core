@@ -516,7 +516,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                 addr, key.target_ip, key.target_port, route.rule, route.payload, route.target, final_name));
             // DIRECT and REJECT are the built-in non-proxy outbounds; every
             // other name counts towards the App's proxy-only totals.
-            let proxied = !matches!(final_name.as_str(), "DIRECT" | "REJECT");
+            let proxied = crate::common::is_proxied_outbound(&final_name);
             let mut stream: BoxedStream = tokio::select! {
                 _ = cancel.notified() => {
                     relay_failed.store(true, Ordering::Relaxed);

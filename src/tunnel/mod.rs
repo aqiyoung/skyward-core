@@ -369,7 +369,7 @@ impl Engine {
                         }
                         let (mut rin, mut win) = tokio::io::split(inbound);
                         let (mut rout, mut wout) = tokio::io::split(remote);
-                        let proxied = !matches!(final_name.as_str(), "DIRECT" | "REJECT");
+                        let proxied = crate::common::is_proxied_outbound(&final_name);
                         let mut up = CountingWriter::new(&mut wout, up_counter, self.traffic.clone(), true, proxied);
                         let mut down = CountingWriter::new(&mut win, down_counter, self.traffic.clone(), false, proxied);
                         let result = tokio::select! {

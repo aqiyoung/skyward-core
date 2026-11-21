@@ -10,6 +10,12 @@ use std::time::{Duration, Instant};
 /// App release line the Rust core ships in.
 pub const VERSION: &str = "1.0.1.4";
 
+/// DIRECT and REJECT are the built-in non-proxy outbounds; every other name
+/// counts towards the App's proxy-only statistics.
+pub fn is_proxied_outbound(name: &str) -> bool {
+    !matches!(name, "DIRECT" | "REJECT")
+}
+
 /// Process-wide traffic counters.
 #[derive(Debug, Default)]
 pub struct TrafficStats {

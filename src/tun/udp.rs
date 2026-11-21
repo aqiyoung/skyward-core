@@ -26,6 +26,24 @@ use crate::tunnel::Engine;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Fold session bytes into the global totals (and the proxy-only subset when
+/// the session left through a real outbound), matching what TCP does at its
+/// relay.
+fn account(engine: &Engine, final_name: &str, bytes: u64, upload: bool) {
+    let proxied = crate::common::is_proxied_outbound(final_name);
+    if upload {
+        engine.traffic.add_upload(bytes);
+        if proxied {
+            engine.traffic.add_proxy_upload(bytes);
+        }
+    } else {
+        engine.traffic.add_download(bytes);
+        if proxied {
+            engine.traffic.add_proxy_download(bytes);
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct SessionKey {
     src: Ipv4Addr,
@@ -131,6 +149,7 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
                 return;
             }
             up_counter.fetch_add(first_payload.len() as u64, Ordering::Relaxed);
+            account(&engine, &final_name, first_payload.len() as u64, true);
             crate::tun::runtime::diag_udp(format!(
                 "udp session {}:{} -> {} open",
                 key.src, key.src_port, target.address()
@@ -143,6 +162,7 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
                             match outgoing {
                                 Some(data) => conn.send(&data).await.map(|_| {
                                     up_counter.fetch_add(data.len() as u64, Ordering::Relaxed);
+                                    account(&engine, &final_name, data.len() as u64, true);
                                     true
                                 }),
                                 None => Ok(false),
@@ -152,6 +172,7 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
                             match incoming {
                                 Ok(n) => {
                                     down_counter.fetch_add(n as u64, Ordering::Relaxed);
+                                    account(&engine, &final_name, n as u64, false);
                                     let packet = build_udp_reply(
                                         key.dst, key.dst_port, key.src, key.src_port, &buf[..n],
                                     );
