@@ -9,7 +9,7 @@ use crate::config::{SniffProtocol, SnifferConfig};
 use super::relay::ByteQueue;
 
 const LIMIT: usize = 32 * 1024;
-const DEADLINE: Duration = Duration::from_millis(500);
+const DEADLINE: Duration = Duration::from_millis(1500);
 
 #[derive(Debug, PartialEq, Eq)]
 enum Parsed {
@@ -83,12 +83,23 @@ pub(super) async fn inspect(
     if http.is_none() && tls.is_none() {
         return None;
     }
+    let start = std::time::Instant::now();
     let mut bytes = queue.peek(LIMIT);
     if bytes.is_empty() {
         return None;
     }
     let mut budget = AttemptBudget { queue, overflow: AtomicBool::new(false) };
-    tokio::time::timeout(DEADLINE, sniff(&mut bytes, &mut budget, config, target, upload_closed, http, tls)).await.ok().flatten()
+    let mut sniff = Box::pin(sniff(&mut bytes, &mut budget, config, upload_closed, http, tls, start));
+    loop {
+        let Some(remaining) = DEADLINE.checked_sub(start.elapsed()) else {
+            return sniff.await;
+        };
+        tokio::select! {
+            biased;
+            result = &mut sniff => return result,
+            _ = tokio::time::sleep(remaining) => return sniff.await,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -96,10 +107,10 @@ async fn sniff(
     bytes: &mut Vec<u8>,
     budget: &mut AttemptBudget<'_>,
     config: &SnifferConfig,
-    target: &TargetAddr,
     upload_closed: &AtomicBool,
     http: Option<&SniffProtocol>,
     tls: Option<&SniffProtocol>,
+    start: std::time::Instant,
 ) -> Option<(String, bool)> {
     loop {
         if bytes.is_empty() {
@@ -107,7 +118,10 @@ async fn sniff(
                 return None;
             }
             let before = budget.queue.peek(LIMIT).len();
-            budget.queue.notified().await;
+            tokio::select! {
+                _ = budget.queue.notified() => {}
+                _ = tokio::time::sleep(DEADLINE) => {}
+            }
             let after = budget.queue.peek(LIMIT);
             if before == after.len() && !budget.queue.is_empty() {
                 bytes.extend_from_slice(&after);
@@ -115,12 +129,15 @@ async fn sniff(
                 *bytes = after;
             }
         }
+        if start.elapsed() >= DEADLINE {
+            return None;
+        }
         let (result, settings) = if bytes.first() == Some(&22) {
-            (if tls.is_some() { tls_host(bytes) } else { Parsed::None }, tls)
+            (if tls.is_some() { tls_host(bytes) } else { Parsed::NotHost }, tls)
         } else if bytes.is_empty() {
-            (Parsed::More, None)
+            (Parsed::Retry, None)
         } else {
-            (if http.is_some() { http_host(bytes) } else { Parsed::None }, http)
+            (if http.is_some() { http_host(bytes) } else { Parsed::NotHost }, http)
         };
         match result {
             Parsed::Host(host) => {
@@ -156,7 +173,7 @@ async fn sniff(
 }
 
 fn normalize_host(bytes: &[u8]) -> Parsed {
-    let host = match std::str::from_utf8(bytes).ok().map(str::trim_end_matches('.')) {
+    let host = match std::str::from_utf8(bytes).ok().map(|host| host.trim_end_matches('.')) {
         Some(host) if !host.is_empty() && host.len() <= 253 && host.parse::<IpAddr>().is_err() => host,
         _ => return Parsed::NotHost,
     };
@@ -207,11 +224,20 @@ fn http_host(bytes: &[u8]) -> Parsed {
                 Some((name, port)) if port.parse::<u16>().is_ok() => name,
                 _ => value,
             };
-            host = normalize_host(value.as_bytes());
-            if host.is_none() { return Parsed::NotHost; }
+            host = Some(normalize_host(value.as_bytes()));
+            if !matches!(host, Some(Parsed::Host(_))) {
+                return Parsed::NotHost;
+            }
         }
     }
-    host.map(Parsed::Host).unwrap_or(Parsed::NotHost)
+    if let Some(host) = host {
+        match host {
+            Parsed::Host(_) => host,
+            _ => Parsed::NotHost,
+        }
+    } else {
+        Parsed::NotHost
+    }
 }
 
 fn take<'a>(input: &mut &'a [u8], count: usize) -> Option<&'a [u8]> {
@@ -227,49 +253,71 @@ fn u16_len(input: &mut &[u8]) -> Option<usize> {
 }
 
 fn client_hello_host(mut hello: &[u8]) -> Parsed {
-    take(&mut hello, 34)?; // legacy version and random
-    let session_len = take(&mut hello, 1)?[0] as usize;
-    take(&mut hello, session_len)?;
-    let cipher_len = u16_len(&mut hello)?;
-    take(&mut hello, cipher_len)?;
-    let compression_len = take(&mut hello, 1)?[0] as usize;
-    take(&mut hello, compression_len)?;
-    let extension_len = u16_len(&mut hello)?;
-    let mut extensions = take(&mut hello, extension_len)?;
-    if !hello.is_empty() {
-        return Parsed::Retry;
-    }
+    let Some(header) = take(&mut hello, 4) else { return Parsed::Retry; };
+    if header[0] != 1 { return Parsed::NotHost; } // ServerHello is not a client hostname.
+    let Some(_) = take(&mut hello, 2) else { return Parsed::Retry; }; // legacy_version
+    let Some(_) = take(&mut hello, 32) else { return Parsed::Retry; }; // random
+    let session_len = match take(&mut hello, 1).map(|value| value[0] as usize) {
+        Some(value) => value,
+        None => return Parsed::Retry,
+    };
+    let Some(_) = take(&mut hello, session_len) else { return Parsed::Retry };
+    let cipher_len = match u16_len(&mut hello) {
+        Some(value) => value,
+        None => return Parsed::Retry,
+    };
+    let Some(_) = take(&mut hello, cipher_len) else { return Parsed::Retry };
+    let compression_len = match take(&mut hello, 1).map(|value| value[0] as usize) {
+        Some(value) => value,
+        None => return Parsed::Retry,
+    };
+    let Some(_) = take(&mut hello, compression_len) else { return Parsed::Retry };
+    let extension_len = match u16_len(&mut hello) {
+        Some(value) => value,
+        None => return Parsed::Retry,
+    };
+    let Some(mut extensions) = take(&mut hello, extension_len) else { return Parsed::Retry };
+    if !hello.is_empty() { return Parsed::Retry; }
     let mut host = None;
     let mut found_type_zero = false;
     while !extensions.is_empty() {
-        let kind = u16_len(&mut extensions)?;
-        let len = u16_len(&mut extensions)?;
-        let mut extension = take(&mut extensions, len)?;
+        let (kind, len) = match (u16_len(&mut extensions), u16_len(&mut extensions)) {
+            (Some(kind), Some(len)) => (kind, len),
+            _ => return Parsed::Retry,
+        };
+        let Some(mut extension) = take(&mut extensions, len) else { return Parsed::Retry };
         if kind == 0 {
             if found_type_zero { return Parsed::NotHost; }
             found_type_zero = true;
-            let list_len = u16_len(&mut extension)?;
-            let mut names = take(&mut extension, list_len)?;
+            let list_len = match u16_len(&mut extension) {
+                Some(value) => value,
+                None => return Parsed::Retry,
+            };
+            let Some(mut names) = take(&mut extension, list_len) else { return Parsed::Retry };
             if !extension.is_empty() { return Parsed::NotHost; }
             while !names.is_empty() {
-                let name_type = take(&mut names, 1)?[0];
-                let name_len = u16_len(&mut names)?;
-                let name = take(&mut names, name_len)?;
+                let Some(name_type) = take(&mut names, 1).map(|value| value[0]) else { return Parsed::Retry };
+                let name_len = match u16_len(&mut names) {
+                    Some(value) => value,
+                    None => return Parsed::Retry,
+                };
+                let Some(name) = take(&mut names, name_len) else { return Parsed::Retry };
                 if name_type == 0 {
                     if !names.is_empty() { return Parsed::NotHost; }
-                    host = normalize_host(name);
+                    host = Some(normalize_host(name));
                 }
             }
         }
     }
     if !extensions.is_empty() { return Parsed::NotHost; }
-    host.map(Parsed::Host).unwrap_or(if found_type_zero { Parsed::Complete } else { Parsed::NotHost })
+    if let Some(result) = host { return result; }
+    if found_type_zero { Parsed::Complete } else { Parsed::NotHost }
 }
 
 fn tls_host(mut bytes: &[u8]) -> Parsed {
     let mut handshake = Vec::new();
-    let mut records = 0;
     loop {
+        if bytes.is_empty() { break; }
         if bytes.len() < 5 { return Parsed::Retry; }
         if bytes[0] != 22 || !matches!(bytes[1], 3 | 4) { return Parsed::NotHost; }
         let len = u16::from_be_bytes([bytes[3], bytes[4]]) as usize;
@@ -277,12 +325,8 @@ fn tls_host(mut bytes: &[u8]) -> Parsed {
         if bytes.len() < 5 + len { return Parsed::Retry; }
         handshake.extend_from_slice(&bytes[5..5 + len]);
         bytes = &bytes[5 + len..];
-        records += 1;
-        if records > 2 && bytes.is_empty() {
-            let _ = client_hello_host(&handshake);
-            return Parsed::Complete;
-        }
     }
+    client_hello_host(&handshake)
 }
 
 #[cfg(test)]

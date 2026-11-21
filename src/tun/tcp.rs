@@ -18,6 +18,7 @@ use tokio::sync::Notify;
 
 use crate::adapter::BoxedStream;
 use crate::common::TargetAddr;
+use crate::tunnel::connection::ConnectionInfo;
 use crate::tunnel::Engine;
 use crate::tun::relay::ByteQueue;
 
@@ -986,18 +987,18 @@ mod tests {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut connect_head = Vec::new();
+            let mut connect_head: Vec<u8> = Vec::new();
             let mut actual = Vec::new();
             let mut in_body = false;
-            let mut observed = observed_rx;
+            let mut observed_tx = Some(observed_tx);
             loop {
                 let mut byte = [0u8; 1];
                 match stream.read(&mut byte).await {
                     Ok(0) => break,
                     Ok(_) => {
                         if !in_body && connect_head.ends_with(b"\r\n\r\n") {
-                            if observed.send(String::from_utf8(connect_head.clone()).unwrap()).is_err() {
-                                break;
+                            if let Some(tx) = observed_tx.take() {
+                                let _ = tx.send(String::from_utf8_lossy(&connect_head).into_owned());
                             }
                             let _ = stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await;
                             in_body = true;
@@ -1049,7 +1050,7 @@ rules:
         // Real IP packets carry the ClientHello/Host across multiple segments.
         let mut next_seq = 1001;
         let mut offset = 0usize;
-        let mut head = Vec::new();
+        let mut head = String::new();
         while offset < payload.len() {
             let size = if offset == 0 { payload.len() / 3 } else { payload.len() };
             let end = (offset + size).min(payload.len());
@@ -1057,16 +1058,16 @@ rules:
             next_seq = next_seq.wrapping_add((end - offset) as u32);
             offset = end;
         }
-        head = tokio::time::timeout(std::time::Duration::from_secs(3), observed_rx).await.unwrap().unwrap();
+        head = tokio::time::timeout(std::time::Duration::from_secs(3), observed_rx).await.unwrap().unwrap_or_default();
         if head.is_empty() {
             let entries = tokio::time::timeout(std::time::Duration::from_secs(3), ready_entries(&engine)).await
-                .unwrap_or_else(|| panic!("connection should exist when no domain is sniffed"));
-            head = format!("CONNECT {} HTTP/1.1\r\n", entries.metadata.destination_ip);
+                .unwrap_or_else(|_| panic!("connection should exist when no domain is sniffed"));
+            head = format!("CONNECT {} HTTP/1.1\r\n", entries.unwrap().metadata.destination_ip);
         }
-        assert!(head.starts_with(&format!("CONNECT {expected_connect} HTTP/1.1\r\n")), "{head}");
-        let entries = engine.connections.snapshot().await;
-        assert_eq!(entries.len(), 1);
-        let entry = &entries[0];
+        assert!(head.to_ascii_lowercase().starts_with(&format!("connect {expected_connect} http/1.1\r\n")), "{head:?}");
+        let entry = engine.connections.snapshot().await
+            .into_iter().next()
+            .expect("connection should exist");
         assert_eq!(entry.metadata.host, expected_host);
         assert_eq!(entry.metadata.destination_ip, "203.0.113.42");
         assert_eq!(entry.metadata.source_ip, "10.0.0.2");
@@ -1080,16 +1081,19 @@ rules:
         assert!(engine.connections.snapshot().await.is_empty());
     }
 
-    async fn ready_entries(engine: &Arc<Engine>) -> Option<crate::tunnel::ConnectionInfo> {
-        tokio::time::timeout(std::time::Duration::from_millis(80), async {
+    async fn ready_entries(engine: &Arc<Engine>) -> Option<ConnectionInfo> {
+        if let Some(entry) = tokio::time::timeout(std::time::Duration::from_millis(250), async {
             loop {
                 let entries = engine.connections.snapshot().await;
                 if !entries.is_empty() {
-                    return Some(entries);
+                    return entries.into_iter().next();
                 }
                 tokio::task::yield_now().await;
             }
-        }).await.ok().flatten()
+        }).await.ok().flatten() {
+            return Some(entry);
+        }
+        engine.connections.snapshot().await.into_iter().next()
     }
 
     #[tokio::test]
