@@ -658,7 +658,7 @@ mod tests {
         let query = dns_query("v6.test", 28);
         let request = build_udp_packet6(client, server, 53123, 53, &query);
         let io = Arc::new(Mutex::new(std::io::Cursor::new(Vec::new())));
-        handle_dns_packet6(&request, server.octets(), client.octets(), &io);
+        handle_dns_packet6(&request, 40, server.octets(), client.octets(), &io);
         let reply = io.lock().unwrap().get_ref().clone();
         assert!(!reply.is_empty(), "AAAA must be answered with a fake v6");
         let udp = &reply[40..];

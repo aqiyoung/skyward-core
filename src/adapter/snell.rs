@@ -16,13 +16,13 @@ use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes128Gcm, KeyInit, Nonce as AesNonce};
 use argon2::{Algorithm, Argon2, Params, Version};
 use async_trait::async_trait;
-use blake2::digest::Digest;
-use blake2::Blake2b256;
+use blake2::digest::typenum::U32;
+use blake2::Digest;
+use blake2::Blake2b;
 use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaChaNonce};
 use rand::rngs::OsRng;
 use rand::RngCore;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::adapter::tls::connect_tls;
 use crate::adapter::{BoxedStream, Outbound};
@@ -459,6 +459,18 @@ fn seal_aead(aead: &Aes128Gcm, nonce: &[u8; NONCE_SIZE], plain: &[u8]) -> io::Re
     aead.encrypt(AesNonce::from_slice(nonce), plain).map_err(|_| aead_error())
 }
 
+/// Shaped-mode write: the padding region is the additional authenticated
+/// data (the Go reference passes it to `aead.Seal`).
+fn seal_aead_aad(
+    aead: &Aes128Gcm,
+    nonce: &[u8; NONCE_SIZE],
+    plain: &[u8],
+    aad: &[u8],
+) -> io::Result<Vec<u8>> {
+    aead.encrypt(AesNonce::from_slice(nonce), Payload { msg: plain, aad })
+        .map_err(|_| aead_error())
+}
+
 fn decrypt_aead(aead: &Aes128Gcm, nonce: &[u8; NONCE_SIZE], cipher: &[u8]) -> io::Result<Vec<u8>> {
     aead.decrypt(AesNonce::from_slice(nonce), cipher).map_err(|_| aead_error())
 }
@@ -743,7 +755,8 @@ impl V4Reader {
             Poll::Ready(Ok(())) => {}
         }
         if padding_length > 0 {
-            swap_padding(&mut frame[..padding_length], &mut frame[padding_length..]);
+            let (padding_part, payload_part) = frame.split_at_mut(padding_length);
+            swap_padding(padding_part, payload_part);
         }
         let payload_cipher = frame[padding_length..].to_vec();
         match decrypt_aead(&self.aead, &self.nonce, &payload_cipher) {
@@ -774,7 +787,7 @@ impl V4Reader {
             }
             self.buf.clear();
             self.buf_off = 0;
-            match self.poll_read_frame(inner, cx)? {
+            match self.poll_read_frame(inner, cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Ready(Ok(payload)) => {
@@ -868,7 +881,14 @@ async fn connect_v4(mut base: BoxedStream, psk: &[u8], target: &TargetAddr) -> i
     if reply[0] != REPLY_TUNNEL {
         return Err(io::Error::new(io::ErrorKind::Other, format!("Snell server error reply {}", reply[0])));
     }
-    Ok(Box::new(V4Stream { inner: base, writer, reader, pending: Vec::new(), pending_off: 0, writing: false }))
+    Ok(Box::new(V4Stream {
+        inner: base,
+        writer,
+        reader,
+        pending: Vec::new(),
+        pending_off: 0,
+        writing: false,
+    }))
 }
 
 /// The Snell v4/v6 CONNECT header: [0x01, command, 0x00, hostlen, host, port].
@@ -1023,7 +1043,7 @@ fn v6_profile_secret(psk: &[u8]) -> [u8; 32] {
     input.extend_from_slice(&V6_PROFILE_SEED);
     input.extend_from_slice(psk);
     let mut out = [0u8; 32];
-    out.copy_from_slice(&Blake2b256::digest(&input));
+    out.copy_from_slice(&Blake2b::<U32>::digest(&input));
     out
 }
 
@@ -1172,9 +1192,10 @@ impl V6Profile {
             v6_pick(ns.prf_static(V6_LABEL_RECORD_PREFIX, V6_HANDSHAKE_DOMAIN), prefix_min_hs, prefix_max_hs);
         let salt_block_len = V6_SALT_SIZE + salt_prefix_len as usize;
 
-        let mix_rounds_hs =
+        let mix_rounds_handshake =
             v6_pick_u32(ns.prf_static(V6_LABEL_MIX_ROUNDS, V6_MIX_HANDSHAKE_DOMAIN), 1, 4);
-        let mix_stride_hs = v6_pick(ns.prf_static(V6_LABEL_MIX_STRIDE, V6_MIX_HANDSHAKE_DOMAIN), 0x11, 0xfb);
+        let mix_stride_handshake =
+            v6_pick(ns.prf_static(V6_LABEL_MIX_STRIDE, V6_MIX_HANDSHAKE_DOMAIN), 0x11, 0xfb);
 
         let prefix_min_record =
             v6_pick(ns.prf_static(V6_LABEL_PREFIX_MIN, 0), 0x08, 0x50);
@@ -1402,7 +1423,7 @@ impl V6Profile {
                     let raw = original.wrapping_add((index & 0xff) as u8);
                     let table_value =
                         V6_BIT_ROTATE_TABLE[rotate.max(1) * 16 + ((raw ^ original) & 0x0f) as usize];
-                    *value = table_value.rotate_left((raw ^ (original >> 4)) & 7);
+                    *value = table_value.rotate_left(((raw ^ (original >> 4)) & 7) as u32);
                 }
             }
             1 => {
@@ -1476,7 +1497,7 @@ impl V6Profile {
             let domain = V6_MIX_HANDSHAKE_DOMAIN + round;
             for i in 0..length {
                 let span = (length - i) as u64;
-                let raw = V6Profile::salt_shuffle_prf(ns_salt, domain, i as u32);
+                let raw = V6Profile::salt_shuffle_prf(ns_salt, domain, i as u32) as u64;
                 let j = i + (raw % span) as usize;
                 out.swap(i, j);
             }
@@ -1913,7 +1934,7 @@ impl V6ShapedWriter {
         {
             let mut header_plain = [0u8; V6_HEADER_PLAIN_SIZE];
             v6_put_header(&mut header_plain, padding_length, payload.len());
-            let sealed = seal_aead(&self.aead, &self.nonce, &header_plain, &prefix)?;
+            let sealed = seal_aead_aad(&self.aead, &self.nonce, &header_plain, &prefix)?;
             increment_nonce(&mut self.nonce);
             record[offset..offset + V6_HEADER_CIPHER_SIZE].copy_from_slice(&sealed);
             offset += V6_HEADER_CIPHER_SIZE;

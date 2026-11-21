@@ -114,6 +114,11 @@ impl ConnectionLease {
     pub async fn closed(&self) {
         self.entry.cancel.notified().await;
     }
+
+    /// The connection id, for the App/tests that track per-connection state.
+    pub fn id(&self) -> &str {
+        &self.entry.info.id
+    }
 }
 
 impl Drop for ConnectionLease {
@@ -490,7 +495,7 @@ mod tests {
         assert!(wire["metadata"].is_object(), "metadata must decode as a map");
         assert_eq!(wire["rulePayload"], "");
         assert_eq!(wire["chains"][0], "DIRECT");
-        assert!(tracker.close(&id.id).await);
+        assert!(tracker.close(&id.id()).await);
         tokio::time::timeout(Duration::from_secs(1), id.closed()).await.unwrap();
         assert!(tracker.snapshot().await.is_empty());
     }
@@ -504,7 +509,7 @@ mod tests {
         let event: serde_json::Value =
             serde_json::from_str(&request_event_json(&snapshot[0])).unwrap();
         assert_eq!(event["type"], "request");
-        assert_eq!(event["data"]["id"], id.id);
+        assert_eq!(event["data"]["id"], id.id());
         assert_eq!(event["data"]["metadata"]["host"], "example.com");
         assert_eq!(event["data"]["rule"], "MATCH");
     }
