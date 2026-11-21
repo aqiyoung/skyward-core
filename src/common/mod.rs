@@ -1,6 +1,6 @@
 //! Shared types and primitives used across the kernel.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -320,4 +320,136 @@ impl TargetAddr {
             .next()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no address for host"))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Process attribution
+// ---------------------------------------------------------------------------
+
+/// The name of the process that owns the connection socket (local address
+/// `src:src_port`) — the Android equivalent of Go's
+/// `component/process.FindProcessName`. Matches the socket in
+/// `/proc/net/{tcp,tcp6,udp,udp6}` (exact IP+port preferred, then port-only,
+/// skipping inode==0), then scans `/proc/<pid>/fd` for that inode and returns
+/// the owner's first cmdline word.
+pub fn find_process_name(network: &str, src: IpAddr, src_port: u16) -> Option<String> {
+    let tables = match network.to_ascii_lowercase().as_str() {
+        p if p.starts_with("tcp") => ["/proc/net/tcp", "/proc/net/tcp6"],
+        p if p.starts_with("udp") => ["/proc/net/udp", "/proc/net/udp6"],
+        _ => return None,
+    };
+    for table in tables {
+        if let Some(inode) = socket_inode(table, src, src_port) {
+            if let Some(name) = process_of_inode(inode) {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+/// Parse a `/proc/net/{tcp,tcp6,udp,udp6}` local address field (`IP:PORT` in
+/// hex) into an `(IpAddr, u16)`.
+fn parse_hex_addr_port(s: &str) -> Option<(IpAddr, u16)> {
+    let colon = s.find(':')?;
+    let port = u16::from_str_radix(s.get(colon + 1..)?, 16).ok()?;
+    let hex = s.get(..colon)?;
+    match hex.len() {
+        8 => {
+            let v = u32::from_str_radix(hex, 16).ok()?;
+            Some((IpAddr::V4(Ipv4Addr::from(v)), port))
+        }
+        32 => {
+            let bytes = hex_decode(hex)?;
+            let array: [u8; 16] = bytes.try_into().ok()?;
+            Some((IpAddr::V6(Ipv6Addr::from(array)), port))
+        }
+        _ => None,
+    }
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// Scan a `/proc/net/{tcp,tcp6,udp,udp6}` table for a socket whose local
+/// port is `want_port`. Exact IP+port wins; otherwise the first port-only
+/// match is used (the socket may be listed with a different local address,
+/// e.g. the gateway, in TUN mode).
+fn socket_inode(table: &str, want: IpAddr, want_port: u16) -> Option<u32> {
+    let text = std::fs::read_to_string(table).ok()?;
+    let mut exact = None;
+    let mut port_only = None;
+    for line in text.lines().skip(1) {
+        // Kernel layout: `sl local rem st tx:rx tr:tm->when retrnsmt uid
+        // timeout inode ...` — uid at [7], inode at [9].
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 10 {
+            continue;
+        }
+        let Some((ip, port)) = parse_hex_addr_port(fields[1]) else {
+            continue;
+        };
+        if port != want_port {
+            continue;
+        }
+        let Ok(inode) = fields[9].parse::<u32>() else {
+            continue;
+        };
+        if inode == 0 {
+            continue; // no owner yet (TIME_WAIT, unconnected)
+        }
+        if ip == want && exact.is_none() {
+            exact = Some(inode);
+        } else if port_only.is_none() {
+            port_only = Some(inode);
+        }
+    }
+    exact.or(port_only)
+}
+
+/// Scan `/proc/<pid>/fd` for the socket inode and return the owner process's
+/// first cmdline word — the Android `resolveProcessNameByProcSearch`.
+fn process_of_inode(inode: u32) -> Option<String> {
+    let want = format!("socket:[{inode}]");
+    for entry in std::fs::read_dir("/proc").ok()? {
+        let entry = entry.ok()?;
+        let pid = entry.file_name().to_string_lossy().into_owned();
+        if !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let fds = match std::fs::read_dir(format!("/proc/{pid}/fd")) {
+            Ok(fds) => fds,
+            Err(_) => continue,
+        };
+        for fd in fds {
+            let Ok(fd) = fd else { continue };
+            let target = match fd.path().read_link() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if target.to_string_lossy() == want {
+                return process_name_of_pid(&pid);
+            }
+        }
+    }
+    None
+}
+
+/// The process's display name: the basename of its first cmdline word.
+fn process_name_of_pid(pid: &str) -> Option<String> {
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let first = cmdline.split(|b| *b == 0).next()?;
+    let name = String::from_utf8_lossy(first)
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    (!name.is_empty()).then_some(name)
 }

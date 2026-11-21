@@ -198,6 +198,14 @@ impl ConnectionTracker {
         if let Some(ip) = original_ip {
             destination_ip = ip.to_string();
         }
+        // App attribution: the socket owning this flow — set on the
+        // ConnectionMeta so the App can show per-app usage.
+        let network_str = match network { Network::Tcp => "tcp", Network::Udp => "udp" };
+        let process_path = source
+            .as_ref()
+            .and_then(|(s, p)| s.parse::<std::net::IpAddr>().ok())
+            .and_then(|ip| crate::common::find_process_name(network_str, ip, *p))
+            .unwrap_or_default();
         let (source_ip, source_port) = match source {
             Some((ip, port)) => (ip, port.to_string()),
             None => (String::new(), String::new()),
