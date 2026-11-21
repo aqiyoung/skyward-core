@@ -501,7 +501,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                         }
                         Ok(Err(e)) => {
                             tracing::warn!("TUN flow {} dial failed: {}", addr, e);
-                            diag(format!("flow {} dial failed: {}", addr, e));
+                            diag(format!("flow {} via {} dial failed: {}", addr, final_name, e));
                             // The manager resets the flow so the app fails
                             // fast instead of hanging on a dead connection.
                             relay_failed.store(true, Ordering::Relaxed);
@@ -509,7 +509,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                             return;
                         }
                         Err(_) => {
-                            diag(format!("flow {} dial timed out", addr));
+                            diag(format!("flow {} via {} dial timed out", addr, final_name));
                             relay_failed.store(true, Ordering::Relaxed);
                             done.store(true, Ordering::Relaxed);
                             return;
@@ -523,7 +523,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                     &target,
                     &rule,
                     "",
-                    vec![final_name, rule.clone()],
+                    vec![final_name.clone(), rule.clone()],
                     crate::tunnel::connection::Network::Tcp,
                     Some((key.client_ip.to_string(), key.client_port)),
                 )
@@ -546,7 +546,8 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                 let mut write_buf = vec![0u8; 16 * 1024];
                 let n = to_net.pop(&mut write_buf);
                 if n > 0 {
-                    if stream.write_all(&write_buf[..n]).await.is_err() {
+                    if let Err(error) = stream.write_all(&write_buf[..n]).await {
+                        diag(format!("flow {} via {} write failed: {}", addr, final_name, error));
                         end_reason = "write_err";
                         relay_failed.store(true, Ordering::Relaxed);
                         break 'relay;
@@ -574,7 +575,8 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                             remote_eof.store(true, Ordering::Relaxed);
                             break 'relay;
                         }
-                        Err(_) => {
+                        Err(error) => {
+                            diag(format!("flow {} via {} read failed: {}", addr, final_name, error));
                             end_reason = "read_err";
                             relay_failed.store(true, Ordering::Relaxed);
                             break 'relay;

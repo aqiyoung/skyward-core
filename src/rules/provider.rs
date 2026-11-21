@@ -207,6 +207,7 @@ impl ProviderRegistry {
             match task.await {
                 Ok((name, Ok(provider))) => {
                     tracing::info!("rule provider {} loaded ({} entries)", name, provider.len());
+                    crate::jni::emit_log_event(&format!("[rust-core] rule provider {} loaded ({} entries)", name, provider.len()));
                     registry.providers.insert(name, provider);
                 }
                 Ok((name, Err(e))) => {
@@ -216,6 +217,7 @@ impl ProviderRegistry {
                 Err(e) => tracing::warn!("rule provider task failed: {}", e),
             }
         }
+        crate::jni::emit_log_event(&format!("[rust-core] rule providers loaded {}/{}", registry.len(), config.rule_providers.len()));
         registry
     }
 
@@ -393,5 +395,49 @@ mod tests {
         let geo = GeoData::default();
         assert!(provider.matches(&TargetAddr::Domain("ads.example".into(), 80), None, &geo));
         assert!(!provider.matches(&TargetAddr::Domain("example.com".into(), 80), None, &geo));
+    }
+
+    #[tokio::test]
+    async fn downloaded_providers_match_before_catch_all_and_survive_offline_reload() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(stream.read_u8().await.unwrap());
+            }
+            let payload = "payload:\n  - DOMAIN-SUFFIX,youtube.com\n  - DOMAIN-SUFFIX,twitter.com\n  - IP-CIDR,91.108.56.0/22\n";
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", payload.len(), payload).as_bytes()).await.unwrap();
+        });
+        let dir = std::env::temp_dir().join(format!("skyward-provider-{}", rand::random::<u64>()));
+        let config = Config::from_str(&format!(r#"
+rule-providers:
+  Sites:
+    type: http
+    behavior: classical
+    url: http://{address}/rules
+    path: rules/sites.yaml
+rules:
+  - RULE-SET,Sites,PROXY
+  - MATCH,FALLBACK
+"#)).unwrap();
+        let registry = ProviderRegistry::load(&config, &dir).await;
+        server.await.unwrap();
+        assert_eq!(registry.len(), 1);
+        let rules = crate::rules::RuleSet::new(&config.rules);
+        let geo = GeoData::default();
+        for target in [
+            TargetAddr::Domain("www.youtube.com".into(), 443),
+            TargetAddr::Domain("api.twitter.com".into(), 443),
+            TargetAddr::Ip("91.108.56.150".parse().unwrap(), 443),
+        ] {
+            assert_eq!(rules.find(&target, None, Some(&geo), Some(&registry)).unwrap().target, "PROXY");
+        }
+        let cached = ProviderRegistry::load(&config, &dir).await;
+        assert_eq!(cached.len(), 1);
+        assert!(cached.matches("Sites", &TargetAddr::Domain("twitter.com".into(), 443), None, &geo));
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
     }
 }
