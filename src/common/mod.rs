@@ -15,7 +15,12 @@ pub const VERSION: &str = "1.0.1.4";
 pub struct TrafficStats {
     upload: AtomicU64,
     download: AtomicU64,
+    /// The same totals restricted to connections that left through a proxy
+    /// (the App's "only count proxy traffic" setting).
+    proxy_upload: AtomicU64,
+    proxy_download: AtomicU64,
     rate_sample: Mutex<Option<(Instant, TrafficSnapshot, TrafficSnapshot)>>,
+    proxy_rate_sample: Mutex<Option<(Instant, (u64, u64), (u64, u64))>>,
     persist: Mutex<Option<PersistSlot>>,
 }
 
@@ -43,14 +48,59 @@ impl TrafficStats {
         self.note_change();
     }
 
+    /// Count proxy-only bytes alongside the totals; DIRECT and REJECT flows
+    /// never call these.
+    pub fn add_proxy_upload(&self, bytes: u64) {
+        self.proxy_upload.fetch_add(bytes, Ordering::Relaxed);
+        self.note_change();
+    }
+
+    pub fn add_proxy_download(&self, bytes: u64) {
+        self.proxy_download.fetch_add(bytes, Ordering::Relaxed);
+        self.note_change();
+    }
+
     /// Zero the cumulative counters, as the App's "reset traffic" action does.
     pub fn reset(&self) {
         self.upload.store(0, Ordering::Relaxed);
         self.download.store(0, Ordering::Relaxed);
+        self.proxy_upload.store(0, Ordering::Relaxed);
+        self.proxy_download.store(0, Ordering::Relaxed);
         if let Ok(mut sample) = self.rate_sample.lock() {
             *sample = None;
         }
+        if let Ok(mut sample) = self.proxy_rate_sample.lock() {
+            *sample = None;
+        }
         self.write_now();
+    }
+
+    pub fn snapshot_proxied(&self) -> TrafficSnapshot {
+        TrafficSnapshot {
+            up: self.proxy_upload.load(Ordering::Relaxed),
+            down: self.proxy_download.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn rate_proxied(&self) -> TrafficSnapshot {
+        self.rate_proxied_at(Instant::now())
+    }
+
+    fn rate_proxied_at(&self, now: Instant) -> TrafficSnapshot {
+        let mut sample = self.proxy_rate_sample.lock().unwrap();
+        let current = self.snapshot_proxied();
+        let (last_time, last, rate) = sample.get_or_insert((now, (current.up, current.down), (0, 0)));
+        let elapsed = now.saturating_duration_since(*last_time);
+        if elapsed >= Duration::from_secs(1) {
+            let per_second = |bytes: u64| (bytes as f64 / elapsed.as_secs_f64()) as u64;
+            *rate = (
+                per_second(current.up.saturating_sub(last.0)),
+                per_second(current.down.saturating_sub(last.1)),
+            );
+            *last_time = now;
+            *last = (current.up, current.down);
+        }
+        TrafficSnapshot { up: rate.0, down: rate.1 }
     }
 
     /// Restore the cumulative totals from `path` and mirror later changes back
@@ -60,8 +110,12 @@ impl TrafficStats {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
                 let up = value.get("up").and_then(|v| v.as_u64()).unwrap_or(0);
                 let down = value.get("down").and_then(|v| v.as_u64()).unwrap_or(0);
+                let proxy_up = value.get("proxyUp").and_then(|v| v.as_u64()).unwrap_or(0);
+                let proxy_down = value.get("proxyDown").and_then(|v| v.as_u64()).unwrap_or(0);
                 self.upload.store(up, Ordering::Relaxed);
                 self.download.store(down, Ordering::Relaxed);
+                self.proxy_upload.store(proxy_up, Ordering::Relaxed);
+                self.proxy_download.store(proxy_down, Ordering::Relaxed);
             }
         }
         if let Ok(mut slot) = self.persist.lock() {
@@ -91,9 +145,11 @@ impl TrafficStats {
 
     fn write_locked(&self, path: &Path) {
         let body = format!(
-            "{{\"up\":{},\"down\":{}}}",
+            "{{\"up\":{},\"down\":{},\"proxyUp\":{},\"proxyDown\":{}}}",
             self.upload.load(Ordering::Relaxed),
-            self.download.load(Ordering::Relaxed)
+            self.download.load(Ordering::Relaxed),
+            self.proxy_upload.load(Ordering::Relaxed),
+            self.proxy_download.load(Ordering::Relaxed)
         );
         let _ = std::fs::write(path, body);
     }
@@ -148,6 +204,7 @@ fn cumulative_totals_survive_a_fresh_stats_instance() {
     first.add_download(13);
     first.reset();
     first.add_upload(1);
+    first.add_proxy_upload(4);
     std::thread::sleep(Duration::from_millis(80));
     first.add_upload(0); // a change past the mirror interval flushes
 
@@ -155,6 +212,8 @@ fn cumulative_totals_survive_a_fresh_stats_instance() {
     second.enable_persistence(path);
     assert_eq!(second.snapshot().up, 1);
     assert_eq!(second.snapshot().down, 0);
+    assert_eq!(second.snapshot_proxied().up, 4);
+    assert_eq!(second.snapshot_proxied().down, 0);
     std::fs::remove_dir_all(&dir).ok();
 }
 

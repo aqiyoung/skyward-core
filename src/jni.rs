@@ -371,7 +371,7 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
 }
 
 fn traffic_json(total: bool) -> String {
-    serde_json::json!(crate::runtime_state::traffic_snapshot(total)).to_string()
+    serde_json::json!(crate::runtime_state::traffic_snapshot(total, false)).to_string()
 }
 
 #[no_mangle]

@@ -175,11 +175,13 @@ pub async fn apply_config_from_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn traffic_snapshot(total: bool) -> crate::common::TrafficSnapshot {
-    if total {
-        traffic().snapshot()
-    } else {
-        traffic().rate()
+pub fn traffic_snapshot(total: bool, only_proxy: bool) -> crate::common::TrafficSnapshot {
+    let stats = traffic();
+    match (total, only_proxy) {
+        (true, true) => stats.snapshot_proxied(),
+        (true, false) => stats.snapshot(),
+        (false, true) => stats.rate_proxied(),
+        (false, false) => stats.rate(),
     }
 }
 

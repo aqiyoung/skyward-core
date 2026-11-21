@@ -964,7 +964,9 @@ fn handle_service_check(call: &MethodCall) -> Vec<u8> {
 }
 
 fn handle_get_traffic(call: &MethodCall, total: bool) -> Vec<u8> {
-    let snap = crate::runtime_state::traffic_snapshot(total);
+    // The App's setting restricts the reported numbers to proxied traffic.
+    let only_proxy = call.arguments.as_bool().unwrap_or(false);
+    let snap = crate::runtime_state::traffic_snapshot(total, only_proxy);
     if total {
         static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
         let should_log = {
@@ -1877,6 +1879,27 @@ mod tests {
         assert_eq!(out["behavior"], "classical");
         assert!(!rules.join("set.mrs").exists());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn total_traffic_honours_the_proxy_only_flag() {
+        let _guard = crate::runtime_state::TEST_LOCK.lock().unwrap();
+        let traffic = crate::runtime_state::traffic();
+        traffic.reset();
+        traffic.add_upload(9);
+        traffic.add_download(6);
+        traffic.add_proxy_upload(2);
+        traffic.add_proxy_download(1);
+
+        let only_proxy = response(invoke(br#"{"method":"getTotalTraffic","arguments":true}"#));
+        assert_eq!(only_proxy["result"]["up"], serde_json::json!(2));
+        assert_eq!(only_proxy["result"]["down"], serde_json::json!(1));
+
+        let everything = response(invoke(br#"{"method":"getTotalTraffic","arguments":false}"#));
+        assert_eq!(everything["result"]["up"], serde_json::json!(9));
+        assert_eq!(everything["result"]["down"], serde_json::json!(6));
+
+        traffic.reset();
     }
 
     #[test]

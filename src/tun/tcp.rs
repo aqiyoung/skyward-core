@@ -514,6 +514,9 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             let addr = route_target.address();
             flow_diag(format!("flow {} original={}:{} matched={}:{} policy={} outbound={}",
                 addr, key.target_ip, key.target_port, route.rule, route.payload, route.target, final_name));
+            // DIRECT and REJECT are the built-in non-proxy outbounds; every
+            // other name counts towards the App's proxy-only totals.
+            let proxied = !matches!(final_name.as_str(), "DIRECT" | "REJECT");
             let mut stream: BoxedStream = tokio::select! {
                 _ = cancel.notified() => {
                     relay_failed.store(true, Ordering::Relaxed);
@@ -589,6 +592,9 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                         break 'relay;
                     }
                     up_counter.fetch_add(n as u64, Ordering::Relaxed);
+                    if proxied {
+                        engine.traffic.add_proxy_upload(n as u64);
+                    }
                     continue;
                 }
                 // Backpressure: the manager may only hand the app one window
@@ -619,6 +625,9 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                         }
                         Ok(n) => {
                             down_counter.fetch_add(n as u64, Ordering::Relaxed);
+                            if proxied {
+                                engine.traffic.add_proxy_download(n as u64);
+                            }
                             from_net.push(&read_buf[..n]);
                         }
                     }

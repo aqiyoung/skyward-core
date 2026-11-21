@@ -48,11 +48,18 @@ struct CountingWriter<W> {
     counter: Arc<AtomicU64>,
     traffic: SharedTraffic,
     upload: bool,
+    proxied: bool,
 }
 
 impl<W> CountingWriter<W> {
-    fn new(inner: W, counter: Arc<AtomicU64>, traffic: SharedTraffic, upload: bool) -> Self {
-        Self { inner, counter, traffic, upload }
+    fn new(
+        inner: W,
+        counter: Arc<AtomicU64>,
+        traffic: SharedTraffic,
+        upload: bool,
+        proxied: bool,
+    ) -> Self {
+        Self { inner, counter, traffic, upload, proxied }
     }
 }
 
@@ -64,8 +71,14 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CountingWriter<W> {
                 this.counter.fetch_add(n as u64, Ordering::Relaxed);
                 if this.upload {
                     this.traffic.add_upload(n as u64);
+                    if this.proxied {
+                        this.traffic.add_proxy_upload(n as u64);
+                    }
                 } else {
                     this.traffic.add_download(n as u64);
+                    if this.proxied {
+                        this.traffic.add_proxy_download(n as u64);
+                    }
                 }
                 Poll::Ready(Ok(n))
             }
@@ -356,8 +369,9 @@ impl Engine {
                         }
                         let (mut rin, mut win) = tokio::io::split(inbound);
                         let (mut rout, mut wout) = tokio::io::split(remote);
-                        let mut up = CountingWriter::new(&mut wout, up_counter, self.traffic.clone(), true);
-                        let mut down = CountingWriter::new(&mut win, down_counter, self.traffic.clone(), false);
+                        let proxied = !matches!(final_name.as_str(), "DIRECT" | "REJECT");
+                        let mut up = CountingWriter::new(&mut wout, up_counter, self.traffic.clone(), true, proxied);
+                        let mut down = CountingWriter::new(&mut win, down_counter, self.traffic.clone(), false, proxied);
                         let result = tokio::select! {
                             r = tokio::io::copy(&mut rin, &mut up) => r.map(|_| ()),
                             r = tokio::io::copy(&mut rout, &mut down) => r.map(|_| ()),
