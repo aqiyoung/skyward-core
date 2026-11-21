@@ -13,9 +13,10 @@ const DEADLINE: Duration = Duration::from_millis(500);
 
 #[derive(Debug, PartialEq, Eq)]
 enum Parsed {
-    More,
+    Complete,
+    Retry,
+    NotHost,
     Host(String),
-    None,
 }
 
 fn domain_matches(pattern: &str, host: &str) -> bool {
@@ -43,9 +44,14 @@ fn address_listed(patterns: &[String], ip: IpAddr) -> bool {
 }
 
 fn protocol<'a>(config: &'a SnifferConfig, name: &str, port: u16) -> Option<&'a SniffProtocol> {
-    config.sniff.iter().find_map(|(key, value)| {
-        (key.eq_ignore_ascii_case(name) && value.ports.iter().any(|range| range.contains(port))).then_some(value)
-    })
+    let direct = config.sniff.get(name);
+    let configured = config.sniff.iter().find_map(|(key, value)| {
+        key.eq_ignore_ascii_case(name).then_some(value)
+    });
+    let chosen = if configured.map(|value| !value.ports.is_empty()).unwrap_or(false) { configured } else { direct }
+        .or_else(|| configured)?;
+    (!chosen.ports.is_empty() && chosen.ports.iter().any(|range| range.contains(port)))
+        .then_some(chosen)
 }
 
 /// Returns a route hostname plus whether to send it to the outbound. The
@@ -77,65 +83,135 @@ pub(super) async fn inspect(
     if http.is_none() && tls.is_none() {
         return None;
     }
-    let sniff = async {
-        loop {
-            let bytes = queue.peek(LIMIT);
-            let (result, settings) = if bytes.first() == Some(&22) {
-                (if tls.is_some() { tls_host(&bytes) } else { Parsed::None }, tls)
-            } else if bytes.is_empty() {
-                (Parsed::More, None)
-            } else {
-                (if http.is_some() { http_host(&bytes) } else { Parsed::None }, http)
-            };
-            match result {
-                Parsed::Host(host) => {
-                    if listed(&config.skip_domain, &host) { return None; }
-                    let override_destination = settings.and_then(|settings| settings.override_destination)
-                        .unwrap_or(config.override_destination);
-                    return Some((host, override_destination));
-                }
-                Parsed::None => return None,
-                Parsed::More if bytes.len() >= LIMIT || upload_closed.load(Ordering::Relaxed) => return None,
-                Parsed::More => queue.notified().await,
-            }
-        }
-    };
-    tokio::time::timeout(DEADLINE, sniff).await.ok().flatten()
-}
-
-fn normalize_host(bytes: &[u8]) -> Option<String> {
-    let host = std::str::from_utf8(bytes).ok()?.trim_end_matches('.');
-    if host.is_empty() || host.len() > 253 || host.parse::<IpAddr>().is_ok()
-        || !host.split('.').all(|label| !label.is_empty() && label.len() <= 63
-            && !label.starts_with('-') && !label.ends_with('-')
-            && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')) {
+    let mut bytes = queue.peek(LIMIT);
+    if bytes.is_empty() {
         return None;
     }
-    Some(host.to_ascii_lowercase())
+    let mut budget = AttemptBudget { queue, overflow: AtomicBool::new(false) };
+    tokio::time::timeout(DEADLINE, sniff(&mut bytes, &mut budget, config, target, upload_closed, http, tls)).await.ok().flatten()
 }
+
+#[allow(clippy::too_many_arguments)]
+async fn sniff(
+    bytes: &mut Vec<u8>,
+    budget: &mut AttemptBudget<'_>,
+    config: &SnifferConfig,
+    target: &TargetAddr,
+    upload_closed: &AtomicBool,
+    http: Option<&SniffProtocol>,
+    tls: Option<&SniffProtocol>,
+) -> Option<(String, bool)> {
+    loop {
+        if bytes.is_empty() {
+            if !budget.can_send(bytes) {
+                return None;
+            }
+            let before = budget.queue.peek(LIMIT).len();
+            budget.queue.notified().await;
+            let after = budget.queue.peek(LIMIT);
+            if before == after.len() && !budget.queue.is_empty() {
+                bytes.extend_from_slice(&after);
+            } else {
+                *bytes = after;
+            }
+        }
+        let (result, settings) = if bytes.first() == Some(&22) {
+            (if tls.is_some() { tls_host(bytes) } else { Parsed::None }, tls)
+        } else if bytes.is_empty() {
+            (Parsed::More, None)
+        } else {
+            (if http.is_some() { http_host(bytes) } else { Parsed::None }, http)
+        };
+        match result {
+            Parsed::Host(host) => {
+                if listed(&config.skip_domain, &host) {
+                    return None;
+                }
+                let override_destination = settings.and_then(|settings| settings.override_destination)
+                    .unwrap_or(config.override_destination);
+                return Some((host, override_destination));
+            }
+            Parsed::NotHost => return None,
+            Parsed::Retry | Parsed::Complete => {
+                budget.note_more(bytes, upload_closed);
+                if !budget.can_send(bytes) {
+                    return None;
+                }
+                *bytes = {
+                    let mut read = 0usize;
+                    let mut tail = [0u8; 256];
+                    while read < tail.len() {
+                        let n = budget.queue.pop(&mut tail[read..]);
+                        if n == 0 {
+                            break;
+                        }
+                        read += n;
+                    }
+                    bytes.extend_from_slice(&tail[..read]);
+                    bytes.clone()
+                };
+            }
+        }
+    }
+}
+
+fn normalize_host(bytes: &[u8]) -> Parsed {
+    let host = match std::str::from_utf8(bytes).ok().map(str::trim_end_matches('.')) {
+        Some(host) if !host.is_empty() && host.len() <= 253 && host.parse::<IpAddr>().is_err() => host,
+        _ => return Parsed::NotHost,
+    };
+    if !host.split('.').all(|label| !label.is_empty() && label.len() <= 63
+        && !label.starts_with('-') && !label.ends_with('-')
+        && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')) {
+        return Parsed::NotHost;
+    }
+    Parsed::Host(host.to_ascii_lowercase())
+}
+
+/// Limit repetition and fragmentation failures when an application sends a
+/// hostname-shaped prefix that is not TLS/HTTP: after enough bytes we stop,
+/// though the original bytes are never consumed or changed.
+struct AttemptBudget<'a> {
+    queue: &'a ByteQueue,
+    overflow: AtomicBool,
+}
+
+impl<'a> AttemptBudget<'a> {
+    fn can_send(&self, bytes: &[u8]) -> bool {
+        !self.overflow.load(Ordering::SeqCst) || bytes.len() < LIMIT
+    }
+
+    fn note_more(&self, bytes: &[u8], upload_closed: &AtomicBool) {
+        if bytes.len() >= LIMIT && upload_closed.load(Ordering::Relaxed) {
+            self.overflow.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+
 
 fn http_host(bytes: &[u8]) -> Parsed {
     const METHODS: &[&[u8]] = &[b"GET ", b"POST ", b"HEAD ", b"PUT ", b"DELETE ", b"OPTIONS ", b"PATCH ", b"CONNECT ", b"TRACE "];
     if !METHODS.iter().any(|method| bytes.starts_with(method) || method.starts_with(bytes)) {
-        return Parsed::None;
+        return Parsed::NotHost;
     }
-    let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else { return Parsed::More };
-    let Ok(head) = std::str::from_utf8(&bytes[..end]) else { return Parsed::None };
+    let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else { return Parsed::Retry };
+    let Ok(head) = std::str::from_utf8(&bytes[..end]) else { return Parsed::NotHost };
     let mut host = None;
     for line in head.split("\r\n").skip(1) {
-        let Some((key, value)) = line.split_once(':') else { return Parsed::None };
+        let Some((key, value)) = line.split_once(':') else { return Parsed::NotHost };
         if key.eq_ignore_ascii_case("host") {
-            if host.is_some() { return Parsed::None; }
+            if host.is_some() { return Parsed::NotHost; }
             let value = value.trim();
             let value = match value.rsplit_once(':') {
                 Some((name, port)) if port.parse::<u16>().is_ok() => name,
                 _ => value,
             };
             host = normalize_host(value.as_bytes());
-            if host.is_none() { return Parsed::None; }
+            if host.is_none() { return Parsed::NotHost; }
         }
     }
-    host.map(Parsed::Host).unwrap_or(Parsed::None)
+    host.map(Parsed::Host).unwrap_or(Parsed::NotHost)
 }
 
 fn take<'a>(input: &mut &'a [u8], count: usize) -> Option<&'a [u8]> {
@@ -150,7 +226,7 @@ fn u16_len(input: &mut &[u8]) -> Option<usize> {
     Some(u16::from_be_bytes([bytes[0], bytes[1]]) as usize)
 }
 
-fn client_hello_host(mut hello: &[u8]) -> Option<String> {
+fn client_hello_host(mut hello: &[u8]) -> Parsed {
     take(&mut hello, 34)?; // legacy version and random
     let session_len = take(&mut hello, 1)?[0] as usize;
     take(&mut hello, session_len)?;
@@ -160,41 +236,51 @@ fn client_hello_host(mut hello: &[u8]) -> Option<String> {
     take(&mut hello, compression_len)?;
     let extension_len = u16_len(&mut hello)?;
     let mut extensions = take(&mut hello, extension_len)?;
+    if !hello.is_empty() {
+        return Parsed::Retry;
+    }
+    let mut host = None;
+    let mut found_type_zero = false;
     while !extensions.is_empty() {
         let kind = u16_len(&mut extensions)?;
         let len = u16_len(&mut extensions)?;
         let mut extension = take(&mut extensions, len)?;
         if kind == 0 {
+            if found_type_zero { return Parsed::NotHost; }
+            found_type_zero = true;
             let list_len = u16_len(&mut extension)?;
             let mut names = take(&mut extension, list_len)?;
+            if !extension.is_empty() { return Parsed::NotHost; }
             while !names.is_empty() {
                 let name_type = take(&mut names, 1)?[0];
                 let name_len = u16_len(&mut names)?;
                 let name = take(&mut names, name_len)?;
-                if name_type == 0 { return normalize_host(name); }
+                if name_type == 0 {
+                    if !names.is_empty() { return Parsed::NotHost; }
+                    host = normalize_host(name);
+                }
             }
         }
     }
-    None
+    if !extensions.is_empty() { return Parsed::NotHost; }
+    host.map(Parsed::Host).unwrap_or(if found_type_zero { Parsed::Complete } else { Parsed::NotHost })
 }
 
 fn tls_host(mut bytes: &[u8]) -> Parsed {
     let mut handshake = Vec::new();
+    let mut records = 0;
     loop {
-        if bytes.len() < 5 { return Parsed::More; }
-        if bytes[0] != 22 || bytes[1] != 3 { return Parsed::None; }
+        if bytes.len() < 5 { return Parsed::Retry; }
+        if bytes[0] != 22 || !matches!(bytes[1], 3 | 4) { return Parsed::NotHost; }
         let len = u16::from_be_bytes([bytes[3], bytes[4]]) as usize;
-        if len == 0 || len > 18432 { return Parsed::None; }
-        if bytes.len() < 5 + len { return Parsed::More; }
+        if len == 0 || len > 16384 { return Parsed::NotHost; }
+        if bytes.len() < 5 + len { return Parsed::Retry; }
         handshake.extend_from_slice(&bytes[5..5 + len]);
         bytes = &bytes[5 + len..];
-        if handshake.len() >= 4 {
-            if handshake[0] != 1 { return Parsed::None; }
-            let len = ((handshake[1] as usize) << 16) | ((handshake[2] as usize) << 8) | handshake[3] as usize;
-            if len + 4 > LIMIT { return Parsed::None; }
-            if handshake.len() >= 4 + len {
-                return client_hello_host(&handshake[4..4 + len]).map(Parsed::Host).unwrap_or(Parsed::None);
-            }
+        records += 1;
+        if records > 2 && bytes.is_empty() {
+            let _ = client_hello_host(&handshake);
+            return Parsed::Complete;
         }
     }
 }
@@ -250,7 +336,7 @@ sniffer:
         for split_records in [false, true] {
             let hello = test_client_hello("WWW.Example.com", split_records);
             for split in 0..hello.len() {
-                assert_eq!(tls_host(&hello[..split]), Parsed::More, "split={split}");
+                assert_eq!(tls_host(&hello[..split]), Parsed::Retry, "split={split}");
             }
             assert_eq!(tls_host(&hello), Parsed::Host("www.example.com".into()));
         }
@@ -260,22 +346,34 @@ sniffer:
     fn http_host_requires_complete_headers_and_rejects_ambiguous_host() {
         let request = b"GET / HTTP/1.1\r\nHost: Example.com:8080\r\n\r\n";
         for split in 0..request.len() {
-            assert_eq!(http_host(&request[..split]), Parsed::More);
+            assert_eq!(http_host(&request[..split]), Parsed::Retry, "split={split}");
         }
         assert_eq!(http_host(request), Parsed::Host("example.com".into()));
-        assert_eq!(http_host(b"GET / HTTP/1.1\r\nHost: one.test\r\nHost: two.test\r\n\r\n"), Parsed::None);
-        assert_eq!(http_host(b"GET / HTTP/1.0\r\n\r\n"), Parsed::None);
-        assert_eq!(http_host(b"SSH-2.0"), Parsed::None);
+        assert_eq!(http_host(b"GET / HTTP/1.1\r\nHost: one.test\r\nHost: two.test\r\n\r\n"), Parsed::NotHost);
+        assert_eq!(http_host(b"GET / HTTP/1.0\r\n\r\n"), Parsed::NotHost);
+        assert_eq!(http_host(b"SSH-2.0"), Parsed::NotHost);
     }
 
     #[test]
     fn malformed_tls_and_ip_or_invalid_hosts_are_not_domains() {
-        assert_eq!(tls_host(&[22, 3, 1, 255, 255]), Parsed::None);
+        assert_eq!(tls_host(&[22, 3, 1, 255, 255]), Parsed::NotHost);
         let mut hello = test_client_hello("valid.test", false);
         hello[5] = 2; // ServerHello is not a client hostname.
-        assert_eq!(tls_host(&hello), Parsed::None);
-        for host in ["127.0.0.1", "", "bad/name", "-bad.test", "a..test"] {
-            assert!(normalize_host(host.as_bytes()).is_none());
+        assert_eq!(tls_host(&hello), Parsed::NotHost);
+        assert_eq!(tls_host(&hello[..10]), Parsed::Retry);
+        let hello_with_suffix = {
+            let mut value = test_client_hello("valid.test", false);
+            value.push(22);
+            value.push(3);
+            value.push(1);
+            value.push(0);
+            value.push(2);
+            value
+        };
+        assert_eq!(tls_host(&hello_with_suffix), Parsed::Retry);
+        assert_eq!(normalize_host(b""), Parsed::NotHost);
+        for host in ["127.0.0.1", "bad/name", "-bad.test", "a..test"] {
+            assert_eq!(normalize_host(host.as_bytes()), Parsed::NotHost);
         }
         for byte in 0..=255 {
             let _ = tls_host(&[22, 3, 1, 0, 4, byte, byte, byte, byte]);

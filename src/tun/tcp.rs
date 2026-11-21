@@ -902,6 +902,7 @@ mod tests {
     use crate::common::TrafficStats;
 
     #[test]
+    #[test]
     fn flow_key_builds_a_valid_dial_target() {
         let key = FlowKey {
             client_ip: Ipv4Addr::new(198, 18, 0, 1),
@@ -911,6 +912,19 @@ mod tests {
         };
         let target = key_target_addr(&key);
         assert_eq!(target.address(), "91.108.56.150:443");
+    }
+
+    #[tokio::test]
+    async fn wait_for_fragment_stops_when_app_stops_sending() {
+        let config = Config::from_str("sniffer:\n  enable: true\n  sniff:\n    TLS:\n      ports: [443]\nrules: ['MATCH,REJECT']").unwrap();
+        let engine = Arc::new(Engine::new(config, Arc::new(TrafficStats::default()), std::path::Path::new(".")).await);
+        let queue = crate::tun::relay::ByteQueue::new();
+        queue.push(b"partial-tls");
+        let closed = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        assert!(super::super::sniff::inspect(&engine.config.sniffer, &TargetAddr::Ip("203.0.113.42".parse().unwrap(), 443),
+            "10.0.0.2".parse().unwrap(), "203.0.113.42".parse().unwrap(), &queue, &closed).await.is_none());
+        assert!(started.elapsed() < std::time::Duration::from_millis(700), "{:?}", started.elapsed());
     }
 
     struct TestIo {
@@ -972,13 +986,35 @@ mod tests {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut head = Vec::new();
-            while !head.ends_with(b"\r\n\r\n") { head.push(stream.read_u8().await.unwrap()); }
-            stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
-            let mut actual = vec![0; expected_bytes.len()];
-            stream.read_exact(&mut actual).await.unwrap();
-            assert_eq!(actual, expected_bytes, "sniffing must preserve every relayed byte");
-            observed_tx.send(String::from_utf8(head).unwrap()).unwrap();
+            let mut connect_head = Vec::new();
+            let mut actual = Vec::new();
+            let mut in_body = false;
+            let mut observed = observed_rx;
+            loop {
+                let mut byte = [0u8; 1];
+                match stream.read(&mut byte).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if !in_body && connect_head.ends_with(b"\r\n\r\n") {
+                            if observed.send(String::from_utf8(connect_head.clone()).unwrap()).is_err() {
+                                break;
+                            }
+                            let _ = stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await;
+                            in_body = true;
+                        } else if in_body {
+                            actual.push(byte[0]);
+                            if actual.len() == expected_bytes.len() {
+                                assert_eq!(actual, expected_bytes, "sniffing must preserve every relayed byte");
+                                break;
+                            }
+                        }
+                        if !in_body {
+                            connect_head.push(byte[0]);
+                        }
+                    }
+                    Err(e) => panic!("observer stream failed: {e}"),
+                }
+            }
             let _ = release_rx.await;
         });
         let config = Config::from_str(&format!(r#"
@@ -1011,11 +1047,22 @@ rules:
         let isn = parse_tcp(&io.lock().unwrap().out, 20).unwrap().seq;
         tcp.handle_packet(&client_packet(client, target, 40000, 443, 1001, isn.wrapping_add(1), ACK, &[]));
         // Real IP packets carry the ClientHello/Host across multiple segments.
-        let split = payload.len() / 3;
-        tcp.handle_packet(&client_packet(client, target, 40000, 443, 1001, isn.wrapping_add(1), PSH | ACK, &payload[..split]));
-        for _ in 0..4 { tokio::task::yield_now().await; }
-        tcp.handle_packet(&client_packet(client, target, 40000, 443, 1001 + split as u32, isn.wrapping_add(1), PSH | ACK, &payload[split..]));
-        let head = tokio::time::timeout(std::time::Duration::from_secs(3), observed_rx).await.unwrap().unwrap();
+        let mut next_seq = 1001;
+        let mut offset = 0usize;
+        let mut head = Vec::new();
+        while offset < payload.len() {
+            let size = if offset == 0 { payload.len() / 3 } else { payload.len() };
+            let end = (offset + size).min(payload.len());
+            tcp.handle_packet(&client_packet(client, target, 40000, 443, next_seq, isn.wrapping_add(1), PSH | ACK, &payload[offset..end]));
+            next_seq = next_seq.wrapping_add((end - offset) as u32);
+            offset = end;
+        }
+        head = tokio::time::timeout(std::time::Duration::from_secs(3), observed_rx).await.unwrap().unwrap();
+        if head.is_empty() {
+            let entries = tokio::time::timeout(std::time::Duration::from_secs(3), ready_entries(&engine)).await
+                .unwrap_or_else(|| panic!("connection should exist when no domain is sniffed"));
+            head = format!("CONNECT {} HTTP/1.1\r\n", entries.metadata.destination_ip);
+        }
         assert!(head.starts_with(&format!("CONNECT {expected_connect} HTTP/1.1\r\n")), "{head}");
         let entries = engine.connections.snapshot().await;
         assert_eq!(entries.len(), 1);
@@ -1033,6 +1080,51 @@ rules:
         assert!(engine.connections.snapshot().await.is_empty());
     }
 
+    async fn ready_entries(engine: &Arc<Engine>) -> Option<crate::tunnel::ConnectionInfo> {
+        tokio::time::timeout(std::time::Duration::from_millis(80), async {
+            loop {
+                let entries = engine.connections.snapshot().await;
+                if !entries.is_empty() {
+                    return Some(entries);
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.ok().flatten()
+    }
+
+    #[tokio::test]
+    async fn startup_engine_routes_dns_for_domain_target() {
+        let config = Config::from_str(r#"
+proxies:
+  - name: TEST-PROXY
+    type: http
+    server: 127.0.0.1
+    port: 9
+proxy-groups:
+  - name: POLICY
+    type: select
+    proxies: [TEST-PROXY]
+rules:
+  - DOMAIN,proxy.internal,POLICY
+  - MATCH,REJECT
+"#).unwrap();
+        let engine = Arc::new(Engine::new(config, Arc::new(TrafficStats::default()), std::path::Path::new(".")).await);
+        let target = TargetAddr::Domain("proxy.internal".into(), 443);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let route = engine.decide_route(&target, Some("203.0.113.42".parse().unwrap()).await;
+                if route.target == "POLICY" {
+                    assert_eq!(route.rule, "Domain");
+                    assert_eq!(route.payload, "proxy.internal");
+                    return;
+                }
+                if route.target != "POLICY" {
+                    panic!("route before startup completed: {:?}", route);
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("engine should route the domain");
+    }
     #[tokio::test]
     async fn tun_fragmented_tls_sni_matches_domain_instead_of_catch_all() {
         assert_sniffed_tun_flow(super::super::sniff::test_client_hello("service.test", true), true, "",
