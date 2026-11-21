@@ -130,7 +130,7 @@ impl Engine {
                     members.extend(config.proxies.iter().map(|proxy| proxy.name.clone()));
                 }
                 if g.include_all || g.include_all_providers {
-                    let mut names: Vec<_> = provider_nodes.keys().cloned().collect();
+                    let mut names: Vec<_> = provider_nodes.iter().map(|(name, _)| name.clone()).collect();
                     names.sort();
                     members.extend(names);
                 } else {
