@@ -135,6 +135,7 @@ pub fn invoke(data: &[u8]) -> Vec<u8> {
         "updateDns" => handle_update_dns(&call),
         "updateGeoData" => handle_update_geo_data(&call),
         "getConnections" => handle_get_connections(&call),
+        "takeClosedConnections" => handle_take_closed_connections(&call),
         "getConnectionCount" => handle_connection_count(&call),
         "closeConnections" => handle_close_connections(&call),
         "resetConnections" => handle_close_connections(&call),
@@ -1356,6 +1357,18 @@ fn handle_get_connections(call: &MethodCall) -> Vec<u8> {
         }
     };
     ok(&call.id, block_on(future).unwrap_or_else(|_| json!({"connections": []})))
+}
+
+/// Hand the App every connection that finished since the last call, so its
+/// history is complete even for traffic sampled too late or not at all.
+fn handle_take_closed_connections(call: &MethodCall) -> Vec<u8> {
+    let future = async {
+        match crate::runtime_state::engine().await {
+            Some(engine) => serde_json::json!(engine.connections.take_closed()),
+            None => serde_json::json!([]),
+        }
+    };
+    ok(&call.id, block_on(future).unwrap_or_else(|_| json!([])))
 }
 
 fn handle_connection_count(call: &MethodCall) -> Vec<u8> {

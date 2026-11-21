@@ -1,6 +1,6 @@
 //! Live connection registry backing the `/connections` API.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -119,9 +119,31 @@ impl ConnectionLease {
 
 impl Drop for ConnectionLease {
     fn drop(&mut self) {
-        self.tracker.entries.write().unwrap().remove(&self.id);
+        self.tracker.forget(&self.id);
     }
 }
+
+/// A finished connection's final accounting, handed to the App so history is
+/// complete even for traffic the periodic sampler never saw.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClosedSummary {
+    pub id: String,
+    #[serde(rename = "startedAt")]
+    pub started_ms: u64,
+    #[serde(rename = "endedAt")]
+    pub ended_ms: u64,
+    pub host: String,
+    pub rule: String,
+    #[serde(rename = "rulePayload")]
+    pub rule_payload: String,
+    pub chains: Vec<String>,
+    pub network: String,
+    pub upload: u64,
+    pub download: u64,
+}
+
+/// How many finished connections are kept for the App to collect.
+const CLOSED_CAP: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Network {
@@ -136,6 +158,8 @@ pub struct ConnectionTracker {
     /// request-traffic watch diffs against this map.
     watch_reported: Mutex<HashMap<String, (u64, u64)>>,
     watch_running: AtomicBool,
+    /// Finished connections awaiting collection by the App.
+    closed: std::sync::Mutex<VecDeque<ClosedSummary>>,
 }
 
 /// The App's request-list event for one new connection (its
@@ -289,9 +313,22 @@ impl ConnectionTracker {
         self.entries.read().unwrap().len()
     }
 
+    /// Remove an entry and keep its final accounting; returns it when the id
+    /// was live.
+    fn forget(&self, id: &str) -> Option<Entry> {
+        let entry = self.entries.write().unwrap().remove(id)?;
+        self.record_closed(&entry);
+        Some(entry)
+    }
+
+    /// Collect (and clear) the finished connections since the last call.
+    pub fn take_closed(&self) -> Vec<ClosedSummary> {
+        self.closed.lock().unwrap().drain(..).collect()
+    }
+
     /// Close a connection by id. Returns false when it does not exist.
     pub async fn close(&self, id: &str) -> bool {
-        let entry = self.entries.write().unwrap().remove(id);
+        let entry = self.forget(id);
         if let Some(entry) = entry {
             entry.cancel.notify_one();
             true
@@ -301,18 +338,119 @@ impl ConnectionTracker {
     }
 
     pub async fn close_all(&self) -> usize {
-        let mut entries = self.entries.write().unwrap();
-        let count = entries.len();
-        for (_, entry) in entries.drain() {
+        let drained: Vec<Entry> = {
+            let mut entries = self.entries.write().unwrap();
+            entries.drain().map(|(_, entry)| entry).collect()
+        };
+        let count = drained.len();
+        for entry in drained {
+            self.record_closed(&entry);
             entry.cancel.notify_one();
         }
         count
     }
+
+    fn record_closed(&self, entry: &Entry) {
+        let info = &entry.info;
+        let summary = ClosedSummary {
+            id: info.id.clone(),
+            started_ms: parse_iso8601_millis(&info.start).unwrap_or_else(now_millis),
+            ended_ms: now_millis(),
+            host: info.metadata.host.clone(),
+            rule: info.rule.clone(),
+            rule_payload: info.rule_payload.clone(),
+            chains: info.chains.clone(),
+            network: info.kind.clone(),
+            upload: entry.counters.upload.load(Ordering::Relaxed),
+            download: entry.counters.download.load(Ordering::Relaxed),
+        };
+        let mut closed = self.closed.lock().unwrap();
+        if closed.len() >= CLOSED_CAP {
+            closed.pop_front();
+        }
+        closed.push_back(summary);
+    }
+}
+
+/// Epoch milliseconds for the RFC 3339 UTC form `iso8601` emits.
+fn parse_iso8601_millis(text: &str) -> Option<u64> {
+    let rest = text.strip_suffix('Z')?;
+    let (date, time) = rest.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year: i64 = date_parts.next()?.parse().ok()?;
+    let month: u32 = date_parts.next()?.parse().ok()?;
+    let day: u32 = date_parts.next()?.parse().ok()?;
+    let mut time_parts = time.split(':');
+    let hour: u32 = time_parts.next()?.parse().ok()?;
+    let minute: u32 = time_parts.next()?.parse().ok()?;
+    let second = time_parts.next()?;
+    let (second, millis) = match second.split_once('.') {
+        Some((second, fraction)) => {
+            let mut millis: u32 = 0;
+            for (index, digit) in fraction.chars().take(3).enumerate() {
+                millis += digit.to_digit(10)? * 10u32.pow(2 - index as u32);
+            }
+            (second.parse::<u32>().ok()?, millis)
+        }
+        None => (second.parse().ok()?, 0),
+    };
+    let days = days_from_civil(year, month, day);
+    Some(
+        ((((days * 24 + hour as i64) * 60 + minute as i64) * 60 + second as i64) * 1000
+            + millis as i64) as u64,
+    )
+}
+
+/// Days since the Unix epoch for a proleptic Gregorian date (the inverse of
+/// Howard Hinnant's `civil_from_days`).
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = year - if month <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month as i64 - 3 } else { month as i64 + 9 };
+    let doy = (153 * mp + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn finished_connections_are_reported_until_collected() {
+        let tracker = Arc::new(ConnectionTracker::new());
+        let ip = "203.0.113.42".parse::<std::net::IpAddr>().unwrap();
+        let (lease, upload, download) = tracker.add(
+            &TargetAddr::Domain("service.test".into(), 443),
+            "Domain",
+            "service.test",
+            vec!["DIRECT".into()],
+            Network::Tcp,
+            None,
+            Some(ip),
+        )
+        .await;
+        upload.fetch_add(5, Ordering::Relaxed);
+        download.fetch_add(7, Ordering::Relaxed);
+        drop(lease);
+
+        let closed = tracker.take_closed();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].host, "service.test");
+        assert_eq!(closed[0].rule, "Domain");
+        assert_eq!(closed[0].chains, vec!["DIRECT"]);
+        assert_eq!((closed[0].upload, closed[0].download), (5, 7));
+        assert!(closed[0].started_ms > 0);
+        assert!(closed[0].ended_ms >= closed[0].started_ms);
+        assert!(tracker.take_closed().is_empty());
+    }
+
+    #[test]
+    fn iso8601_round_trips_through_the_epoch_helper() {
+        let ms = parse_iso8601_millis("2026-11-19T13:34:48.123Z").unwrap();
+        assert_eq!(iso8601(ms), "2026-11-19T13:34:48.123Z");
+    }
 
     #[tokio::test]
     async fn raw_ip_has_no_invented_host_and_sniffed_host_keeps_original_ip() {
