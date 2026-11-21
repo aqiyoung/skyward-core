@@ -1581,10 +1581,6 @@ fn v6_bad_header_error() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "snell v6 invalid record header")
 }
 
-fn v6_record_padding_error() -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, "snell v6 unexpected padding in record")
-}
-
 fn v6_put_header(header: &mut [u8], padding_length: usize, payload_length: usize) {
     header[0] = V6_HEADER_VERSION;
     header[1] = 0;
