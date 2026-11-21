@@ -1112,7 +1112,7 @@ rules:
         let target = TargetAddr::Domain("proxy.internal".into(), 443);
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
-                let route = engine.decide_route(&target, Some("203.0.113.42".parse().unwrap()).await;
+                let route = engine.decide_route(&target, Some("203.0.113.42".parse().unwrap())).await;
                 if route.target == "POLICY" {
                     assert_eq!(route.rule, "Domain");
                     assert_eq!(route.payload, "proxy.internal");
