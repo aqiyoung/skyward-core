@@ -254,30 +254,6 @@ pub struct ProxyInfo {
     pub selected: Option<String>,
 }
 
-/// Regional flags/words present in a group name, used to fill an empty
-/// url-test group from proxy nodes whose names carry the same region.
-fn region_tags(name: &str) -> Vec<String> {
-    let mut tags = Vec::new();
-    // Regional-indicator emoji pairs (e.g. 🇭🇰, 🇯🇵).
-    let runes: Vec<char> = name.chars().collect();
-    for w in runes.windows(2) {
-        if (0x1F1E6..=0x1F1FF).contains(&(w[0] as u32))
-            && (0x1F1E6..=0x1F1FF).contains(&(w[1] as u32))
-        {
-            tags.push(format!("{}{}", w[0], w[1]));
-        }
-    }
-    for word in [
-        "香港", "台湾", "日本", "美国", "新加坡", "韩国", "印尼", "俄罗斯", "德国", "英国",
-        "Hong Kong", "Taiwan", "Japan", "United States", "Singapore", "Korea",
-    ] {
-        if name.contains(word) {
-            tags.push(word.to_string());
-        }
-    }
-    tags
-}
-
 /// Owns the outbound registry and group-selection logic.
 pub struct OutboundManager {
     pub outbounds: HashMap<String, Arc<dyn Outbound>>,
@@ -607,49 +583,58 @@ impl OutboundManager {
             explicit: AtomicBool::new(false),
         });
         for g in &config.proxy_groups {
+            let mut members = g.proxies.clone();
+            if g.include_all || g.include_all_proxies {
+                members.extend(config.proxies.iter().map(|proxy| proxy.name.clone()));
+            }
             groups.insert(g.name.clone(), GroupState {
                 name: g.name.clone(),
                 kind: g.kind.clone(),
-                members: g.proxies.clone(),
+                members,
                 url: g.url.clone(),
                 cursor: AtomicUsize::new(0),
                 explicit: AtomicBool::new(false),
             });
         }
 
-        // Some subscriptions express url-test/fallback membership through a
-        // construct our minimal schema doesn't expand, leaving the group's
-        // member list empty. An empty group resolves to DIRECT and silently
-        // bypasses the proxy. Fill it from the proxy nodes: prefer nodes whose
-        // name matches the group's region, otherwise use all real nodes.
-        let node_names: Vec<String> = config.proxies.iter()
-            .filter(|p| !matches!(p.name.as_str(), "DIRECT" | "REJECT"))
-            .map(|p| p.name.clone())
-            .collect();
-        let empty_groups: Vec<(String, String)> = groups.iter()
-            .filter(|(_, g)| matches!(g.kind.as_str(), "url-test" | "fallback") && g.members.is_empty())
-            .map(|(name, g)| (name.clone(), g.name.clone()))
-            .collect();
-        for (key, name) in empty_groups {
-            let tags = region_tags(&name);
-            let mut members: Vec<String> = if tags.is_empty() {
-                node_names.clone()
-            } else {
-                node_names.iter()
-                    .filter(|n| tags.iter().any(|t| n.contains(t)))
-                    .cloned()
-                    .collect()
-            };
-            if members.is_empty() {
-                members = node_names.clone();
-            }
-            tracing::info!("filled empty group {} with {} nodes", name, members.len());
-            if let Some(g) = groups.get_mut(&key) {
-                g.members = members;
-            }
-        }
+        let mut manager = Self { outbounds, groups };
+        manager.filter_group_members(config);
+        manager
+    }
 
-        Self { outbounds, groups }
+    pub fn filter_group_members(&mut self, config: &Config) {
+        for group in &config.proxy_groups {
+            let compile = |pattern: Option<&str>| -> Result<Option<regex::Regex>, regex::Error> {
+                pattern.filter(|p| !p.is_empty()).map(regex::Regex::new).transpose()
+            };
+            let filters = compile(group.filter.as_deref())
+                .and_then(|include| compile(group.exclude_filter.as_deref()).map(|exclude| (include, exclude)));
+            let Some(state) = self.groups.get_mut(&group.name) else { continue };
+            let (include, exclude) = match filters {
+                Ok(filters) => filters,
+                Err(error) => {
+                    crate::jni::emit_log_event(&format!("[rust-core] group {}: invalid filter: {}", group.name, error));
+                    state.members.clear();
+                    continue;
+                }
+            };
+            let excluded_types: Vec<&str> = group.exclude_type.as_deref().unwrap_or("")
+                .split('|').filter(|kind| !kind.is_empty()).collect();
+            let mut seen = std::collections::HashSet::new();
+            state.members.retain(|name| {
+                seen.insert(name.clone())
+                    && include.as_ref().is_none_or(|pattern| pattern.is_match(name))
+                    && exclude.as_ref().is_none_or(|pattern| !pattern.is_match(name))
+                    && self.outbounds.get(name).is_none_or(|outbound| {
+                        let kind = match outbound.kind() {
+                            "Shadowsocks" => "ss",
+                            "ShadowsocksR" => "ssr",
+                            kind => kind,
+                        };
+                        !excluded_types.iter().any(|excluded| excluded.eq_ignore_ascii_case(kind))
+                    })
+            });
+        }
     }
 
     /// Resolve a rule target down to a concrete outbound name. A group's
@@ -679,11 +664,11 @@ impl OutboundManager {
                     std::sync::atomic::AtomicUsize::new(0);
                 if RESOLVE_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
                     crate::jni::emit_log_event(&format!(
-                        "[rust-core] resolve step {}: group {} kind={} members={:?} NO VALID CANDIDATES -> DIRECT",
+                        "[rust-core] resolve step {}: group {} kind={} members={:?} NO VALID CANDIDATES -> REJECT",
                         step, current, group.kind, group.members
                     ));
                 }
-                return "DIRECT".to_string();
+                return "REJECT".to_string();
             }
 
             // Never block the data path on health probes: probing every
@@ -774,6 +759,45 @@ fn _ip_marker(_: Option<IpAddr>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn group_filters_do_not_fall_back_to_all_nodes_or_direct() {
+        let config = Config::from_str(r#"
+proxies:
+  - {name: 香港01, type: direct}
+  - {name: 台湾01, type: socks5, server: 127.0.0.1, port: 1080}
+  - {name: 台湾过期, type: socks5, server: 127.0.0.1, port: 1080}
+proxy-groups:
+  - {name: 台湾, type: url-test, include-all: true, filter: 台湾, exclude-filter: 过期}
+  - {name: 韩国, type: url-test, include-all: true, filter: 韩国}
+  - {name: 不含直连, type: select, include-all-proxies: true, exclude-type: DIRECT}
+  - {name: 空分组, type: fallback, proxies: []}
+  - {name: 显式, type: select, proxies: [DIRECT, 台湾01, 台湾01]}
+  - {name: 无效筛选, type: select, include-all: true, filter: '['}
+"#).unwrap();
+        let manager = OutboundManager::new(&config);
+        assert_eq!(manager.groups["台湾"].members, vec!["台湾01"]);
+        assert_eq!(manager.groups["不含直连"].members, vec!["台湾01", "台湾过期"]);
+        assert_eq!(manager.groups["显式"].members, vec!["DIRECT", "台湾01"]);
+        assert_eq!(manager.resolve("韩国").await, "REJECT");
+        assert_eq!(manager.resolve("空分组").await, "REJECT");
+        assert_eq!(manager.resolve("无效筛选").await, "REJECT");
+    }
+
+    #[test]
+    fn provider_members_are_filtered_after_registration() {
+        let config = Config::from_str(r#"
+proxy-groups:
+  - {name: 台湾, type: url-test, use: [机场], filter: 台湾, exclude-type: DIRECT}
+"#).unwrap();
+        let mut manager = OutboundManager::new(&config);
+        manager.register("香港01".into(), Arc::new(DirectOutbound::new("香港01")));
+        manager.register("台湾直连".into(), Arc::new(DirectOutbound::new("台湾直连")));
+        manager.register("台湾01".into(), Arc::new(UnimplementedOutbound { name: "台湾01".into(), kind: "socks5".into() }));
+        manager.set_group_members("台湾", vec!["香港01".into(), "台湾直连".into(), "台湾01".into()]);
+        manager.filter_group_members(&config);
+        assert_eq!(manager.groups["台湾"].members, vec!["台湾01"]);
+    }
 
     #[test]
     fn unsupported_transports_are_named() {

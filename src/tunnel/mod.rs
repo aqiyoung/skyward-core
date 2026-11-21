@@ -24,17 +24,42 @@ use crate::rules::RuleSet;
 
 use connection::{ConnectionTracker, Network};
 
+/// The matched rule is distinct from its outbound policy/group.
+#[derive(Debug, Clone)]
+pub struct RouteDecision {
+    pub target: String,
+    pub rule: String,
+    pub payload: String,
+}
+
+impl RouteDecision {
+    pub fn chains(&self, final_name: &str) -> Vec<String> {
+        if final_name == self.target {
+            vec![final_name.to_string()]
+        } else {
+            vec![final_name.to_string(), self.target.clone()]
+        }
+    }
+}
+
 /// AsyncWrite wrapper that feeds bytes moved through it into the traffic counters.
 struct CountingWriter<W> {
     inner: W,
     counter: Arc<AtomicU64>,
     traffic: SharedTraffic,
     upload: bool,
+    proxied: bool,
 }
 
 impl<W> CountingWriter<W> {
-    fn new(inner: W, counter: Arc<AtomicU64>, traffic: SharedTraffic, upload: bool) -> Self {
-        Self { inner, counter, traffic, upload }
+    fn new(
+        inner: W,
+        counter: Arc<AtomicU64>,
+        traffic: SharedTraffic,
+        upload: bool,
+        proxied: bool,
+    ) -> Self {
+        Self { inner, counter, traffic, upload, proxied }
     }
 }
 
@@ -46,8 +71,14 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for CountingWriter<W> {
                 this.counter.fetch_add(n as u64, Ordering::Relaxed);
                 if this.upload {
                     this.traffic.add_upload(n as u64);
+                    if this.proxied {
+                        this.traffic.add_proxy_upload(n as u64);
+                    }
                 } else {
                     this.traffic.add_download(n as u64);
+                    if this.proxied {
+                        this.traffic.add_proxy_download(n as u64);
+                    }
                 }
                 Poll::Ready(Ok(n))
             }
@@ -124,17 +155,29 @@ impl Engine {
             outbounds.register(name.clone(), outbound.clone());
         }
         for g in &config.proxy_groups {
-            if !g.use_providers.is_empty() {
+            if !g.use_providers.is_empty() || g.include_all || g.include_all_providers {
                 let mut members = g.proxies.clone();
-                members.extend(proxy_providers.member_names(&g.use_providers));
+                if g.include_all || g.include_all_proxies {
+                    members.extend(config.proxies.iter().map(|proxy| proxy.name.clone()));
+                }
+                if g.include_all || g.include_all_providers {
+                    let mut names: Vec<_> = provider_nodes.iter().map(|(name, _)| name.clone()).collect();
+                    names.sort();
+                    members.extend(names);
+                } else {
+                    members.extend(proxy_providers.member_names(&g.use_providers));
+                }
                 outbounds.set_group_members(&g.name, members);
             }
         }
+        outbounds.filter_group_members(&config);
         if let Some(global) = outbounds.groups.get_mut("GLOBAL") {
             global.members.extend(provider_nodes.into_iter().map(|(name, _)| name));
         }
 
         let mode = RwLock::new(config.mode.clone());
+        log(format!("engine: TCP sniffer enable={} parse-pure-ip={} override-destination={} protocols={:?}; QUIC sniffing unsupported",
+            config.sniffer.enable, config.sniffer.parse_pure_ip, config.sniffer.override_destination, config.sniffer.sniff));
         log(format!("engine: loading geo ({:?})", t0.elapsed()));
         // mihomo keeps GeoX files in the core home dir, which may differ from
         // the config file's parent. Search both so GEOIP/GEOSITE rules work.
@@ -147,6 +190,7 @@ impl Engine {
         log(format!("engine: geo done ({:?}) geoip={} geosite={} ({:?})",
             t0.elapsed(), geo.geoip.len(), geo.geosite.len(), t0.elapsed()));
         let providers = Arc::new(ProviderRegistry::load(&config, data_dir).await);
+        providers.spawn_refresh(config.rule_providers.clone(), data_dir.to_path_buf());
         log(format!("engine: rule providers done ({:?})", t0.elapsed()));
         let connections = Arc::new(ConnectionTracker::new());
         Self {
@@ -173,17 +217,26 @@ impl Engine {
 
     /// Choose a rule target based on the active mode and the rule set.
     pub async fn decide(&self, target: &TargetAddr) -> String {
+        self.decide_route(target, None).await.target
+    }
+
+    pub async fn decide_route(&self, target: &TargetAddr, original_ip: Option<std::net::IpAddr>) -> RouteDecision {
         let mode = self.mode.read().await.clone();
         match mode.as_str() {
-            "direct" => "DIRECT".to_string(),
-            "global" => "GLOBAL".to_string(),
+            "direct" => RouteDecision { target: "DIRECT".into(), rule: String::new(), payload: String::new() },
+            "global" => RouteDecision { target: "GLOBAL".into(), rule: String::new(), payload: String::new() },
             _ => {
-                let resolved = match target {
-                    TargetAddr::Domain(h, _) => self.resolver.resolve_first(h).await.ok(),
-                    TargetAddr::Ip(ip, _) => Some(*ip),
+                let resolved = match (original_ip, target) {
+                    (Some(ip), _) => Some(ip),
+                    (_, TargetAddr::Domain(h, _)) => self.resolver.resolve_first(h).await.ok(),
+                    (_, TargetAddr::Ip(ip, _)) => Some(*ip),
                 };
                 match self.rules.find(target, resolved, Some(&self.geo), Some(&self.providers)) {
-                    Some(rule) => rule.target.clone(),
+                    Some(rule) => RouteDecision {
+                        target: rule.target.clone(),
+                        rule: rule.type_name().to_string(),
+                        payload: rule.value.clone(),
+                    },
                     None => {
                         // No rule matched (e.g. GEOIP/GEOSITE with empty geo data,
                         // or RULE-SET with no provider). Say why instead of
@@ -196,7 +249,7 @@ impl Engine {
                                 target.address(), self.geo.geoip.len(), self.geo.geosite.len(), self.providers.len()
                             ));
                         }
-                        "DIRECT".to_string()
+                        RouteDecision { target: "DIRECT".into(), rule: String::new(), payload: String::new() }
                     }
                 }
             }
@@ -240,20 +293,20 @@ impl Engine {
     pub async fn dial_udp(
         &self,
         target: &TargetAddr,
-    ) -> io::Result<(Box<dyn crate::adapter::PacketConn>, String, String)> {
-        let rule_target = self.decide(target).await;
-        let final_name = self.outbounds.resolve(&rule_target).await;
+    ) -> io::Result<(Box<dyn crate::adapter::PacketConn>, RouteDecision, String)> {
+        let route = self.decide_route(target, None).await;
+        let final_name = self.outbounds.resolve(&route.target).await;
         dial_diag(format!(
             "dial_udp {} -> rule={} outbound={}",
             target.address(),
-            rule_target,
+            route.target,
             final_name
         ));
         let outbound = self.outbounds.outbound(&final_name).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("unknown outbound '{}'", final_name))
         })?;
         match outbound.connect_udp(target).await {
-            Ok(conn) => Ok((conn, rule_target, final_name)),
+            Ok(conn) => Ok((conn, route, final_name)),
             Err(e) => {
                 dial_diag(format!(
                     "dial_udp {} via {} FAILED: {}",
@@ -278,7 +331,8 @@ impl Engine {
     /// Drive a single inbound connection to completion. `prefix` carries bytes
     /// already consumed from the inbound during handshakes (e.g. an HTTP head).
     pub async fn handle(&self, target: TargetAddr, inbound: TcpStream, prefix: &[u8]) -> io::Result<()> {
-        let rule_target = self.decide(&target).await;
+        let route = self.decide_route(&target, None).await;
+        let rule_target = route.target.clone();
         let final_name = self.outbounds.resolve(&rule_target).await;
 
         tracing::info!(
@@ -293,7 +347,7 @@ impl Engine {
             .ok()
             .map(|addr| (addr.ip().to_string(), addr.port()));
         let (connection, up_counter, down_counter) = self.connections
-            .add(&target, &rule_target, "", vec![final_name.clone(), rule_target.clone()], Network::Tcp, source)
+            .add(&target, &route.rule, &route.payload, route.chains(&final_name), Network::Tcp, source, None)
             .await;
 
         let outbound = self.outbounds.outbound(&final_name);
@@ -315,8 +369,9 @@ impl Engine {
                         }
                         let (mut rin, mut win) = tokio::io::split(inbound);
                         let (mut rout, mut wout) = tokio::io::split(remote);
-                        let mut up = CountingWriter::new(&mut wout, up_counter, self.traffic.clone(), true);
-                        let mut down = CountingWriter::new(&mut win, down_counter, self.traffic.clone(), false);
+                        let proxied = crate::common::is_proxied_outbound(&final_name);
+                        let mut up = CountingWriter::new(&mut wout, up_counter, self.traffic.clone(), true, proxied);
+                        let mut down = CountingWriter::new(&mut win, down_counter, self.traffic.clone(), false, proxied);
                         let result = tokio::select! {
                             r = tokio::io::copy(&mut rin, &mut up) => r.map(|_| ()),
                             r = tokio::io::copy(&mut rout, &mut down) => r.map(|_| ()),

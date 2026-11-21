@@ -16,6 +16,7 @@ use smoltcp::time::Instant;
 
 pub mod relay;
 pub mod runtime;
+mod sniff;
 pub mod stack;
 pub mod tcp;
 pub mod udp;

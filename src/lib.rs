@@ -1,6 +1,7 @@
 //! skyward-core (Rust) — a mihomo-compatible proxy kernel, rewritten incrementally.
 
 pub mod adapter;
+pub mod age;
 pub mod alloc;
 pub mod common;
 pub mod config;

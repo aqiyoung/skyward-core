@@ -13,6 +13,8 @@
 use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use ipnet::IpNet;
+
 use super::provider::{domain_entry, Behavior, Entry};
 
 pub fn parse_mrs(raw: &[u8], behavior: Behavior) -> io::Result<Vec<Entry>> {
@@ -55,6 +57,85 @@ pub fn parse_mrs(raw: &[u8], behavior: Behavior) -> io::Result<Vec<Entry>> {
         Behavior::IpCidr => parse_ipcidr(&mut r),
         Behavior::Classical => Err(invalid("mrs classical behavior unsupported".into())),
     }
+}
+
+/// Text form of an mrs file, mirroring mihomo's `DumpMrs`: an exact entry and
+/// a suffix-only entry for the same domain collapse into one `+.` rule, and
+/// ipcidr ranges expand back into prefixes. Classical mrs is unsupported.
+pub fn dump_mrs(raw: &[u8], behavior: Behavior) -> io::Result<String> {
+    let entries = parse_mrs(raw, behavior)?;
+    let mut lines: Vec<String> = Vec::new();
+    match behavior {
+        Behavior::Domain => {
+            let mut bases: std::collections::BTreeMap<String, bool> =
+                std::collections::BTreeMap::new();
+            for entry in entries {
+                if let Entry::Domain { value, mode } = entry {
+                    *bases.entry(value).or_default() |=
+                        matches!(mode, super::provider::DomainMode::SubOnly);
+                }
+            }
+            for (base, suffix_only) in bases {
+                lines.push(if suffix_only { format!("+.{base}") } else { base });
+            }
+        }
+        Behavior::IpCidr => {
+            for entry in entries {
+                if let Entry::IpRange(from, to) = entry {
+                    for prefix in range_to_prefixes(from, to) {
+                        lines.push(prefix.to_string());
+                    }
+                }
+            }
+        }
+        Behavior::Classical => {
+            return Err(invalid("mrs classical behavior unsupported".into()))
+        }
+    }
+    lines.sort();
+    let mut out = lines.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// All CIDR prefixes covering exactly `from..=to`.
+fn range_to_prefixes(from: IpAddr, to: IpAddr) -> Vec<IpNet> {
+    let bits = match (from, to) {
+        (IpAddr::V4(_), IpAddr::V4(_)) => 32u8,
+        (IpAddr::V6(_), IpAddr::V6(_)) => 128u8,
+        _ => return Vec::new(),
+    };
+    let (start, end) = match (from, to) {
+        (IpAddr::V4(a), IpAddr::V4(b)) => {
+            (u128::from(u32::from(a)), u128::from(u32::from(b)))
+        }
+        (IpAddr::V6(a), IpAddr::V6(b)) => (u128::from(a), u128::from(b)),
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    let mut cursor = start;
+    while cursor <= end {
+        let aligned = if cursor == 0 {
+            bits as u32
+        } else {
+            cursor.trailing_zeros().min(bits as u32)
+        };
+        let remaining = (end - cursor + 1) as u128;
+        let room = 127 - remaining.leading_zeros();
+        let size = aligned.min(room);
+        let len = bits - size as u8;
+        let addr = match bits {
+            32 => IpAddr::V4(Ipv4Addr::from(cursor as u32)),
+            _ => IpAddr::V6(Ipv6Addr::from(cursor)),
+        };
+        if let Ok(net) = IpNet::new(addr, len) {
+            out.push(net);
+        }
+        cursor += 1u128 << size;
+    }
+    out
 }
 
 fn parse_ipcidr(r: &mut Reader) -> io::Result<Vec<Entry>> {
