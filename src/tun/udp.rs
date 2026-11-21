@@ -339,6 +339,49 @@ mod tests {
         assert_eq!(packet[41], 4); // port unreachable
     }
 
+    #[tokio::test]
+    async fn ipv6_udp_session_relays_and_replies_over_v6() {
+        let _guard = crate::runtime_state::TEST_LOCK.lock().unwrap();
+        let config = crate::config::Config::from_str("mode: rule\nrules:\n  - MATCH,DIRECT").unwrap();
+        let engine = Arc::new(
+            Engine::new(config, Arc::new(crate::common::TrafficStats::default()), std::path::Path::new(".")).await,
+        );
+        crate::runtime_state::set_engine(engine.clone()).await;
+        let io = Arc::new(Mutex::new(std::io::Cursor::new(Vec::new())));
+        let mut udp = UdpManager::new(engine.clone(), io.clone());
+
+        // Echo server on the IPv6 loopback.
+        let server = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let _ = server.send_to(&buf[..n], peer).await;
+        });
+
+        let client: std::net::Ipv6Addr = "fd00::2".parse().unwrap();
+        udp.handle_packet(client.into(), 53210, server_addr.ip(), server_addr.port() as u16, b"ping");
+
+        let reply = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let bytes = io.lock().unwrap().get_ref().clone();
+                if !bytes.is_empty() {
+                    return bytes;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the v6 UDP session must write a reply");
+
+        let ip = super::super::tcp::parse_ipv6(&reply).expect("a valid v6 packet");
+        assert_eq!(ip.src, server_addr.ip());
+        assert_eq!(ip.dst, client);
+        assert_eq!(ip.proto, 17);
+        let payload = &reply[ip.ihl + 8..];
+        assert_eq!(payload, b"ping");
+    }
+
     #[test]
     fn refuse_packet_is_icmp_port_unreachable() {
         let key = SessionKey {
