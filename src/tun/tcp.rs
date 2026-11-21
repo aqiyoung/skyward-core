@@ -980,6 +980,9 @@ mod tests {
         payload: Vec<u8>, enabled: bool, extra: &str, rules: &str,
         expected_connect: &str, expected_host: &str, expected_rule: &str, expected_payload: &str,
     ) {
+        // The flow task reads the process-wide active engine, which other
+        // tests mutate: serialize and pin it to this flow's engine.
+        let _engine_guard = crate::runtime_state::TEST_LOCK.lock().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let expected_bytes = payload.clone();
@@ -996,21 +999,21 @@ mod tests {
                 match stream.read(&mut byte).await {
                     Ok(0) => break,
                     Ok(_) => {
-                        if !in_body && connect_head.ends_with(b"\r\n\r\n") {
-                            if let Some(tx) = observed_tx.take() {
-                                let _ = tx.send(String::from_utf8_lossy(&connect_head).into_owned());
+                        if !in_body {
+                            connect_head.push(byte[0]);
+                            if connect_head.ends_with(b"\r\n\r\n") {
+                                if let Some(tx) = observed_tx.take() {
+                                    let _ = tx.send(String::from_utf8_lossy(&connect_head).into_owned());
+                                }
+                                let _ = stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await;
+                                in_body = true;
                             }
-                            let _ = stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await;
-                            in_body = true;
-                        } else if in_body {
+                        } else {
                             actual.push(byte[0]);
                             if actual.len() == expected_bytes.len() {
                                 assert_eq!(actual, expected_bytes, "sniffing must preserve every relayed byte");
                                 break;
                             }
-                        }
-                        if !in_body {
-                            connect_head.push(byte[0]);
                         }
                     }
                     Err(e) => panic!("observer stream failed: {e}"),
@@ -1040,6 +1043,7 @@ rules:
 {rules}
 "#)).unwrap();
         let engine = Arc::new(Engine::new(config, Arc::new(TrafficStats::default()), std::path::Path::new(".")).await);
+        crate::runtime_state::set_engine(engine.clone()).await;
         let io = Arc::new(Mutex::new(TestIo { out: Vec::new() }));
         let mut tcp = TcpManager::new(engine.clone(), io.clone());
         let client = Ipv4Addr::new(10, 0, 0, 2);
@@ -1065,9 +1069,15 @@ rules:
             head = format!("CONNECT {} HTTP/1.1\r\n", entries.unwrap().metadata.destination_ip);
         }
         assert!(head.to_ascii_lowercase().starts_with(&format!("connect {expected_connect} http/1.1\r\n")), "{head:?}");
-        let entry = engine.connections.snapshot().await
-            .into_iter().next()
-            .expect("connection should exist");
+        let entry = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let entries = engine.connections.snapshot().await;
+                if let Some(entry) = entries.into_iter().next() {
+                    return entry;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("connection should exist");
         assert_eq!(entry.metadata.host, expected_host);
         assert_eq!(entry.metadata.destination_ip, "203.0.113.42");
         assert_eq!(entry.metadata.source_ip, "10.0.0.2");
@@ -1170,8 +1180,10 @@ rules:
 
     #[tokio::test]
     async fn tun_shutdown_cancels_pending_hostname_inspection() {
+        let _engine_guard = crate::runtime_state::TEST_LOCK.lock().unwrap();
         let config = Config::from_str("sniffer:\n  enable: true\n  sniff:\n    TLS:\n      ports: [443]\nrules: ['MATCH,REJECT']").unwrap();
         let engine = Arc::new(Engine::new(config, Arc::new(TrafficStats::default()), std::path::Path::new(".")).await);
+        crate::runtime_state::set_engine(engine.clone()).await;
         let io = Arc::new(Mutex::new(TestIo { out: Vec::new() }));
         let mut tcp = TcpManager::new(engine.clone(), io);
         tcp.handle_packet(&client_packet(Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(203, 0, 113, 42), 40000, 443, 1000, 0, SYN, &[]));
@@ -1183,8 +1195,10 @@ rules:
     #[tokio::test]
     async fn tun_reset_and_engine_close_cancel_hostname_wait() {
         for reset in [true, false] {
+            let _engine_guard = crate::runtime_state::TEST_LOCK.lock().unwrap();
             let config = Config::from_str("sniffer:\n  enable: true\n  sniff:\n    TLS:\n      ports: [443]\nrules: ['MATCH,REJECT']").unwrap();
             let engine = Arc::new(Engine::new(config, Arc::new(TrafficStats::default()), std::path::Path::new(".")).await);
+            crate::runtime_state::set_engine(engine.clone()).await;
             let io = Arc::new(Mutex::new(TestIo { out: Vec::new() }));
             let mut tcp = TcpManager::new(engine.clone(), io);
             let key = FlowKey { client_ip: Ipv4Addr::new(10, 0, 0, 2), client_port: 40000,
