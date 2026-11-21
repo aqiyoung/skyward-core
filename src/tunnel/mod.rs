@@ -292,12 +292,12 @@ impl Engine {
             .peer_addr()
             .ok()
             .map(|addr| (addr.ip().to_string(), addr.port()));
-        let (id, up_counter, down_counter) = self.connections
+        let (connection, up_counter, down_counter) = self.connections
             .add(&target, &rule_target, "", vec![final_name.clone(), rule_target.clone()], Network::Tcp, source)
             .await;
 
         let outbound = self.outbounds.outbound(&final_name);
-        let result = match outbound {
+        let relay = async { match outbound {
             Some(outbound) => {
                 match outbound.connect(&target).await {
                     Err(e) => {
@@ -328,9 +328,11 @@ impl Engine {
                 }
             }
             None => Err(io::Error::new(io::ErrorKind::NotFound, format!("unknown outbound '{}'", final_name))),
-        };
-
-        self.connections.remove(&id).await;
-        result
+        }};
+        tokio::select! {
+            biased;
+            _ = connection.closed() => Ok(()),
+            result = relay => result,
+        }
     }
 }

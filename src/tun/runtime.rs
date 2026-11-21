@@ -30,7 +30,7 @@ pub async fn run<T>(
 {
     let io = Arc::new(Mutex::new(device.io));
     let mut tcp = TcpManager::new(engine.clone(), io.clone());
-    let udp = UdpManager::new(engine, io.clone());
+    let mut udp = UdpManager::new(engine, io.clone());
     tcp.set_mtu(config.options.mtu);
     let mut buf = vec![0u8; 65536];
 
@@ -61,11 +61,9 @@ pub async fn run<T>(
         if drained > 0 {
             // Busy: loop again immediately, but still honour cancellation.
             tokio::select! {
-                _ = std::future::ready(()) => {}
-                _ = cancel.notified() => {
-                    tcp.shutdown();
-                    return;
-                }
+                biased;
+                _ = cancel.notified() => break,
+                _ = tokio::task::yield_now() => {}
             }
             continue;
         }
@@ -73,12 +71,10 @@ pub async fn run<T>(
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(10)) => {}
             _ = wake.notified() => {}
-            _ = cancel.notified() => {
-                tcp.shutdown();
-                return;
-            }
+            _ = cancel.notified() => break,
         }
     }
+    tokio::join!(tcp.shutdown(), udp.shutdown());
 }
 
 /// Rate-limited diagnostics for the DNS path.

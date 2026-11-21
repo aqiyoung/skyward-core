@@ -2,11 +2,11 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use tokio::sync::RwLock;
+use tokio::sync::Notify;
 
 use crate::common::TargetAddr;
 
@@ -102,6 +102,25 @@ struct Counters {
 struct Entry {
     info: ConnectionInfo,
     counters: Counters,
+    cancel: Arc<Notify>,
+}
+
+pub struct ConnectionLease {
+    id: String,
+    tracker: Arc<ConnectionTracker>,
+    cancel: Arc<Notify>,
+}
+
+impl ConnectionLease {
+    pub async fn closed(&self) {
+        self.cancel.notified().await;
+    }
+}
+
+impl Drop for ConnectionLease {
+    fn drop(&mut self) {
+        self.tracker.entries.write().unwrap().remove(&self.id);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,8 +131,7 @@ pub enum Network {
 
 #[derive(Default)]
 pub struct ConnectionTracker {
-    next_id: AtomicU64,
-    entries: RwLock<HashMap<u64, Entry>>,
+    entries: RwLock<HashMap<String, Entry>>,
     /// Last traffic totals reported to the App per connection id; the
     /// request-traffic watch diffs against this map.
     watch_reported: Mutex<HashMap<String, (u64, u64)>>,
@@ -139,8 +157,9 @@ impl ConnectionTracker {
         chain: Vec<String>,
         network: Network,
         source: Option<(String, u16)>,
-    ) -> (String, Arc<AtomicU64>, Arc<AtomicU64>) {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+    ) -> (ConnectionLease, Arc<AtomicU64>, Arc<AtomicU64>) {
+        let id = format!("{:032x}", rand::random::<u128>());
+        let cancel = Arc::new(Notify::new());
         let upload = Arc::new(AtomicU64::new(0));
         let download = Arc::new(AtomicU64::new(0));
         let (host, destination_ip) = match target {
@@ -173,9 +192,10 @@ impl ConnectionTracker {
             download: 0,
             start: iso8601(now_millis()),
         };
-        self.entries.write().await.insert(id, Entry {
+        self.entries.write().unwrap().insert(id.clone(), Entry {
             info: info.clone(),
             counters: Counters { upload: upload.clone(), download: download.clone() },
+            cancel: cancel.clone(),
         });
         // The App's request list is event-fed (the Go core announces each
         // connection as it opens); without this event the list stays empty.
@@ -185,7 +205,7 @@ impl ConnectionTracker {
             let tracker = self.clone();
             tokio::spawn(async move { tracker.run_traffic_watch().await });
         }
-        (id.to_string(), upload, download)
+        (ConnectionLease { id, tracker: self.clone(), cancel }, upload, download)
     }
 
     /// One-second traffic reports for the App's request list, mirroring
@@ -236,14 +256,8 @@ impl ConnectionTracker {
         }
     }
 
-    pub async fn remove(&self, id: &str) {
-        if let Ok(numeric) = id.parse::<u64>() {
-            self.entries.write().await.remove(&numeric);
-        }
-    }
-
     pub async fn snapshot(&self) -> Vec<ConnectionInfo> {
-        let entries = self.entries.read().await;
+        let entries = self.entries.read().unwrap();
         let mut items: Vec<ConnectionInfo> = entries.values().map(|entry| {
             let mut info = entry.info.clone();
             info.upload = entry.counters.upload.load(Ordering::Relaxed);
@@ -268,19 +282,26 @@ impl ConnectionTracker {
     }
 
     pub async fn count(&self) -> usize {
-        self.entries.read().await.len()
+        self.entries.read().unwrap().len()
     }
 
     /// Close a connection by id. Returns false when it does not exist.
     pub async fn close(&self, id: &str) -> bool {
-        let Ok(numeric) = id.parse::<u64>() else { return false };
-        self.entries.write().await.remove(&numeric).is_some()
+        let entry = self.entries.write().unwrap().remove(id);
+        if let Some(entry) = entry {
+            entry.cancel.notify_one();
+            true
+        } else {
+            false
+        }
     }
 
     pub async fn close_all(&self) -> usize {
-        let mut entries = self.entries.write().await;
+        let mut entries = self.entries.write().unwrap();
         let count = entries.len();
-        entries.clear();
+        for (_, entry) in entries.drain() {
+            entry.cancel.notify_one();
+        }
         count
     }
 }
@@ -307,7 +328,8 @@ mod tests {
         assert!(wire["metadata"].is_object(), "metadata must decode as a map");
         assert_eq!(wire["rulePayload"], "");
         assert_eq!(wire["chains"][0], "DIRECT");
-        tracker.remove(&id).await;
+        assert!(tracker.close(&id.id).await);
+        tokio::time::timeout(Duration::from_secs(1), id.closed()).await.unwrap();
         assert!(tracker.snapshot().await.is_empty());
     }
 
@@ -320,7 +342,7 @@ mod tests {
         let event: serde_json::Value =
             serde_json::from_str(&request_event_json(&snapshot[0])).unwrap();
         assert_eq!(event["type"], "request");
-        assert_eq!(event["data"]["id"], id);
+        assert_eq!(event["data"]["id"], id.id);
         assert_eq!(event["data"]["metadata"]["host"], "example.com");
         assert_eq!(event["data"]["rule"], "MATCH");
     }
