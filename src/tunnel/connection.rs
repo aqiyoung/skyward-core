@@ -203,8 +203,11 @@ impl ConnectionTracker {
         let network_str = match network { Network::Tcp => "tcp", Network::Udp => "udp" };
         let process_path = source
             .as_ref()
-            .and_then(|(s, p)| s.parse::<std::net::IpAddr>().ok())
-            .and_then(|ip| crate::common::find_process_name(network_str, ip, *p))
+            .and_then(|(s, p)| {
+                s.parse::<std::net::IpAddr>().ok().and_then(|ip| {
+                    crate::common::find_process_name(network_str, ip, *p)
+                })
+            })
             .unwrap_or_default();
         let (source_ip, source_port) = match source {
             Some((ip, port)) => (ip, port.to_string()),
@@ -220,7 +223,7 @@ impl ConnectionTracker {
                 destination_ip,
                 destination_port: target.port().to_string(),
                 host,
-                process_path: String::new(),
+                process_path,
                 remote_destination: String::new(),
                 source_geo_ip: Vec::new(),
                 destination_geo_ip: Vec::new(),
