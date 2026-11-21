@@ -121,6 +121,7 @@ pub fn invoke(data: &[u8]) -> Vec<u8> {
         "resetTraffic" => handle_reset_traffic(&call),
         "decryptConfig" => handle_decrypt_config(&call),
         "dumpRuleSet" => handle_dump_rule_set(&call),
+        "compileRuleSet" => handle_compile_rule_set(&call),
         "crash" => handle_crash(&call),
         "encodeShareLinks" => handle_encode_share_links(&call),
         "decodeShareLinks" => handle_decode_share_links(&call),
@@ -1009,45 +1010,146 @@ fn handle_decrypt_config(call: &MethodCall) -> Vec<u8> {
     }
 }
 
-/// Text view of a rule-set file for the provider viewer: yaml/text sets are
-/// returned as-is; an mrs set is decoded and rendered one rule per line.
+/// Text view of a rule-set file, mirroring the Go core's `handleDumpRuleSet`:
+/// an mrs set is dumped through DumpMrs (merged `+.` domains, expanded
+/// prefixes); anything else is returned as-is.
 fn handle_dump_rule_set(call: &MethodCall) -> Vec<u8> {
     let path = call.arguments.as_str().unwrap_or("");
     let raw = match std::fs::read(path) {
         Ok(raw) => raw,
         Err(e) => return err(&call.id, "io_error", format!("read {}: {e}", path)),
     };
-    if !raw.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-        return match String::from_utf8(raw) {
-            Ok(text) => ok(&call.id, Value::String(text)),
-            Err(_) => err(
-                &call.id,
-                "decode_error",
-                "rule-set file is neither text nor an mrs set",
-            ),
-        };
+    if raw.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        use crate::rules::provider::Behavior;
+        let mut errors = Vec::new();
+        for behavior in [Behavior::Domain, Behavior::IpCidr] {
+            match crate::rules::mrs::dump_mrs(&raw, behavior) {
+                Ok(text) => return ok(&call.id, Value::String(text)),
+                Err(e) => errors.push(e.to_string()),
+            }
+        }
+        return err(&call.id, "rule_set_invalid", errors.join("; "));
     }
-    use crate::rules::provider::{Behavior, DomainMode, Entry};
-    for behavior in [Behavior::Domain, Behavior::IpCidr, Behavior::Classical] {
-        let Ok(entries) = crate::rules::mrs::parse_mrs(&raw, behavior) else {
-            continue;
-        };
-        let lines: Vec<String> = entries
-            .iter()
-            .map(|entry| match entry {
-                Entry::Domain { value, mode } => match mode {
-                    DomainMode::Exact => value.clone(),
-                    DomainMode::Suffix => format!("+.{value}"),
-                    DomainMode::SubOnly => format!(".{value}"),
-                },
-                Entry::Cidr(net) => net.to_string(),
-                Entry::IpRange(start, end) => format!("{start}-{end}"),
-                Entry::Classical(rule) => rule.raw.clone(),
-            })
-            .collect();
-        return ok(&call.id, Value::String(lines.join("\n")));
+    match String::from_utf8(raw) {
+        Ok(text) => ok(&call.id, Value::String(text)),
+        Err(_) => err(
+            &call.id,
+            "decode_error",
+            "rule-set file is neither text nor an mrs set",
+        ),
     }
-    err(&call.id, "decode_error", "unreadable mrs rule-set")
+}
+
+/// `compileRuleSet`: compile the staged (or downloaded) source beside
+/// `home/providers/rules/<name>` into `<name>.mrs`, and report what it became.
+#[derive(Deserialize)]
+struct CompileRuleSetArgs {
+    name: String,
+    #[serde(default)]
+    url: String,
+}
+
+fn handle_compile_rule_set(call: &MethodCall) -> Vec<u8> {
+    let args: CompileRuleSetArgs = match serde_json::from_value(call.arguments.clone()) {
+        Ok(args) => args,
+        Err(e) => return err(&call.id, "invalid_arguments", e.to_string()),
+    };
+    if !IS_INIT.load(Ordering::Relaxed) {
+        return err(&call.id, "not_initialized", "core is not initialized");
+    }
+    // A name, never a path: the core may run with more privilege than the app.
+    let valid = !args.name.is_empty()
+        && !args.name.starts_with('.')
+        && args
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    if !valid {
+        return err(&call.id, "invalid_arguments", "invalid rule set name");
+    }
+    let Some(home) = HOME_DIR.get().filter(|s| !s.is_empty()).cloned() else {
+        return err(&call.id, "not_initialized", "core home directory is missing");
+    };
+
+    let future = compile_rule_set(PathBuf::from(home), args);
+    match block_on(future) {
+        Ok(Ok(value)) => ok(&call.id, value),
+        Ok(Err(e)) => err(&call.id, &e.code, e.message),
+        Err(e) => err(&call.id, "runtime_error", e),
+    }
+}
+
+async fn compile_rule_set(
+    home: PathBuf,
+    args: CompileRuleSetArgs,
+) -> Result<Value, MethodError> {
+    let dir = home.join("providers").join("rules");
+        let source = dir.join(&args.name);
+        let bytes = if !args.url.is_empty() {
+            let bytes =
+                crate::fetch::fetch_url_timeout(&args.url, std::time::Duration::from_secs(15))
+                    .await
+                    .map_err(|e| MethodError {
+                        code: "request_bad_response".into(),
+                        message: format!("download {}: {e}", args.url),
+                        details: None,
+                    })?;
+            write_rule_set_file(&source, &bytes).map_err(|e| MethodError {
+                code: "io_error".into(),
+                message: format!("write {}: {e}", source.display()),
+                details: None,
+            })?;
+            bytes
+        } else {
+            tokio::fs::read(&source).await.map_err(|e| MethodError {
+                code: "io_error".into(),
+                message: format!("read {}: {e}", source.display()),
+                details: None,
+            })?
+        };
+
+        let compiled = crate::rules::compile::compile(&bytes, args.url.is_empty())
+            .map_err(|e| MethodError {
+                code: match e {
+                    crate::rules::compile::CompileError::Empty => "rule_set_empty",
+                    crate::rules::compile::CompileError::Mixed => "rule_set_mixed",
+                    crate::rules::compile::CompileError::Invalid => "rule_set_invalid",
+                }
+                .into(),
+                message: "rule set cannot be compiled".into(),
+                details: None,
+            })?;
+
+        if let Some(mrs) = &compiled.mrs {
+            let target = dir.join(format!("{}.mrs", args.name));
+            write_rule_set_file(&target, mrs).map_err(|e| MethodError {
+                code: "io_error".into(),
+                message: format!("write {}: {e}", target.display()),
+                details: None,
+            })?;
+        }
+
+        let body = json!({
+            "behavior": compiled.behavior.as_str(),
+            "format": compiled.format,
+        });
+        Result::<Value, MethodError>::Ok(body)
+}
+
+/// Atomic-ish replace, so a planted link at the target is never followed.
+fn write_rule_set_file(path: &std::path::Path, buf: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!("{e}.tmp"))
+            .unwrap_or_else(|| "tmp".into()),
+    );
+    let _ = std::fs::remove_file(&temp);
+    std::fs::write(&temp, buf)?;
+    std::fs::rename(&temp, path)
 }
 
 fn handle_encode_share_links(call: &MethodCall) -> Vec<u8> {
@@ -1716,6 +1818,52 @@ mod tests {
         assert!(r["error"].is_null(), "{r}");
         assert_eq!(r["result"], "example.com\n");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn compile_rule_set_writes_a_loadable_mrs_beside_the_source() {
+        use crate::rules::provider::Behavior;
+        let dir = temp_data_dir().join("compile");
+        let rules = dir.join("providers").join("rules");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::write(rules.join("set"), "DOMAIN-SUFFIX,example.com\n").unwrap();
+
+        let out = block_on(compile_rule_set(
+            dir.clone(),
+            CompileRuleSetArgs { name: "set".into(), url: String::new() },
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(out["behavior"], "domain");
+        assert_eq!(out["format"], "text");
+
+        let mrs = std::fs::read(rules.join("set.mrs")).unwrap();
+        assert_eq!(
+            crate::rules::mrs::dump_mrs(&mrs, Behavior::Domain).unwrap(),
+            "+.example.com\n"
+        );
+        assert!(!crate::rules::mrs::parse_mrs(&mrs, Behavior::Domain)
+            .unwrap()
+            .is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn empty_staged_content_stays_classical_without_an_mrs() {
+        let dir = temp_data_dir().join("compile-empty");
+        let rules = dir.join("providers").join("rules");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::write(rules.join("set"), "").unwrap();
+        let out = block_on(compile_rule_set(
+            dir.clone(),
+            CompileRuleSetArgs { name: "set".into(), url: String::new() },
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(out["behavior"], "classical");
+        assert!(!rules.join("set.mrs").exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
