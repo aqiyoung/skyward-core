@@ -1480,9 +1480,10 @@ impl V6Profile {
     }
 
     fn salt_shuffle_prf(ns_salt: u64, domain: u32, index: u32) -> u32 {
-        let rdx = index as u64 * V6_COEF_B + V6_ADD_B;
+        // Go: uint64 arithmetic wraps; Rust panics on overflow in debug.
+        let rdx = (index as u64).wrapping_mul(V6_COEF_B).wrapping_add(V6_ADD_B);
         let rdi = ns_salt ^ V6_SALT_NS_XOR;
-        let rsi = domain as u64 * V6_COEF_A + V6_ADD_A;
+        let rsi = (domain as u64).wrapping_mul(V6_COEF_A).wrapping_add(V6_ADD_A);
         let y = v6_split_mix64(rdx ^ rdi ^ rsi);
         (y ^ (y >> 32)) as u32
     }
