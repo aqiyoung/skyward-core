@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -173,16 +174,16 @@ impl RuleProvider {
 
 #[derive(Debug, Default)]
 pub struct ProviderRegistry {
-    providers: HashMap<String, RuleProvider>,
+    providers: std::sync::RwLock<HashMap<String, RuleProvider>>,
 }
 
 impl ProviderRegistry {
     pub fn len(&self) -> usize {
-        self.providers.len()
+        self.providers.read().unwrap().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.providers.is_empty()
+        self.providers.read().unwrap().is_empty()
     }
 
     /// Build all providers. Network/file failures are logged and skipped so
@@ -199,7 +200,7 @@ impl ProviderRegistry {
             let def = def.clone();
             let data_dir = data_dir.to_path_buf();
             tasks.push(tokio::spawn(async move {
-                let provider = Self::build(&name, &def, &data_dir).await;
+                let provider = Self::build(&name, &def, &data_dir, true).await;
                 (name, provider)
             }));
         }
@@ -208,7 +209,7 @@ impl ProviderRegistry {
                 Ok((name, Ok(provider))) => {
                     tracing::info!("rule provider {} loaded ({} entries)", name, provider.len());
                     crate::jni::emit_log_event(&format!("[rust-core] rule provider {} loaded ({} entries)", name, provider.len()));
-                    registry.providers.insert(name, provider);
+                    registry.insert(provider);
                 }
                 Ok((name, Err(e))) => {
                     tracing::warn!("failed to load rule provider {}: {}", name, e);
@@ -221,7 +222,39 @@ impl ProviderRegistry {
         registry
     }
 
-    async fn build(name: &str, def: &RuleProviderDef, data_dir: &Path) -> io::Result<RuleProvider> {
+    /// Re-fetch and swap in every provider that declares an `interval`, so a
+    /// long-running kernel picks up remote rule-set updates without a reload.
+    /// A failed refresh keeps the previous entries in place.
+    pub fn spawn_refresh(self: &Arc<Self>, defs: HashMap<String, RuleProviderDef>, data_dir: PathBuf) {
+        for (name, def) in defs {
+            let Some(interval) = def.interval else { continue };
+            if def.kind != "http" && def.kind != "file" {
+                continue;
+            }
+            let registry = Arc::clone(self);
+            let data_dir = data_dir.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(interval));
+                interval.tick().await; // the first tick fires immediately; startup just loaded it
+                loop {
+                    interval.tick().await;
+                    match Self::build(&name, &def, &data_dir, false).await {
+                        Ok(provider) => {
+                            tracing::info!("rule provider {} refreshed ({} entries)", name, provider.len());
+                            crate::jni::emit_log_event(&format!("[rust-core] rule provider {} refreshed ({} entries)", name, provider.len()));
+                            registry.insert(provider);
+                        }
+                        Err(e) => {
+                            tracing::warn!("failed to refresh rule provider {}: {}", name, e);
+                            crate::jni::emit_log_event(&format!("[rust-core] rule provider {} refresh failed: {}", name, e));
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    async fn build(name: &str, def: &RuleProviderDef, data_dir: &Path, use_cache: bool) -> io::Result<RuleProvider> {
         let behavior = Behavior::parse(&def.behavior).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, format!("unknown provider behavior '{}'", def.behavior))
         })?;
@@ -234,10 +267,15 @@ impl ProviderRegistry {
                 tokio::fs::read(&path).await.map_err(|e| io::Error::new(e.kind(), format!("read {}: {}", path.display(), e)))?
             }
             "http" => {
-                // Prefer the cached copy so startup is instant and offline-safe.
-                let cached = match &def.path {
-                    Some(path) => tokio::fs::read(resolve_path(path, data_dir)).await.ok(),
-                    None => None,
+                // Startup prefers the cached copy so it is instant and
+                // offline-safe; a scheduled refresh always re-downloads.
+                let cached = if use_cache {
+                    match &def.path {
+                        Some(path) => tokio::fs::read(resolve_path(path, data_dir)).await.ok(),
+                        None => None,
+                    }
+                } else {
+                    None
                 };
                 match cached {
                     Some(bytes) => bytes,
@@ -266,28 +304,27 @@ impl ProviderRegistry {
         } else {
             parse_payload(&raw, &format)
         };
-        let _ = def.interval; // periodic refresh is not implemented yet
         Ok(RuleProvider::new(name.to_string(), behavior, lines))
     }
 
-    pub fn insert(&mut self, provider: RuleProvider) {
-        self.providers.insert(provider.name.clone(), provider);
+    pub fn insert(&self, provider: RuleProvider) {
+        self.providers.write().unwrap().insert(provider.name.clone(), provider);
     }
 
     pub fn matches(&self, name: &str, addr: &TargetAddr, resolved: Option<IpAddr>, geo: &GeoData) -> bool {
-        self.providers.get(name)
+        self.providers.read().unwrap().get(name)
             .map(|p| p.matches(addr, resolved, geo))
             .unwrap_or(false)
     }
 
-    pub fn names(&self) -> Vec<&str> {
-        let mut names: Vec<&str> = self.providers.keys().map(String::as_str).collect();
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.providers.read().unwrap().keys().cloned().collect();
         names.sort();
         names
     }
 
     pub fn snapshot(&self) -> Vec<ProviderInfo> {
-        let mut items: Vec<ProviderInfo> = self.providers.values().map(|p| ProviderInfo {
+        let mut items: Vec<ProviderInfo> = self.providers.read().unwrap().values().map(|p| ProviderInfo {
             name: p.name.clone(),
             behavior: p.behavior.as_str().to_string(),
             count: p.len(),
@@ -438,6 +475,30 @@ rules:
         let cached = ProviderRegistry::load(&config, &dir).await;
         assert_eq!(cached.len(), 1);
         assert!(cached.matches("Sites", &TargetAddr::Domain("twitter.com".into(), 443), None, &geo));
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_rebuilds_a_file_provider_from_disk() {
+        let dir = std::env::temp_dir().join(format!("skyward-provider-refresh-{}", rand::random::<u64>()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let file = dir.join("sites.txt");
+        tokio::fs::write(&file, "a.test\n").await.unwrap();
+        let def = RuleProviderDef {
+            kind: "file".into(),
+            behavior: "domain".into(),
+            format: Some("text".into()),
+            path: Some(file.to_string_lossy().into_owned()),
+            interval: Some(3600),
+            ..Default::default()
+        };
+        let provider = ProviderRegistry::build("Sites", &def, &dir, true).await.unwrap();
+        assert!(provider.matches(&TargetAddr::Domain("a.test".into(), 80), None, &GeoData::default()));
+
+        tokio::fs::write(&file, "b.test\n").await.unwrap();
+        let refreshed = ProviderRegistry::build("Sites", &def, &dir, false).await.unwrap();
+        assert!(!refreshed.matches(&TargetAddr::Domain("a.test".into(), 80), None, &GeoData::default()));
+        assert!(refreshed.matches(&TargetAddr::Domain("b.test".into(), 80), None, &GeoData::default()));
         tokio::fs::remove_dir_all(&dir).await.unwrap();
     }
 }

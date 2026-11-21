@@ -6,8 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Kernel version reported by the CLI and the REST API.
-pub const VERSION: &str = "0.1.0-alpha.1";
+/// Kernel version reported by the CLI and the REST API. Kept in step with the
+/// App release line the Rust core ships in.
+pub const VERSION: &str = "1.0.1.4";
 
 /// Process-wide traffic counters.
 #[derive(Debug, Default)]
