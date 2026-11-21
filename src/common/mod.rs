@@ -1,6 +1,7 @@
 //! Shared types and primitives used across the kernel.
 
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -14,15 +15,86 @@ pub struct TrafficStats {
     upload: AtomicU64,
     download: AtomicU64,
     rate_sample: Mutex<Option<(Instant, TrafficSnapshot, TrafficSnapshot)>>,
+    persist: Mutex<Option<PersistSlot>>,
 }
+
+#[derive(Debug)]
+struct PersistSlot {
+    path: PathBuf,
+    last_write: Instant,
+}
+
+/// Mirroring cadence. Tests shorten it so they do not have to sleep.
+const PERSIST_INTERVAL: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(5)
+};
 
 impl TrafficStats {
     pub fn add_upload(&self, bytes: u64) {
         self.upload.fetch_add(bytes, Ordering::Relaxed);
+        self.note_change();
     }
 
     pub fn add_download(&self, bytes: u64) {
         self.download.fetch_add(bytes, Ordering::Relaxed);
+        self.note_change();
+    }
+
+    /// Zero the cumulative counters, as the App's "reset traffic" action does.
+    pub fn reset(&self) {
+        self.upload.store(0, Ordering::Relaxed);
+        self.download.store(0, Ordering::Relaxed);
+        if let Ok(mut sample) = self.rate_sample.lock() {
+            *sample = None;
+        }
+        self.write_now();
+    }
+
+    /// Restore the cumulative totals from `path` and mirror later changes back
+    /// to it, so a process restart does not lose the running total.
+    pub fn enable_persistence(&self, path: PathBuf) {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                let up = value.get("up").and_then(|v| v.as_u64()).unwrap_or(0);
+                let down = value.get("down").and_then(|v| v.as_u64()).unwrap_or(0);
+                self.upload.store(up, Ordering::Relaxed);
+                self.download.store(down, Ordering::Relaxed);
+            }
+        }
+        if let Ok(mut slot) = self.persist.lock() {
+            *slot = Some(PersistSlot { path, last_write: Instant::now() });
+        }
+        self.write_now();
+    }
+
+    fn note_change(&self) {
+        let Ok(mut slot) = self.persist.lock() else { return };
+        let Some(slot) = slot.as_mut() else { return };
+        if slot.last_write.elapsed() < PERSIST_INTERVAL {
+            return;
+        }
+        slot.last_write = Instant::now();
+        self.write_locked(&slot.path);
+    }
+
+    fn write_now(&self) {
+        if let Ok(mut slot) = self.persist.lock() {
+            if let Some(slot) = slot.as_mut() {
+                slot.last_write = Instant::now();
+                self.write_locked(&slot.path);
+            }
+        }
+    }
+
+    fn write_locked(&self, path: &Path) {
+        let body = format!(
+            "{{\"up\":{},\"down\":{}}}",
+            self.upload.load(Ordering::Relaxed),
+            self.download.load(Ordering::Relaxed)
+        );
+        let _ = std::fs::write(path, body);
     }
 
     pub fn snapshot(&self) -> TrafficSnapshot {
@@ -64,6 +136,27 @@ pub struct TrafficSnapshot {
 pub type SharedTraffic = Arc<TrafficStats>;
 
 #[cfg(test)]
+#[test]
+fn cumulative_totals_survive_a_fresh_stats_instance() {
+    let dir = std::env::temp_dir().join(format!("skyward-traffic-{}", rand::random::<u64>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("traffic.json");
+    let first = TrafficStats::default();
+    first.enable_persistence(path.clone());
+    first.add_upload(11);
+    first.add_download(13);
+    first.reset();
+    first.add_upload(1);
+    std::thread::sleep(Duration::from_millis(80));
+    first.add_upload(0); // a change past the mirror interval flushes
+
+    let second = TrafficStats::default();
+    second.enable_persistence(path);
+    assert_eq!(second.snapshot().up, 1);
+    assert_eq!(second.snapshot().down, 0);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn traffic_rate_is_per_second_and_does_not_consume_totals() {
     let traffic = TrafficStats::default();

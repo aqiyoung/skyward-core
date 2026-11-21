@@ -50,3 +50,4 @@ argon2 = "0.5"
 chacha20 = "0.9"
 jni = "0.21"
 smoltcp = { version = "0.11", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp", "socket-icmp"] }
+age = { version = "0.12.1", default-features = false, features = ["armor"] }

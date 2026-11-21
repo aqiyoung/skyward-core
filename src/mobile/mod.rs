@@ -119,6 +119,9 @@ pub fn invoke(data: &[u8]) -> Vec<u8> {
         "getTraffic" => handle_get_traffic(&call, false),
         "getTotalTraffic" => handle_get_traffic(&call, true),
         "resetTraffic" => handle_reset_traffic(&call),
+        "decryptConfig" => handle_decrypt_config(&call),
+        "dumpRuleSet" => handle_dump_rule_set(&call),
+        "crash" => handle_crash(&call),
         "encodeShareLinks" => handle_encode_share_links(&call),
         "decodeShareLinks" => handle_decode_share_links(&call),
         "convertProxies" => handle_convert_proxies(&call),
@@ -978,7 +981,73 @@ fn handle_get_traffic(call: &MethodCall, total: bool) -> Vec<u8> {
 }
 
 fn handle_reset_traffic(call: &MethodCall) -> Vec<u8> {
+    crate::runtime_state::traffic().reset();
     ok(&call.id, Value::Bool(true))
+}
+
+/// The developer "force crash" probe: the Go core takes the process down so
+/// crash reporting can be exercised on a rooted build.
+fn handle_crash(_call: &MethodCall) -> Vec<u8> {
+    crate::jni::emit_log_event("[rust-core] crash requested by the app");
+    std::process::abort()
+}
+
+fn handle_decrypt_config(call: &MethodCall) -> Vec<u8> {
+    #[derive(Deserialize)]
+    struct Args {
+        path: String,
+        #[serde(rename = "age-secret-key", default)]
+        age_secret_key: String,
+    }
+    let args: Args = match serde_json::from_value(call.arguments.clone()) {
+        Ok(args) => args,
+        Err(e) => return err(&call.id, "invalid_arguments", e.to_string()),
+    };
+    match crate::age::decrypt_file(&args.path, &args.age_secret_key) {
+        Ok(text) => ok(&call.id, Value::String(text)),
+        Err(message) => err(&call.id, "decrypt_failed", message),
+    }
+}
+
+/// Text view of a rule-set file for the provider viewer: yaml/text sets are
+/// returned as-is; an mrs set is decoded and rendered one rule per line.
+fn handle_dump_rule_set(call: &MethodCall) -> Vec<u8> {
+    let path = call.arguments.as_str().unwrap_or("");
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(e) => return err(&call.id, "io_error", format!("read {}: {e}", path)),
+    };
+    if !raw.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        return match String::from_utf8(raw) {
+            Ok(text) => ok(&call.id, Value::String(text)),
+            Err(_) => err(
+                &call.id,
+                "decode_error",
+                "rule-set file is neither text nor an mrs set",
+            ),
+        };
+    }
+    use crate::rules::provider::{Behavior, DomainMode, Entry};
+    for behavior in [Behavior::Domain, Behavior::IpCidr, Behavior::Classical] {
+        let Ok(entries) = crate::rules::mrs::parse_mrs(&raw, behavior) else {
+            continue;
+        };
+        let lines: Vec<String> = entries
+            .iter()
+            .map(|entry| match entry {
+                Entry::Domain { value, mode } => match mode {
+                    DomainMode::Exact => value.clone(),
+                    DomainMode::Suffix => format!("+.{value}"),
+                    DomainMode::SubOnly => format!(".{value}"),
+                },
+                Entry::Cidr(net) => net.to_string(),
+                Entry::IpRange(start, end) => format!("{start}-{end}"),
+                Entry::Classical(rule) => rule.raw.clone(),
+            })
+            .collect();
+        return ok(&call.id, Value::String(lines.join("\n")));
+    }
+    err(&call.id, "decode_error", "unreadable mrs rule-set")
 }
 
 fn handle_encode_share_links(call: &MethodCall) -> Vec<u8> {
@@ -1581,6 +1650,12 @@ mod tests {
         serde_json::from_slice(&data).unwrap()
     }
 
+    fn temp_data_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("skyward-data-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn memory_stats_reports_real_rss() {
         let _guard = crate::runtime_state::TEST_LOCK.lock().unwrap();
@@ -1597,6 +1672,62 @@ mod tests {
         let r = response(invoke(br#"{"method":"coreVersion"}"#));
         assert!(r["result"].as_str().unwrap().starts_with("clash.meta/"));
         assert!(r["error"].is_null());
+    }
+
+    #[test]
+    fn decrypt_config_unwraps_armored_profile() {
+        use age::secrecy::ExposeSecret;
+        let identity = age::x25519::Identity::generate();
+        let armored = age::encrypt_and_armor(
+            &identity.to_public(),
+            b"proxies:\n  - name: test\n",
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("skyward-dec-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("profile.age");
+        std::fs::write(&file, armored).unwrap();
+        let payload = json!({
+            "method": "decryptConfig",
+            "arguments": {
+                "path": file.to_string_lossy(),
+                "age-secret-key": identity.to_string().expose_secret(),
+            }
+        })
+        .to_string();
+        let r = response(invoke(payload.as_bytes()));
+        assert!(r["error"].is_null(), "{r}");
+        assert_eq!(r["result"], "proxies:\n  - name: test\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dump_rule_set_returns_text_file_as_is() {
+        let dir = std::env::temp_dir().join(format!("skyward-dump-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("rules.txt");
+        std::fs::write(&file, "example.com\n").unwrap();
+        let payload = json!({
+            "method": "dumpRuleSet",
+            "arguments": file.to_string_lossy(),
+        })
+        .to_string();
+        let r = response(invoke(payload.as_bytes()));
+        assert!(r["error"].is_null(), "{r}");
+        assert_eq!(r["result"], "example.com\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reset_traffic_zeroes_cumulative_counters() {
+        let _guard = crate::runtime_state::TEST_LOCK.lock().unwrap();
+        let traffic = crate::runtime_state::traffic();
+        traffic.add_upload(7);
+        traffic.add_download(9);
+        let r = response(invoke(br#"{"method":"resetTraffic"}"#));
+        assert_eq!(r["result"], true);
+        let snap = traffic.snapshot();
+        assert_eq!((snap.up, snap.down), (0, 0));
     }
 
     #[test]
@@ -1689,7 +1820,7 @@ mod tests {
                 "proxies:\n  - {name: n1, type: direct}\nproxy-groups:\n  - {name: g1, type: select, proxies: [n1, DIRECT]}\n",
             ).unwrap(),
             std::path::PathBuf::from("c.yaml"),
-            std::path::PathBuf::from("."),
+            temp_data_dir(),
         ));
         let payload = serde_json::json!({
             "method": "quickSetup",
@@ -1711,7 +1842,7 @@ mod tests {
                 "proxies:\n  - {name: n1, type: direct}\nproxy-groups:\n  - {name: g1, type: select, proxies: [n1, DIRECT]}\n",
             ).unwrap(),
             std::path::PathBuf::from("c.yaml"),
-            std::path::PathBuf::from("."),
+            temp_data_dir(),
         ));
         let r = response(invoke(br#"{"method":"getProxies"}"#));
         assert!(r["result"]["all"].as_array().unwrap().iter().any(|n| n == "g1"));
@@ -1734,7 +1865,7 @@ mod tests {
                 "proxies:\n  - {name: n1, type: direct}\nproxy-groups:\n  - {name: g1, type: select, proxies: [n1, DIRECT]}\n",
             ).unwrap(),
             std::path::PathBuf::from("c.yaml"),
-            std::path::PathBuf::from("."),
+            temp_data_dir(),
         ));
         let payload = serde_json::json!({
             "method": "changeProxy",
