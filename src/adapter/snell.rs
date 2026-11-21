@@ -463,6 +463,18 @@ fn decrypt_aead(aead: &Aes128Gcm, nonce: &[u8; NONCE_SIZE], cipher: &[u8]) -> io
     aead.decrypt(AesNonce::from_slice(nonce), cipher).map_err(|_| aead_error())
 }
 
+/// Shaped-mode read: the padding region is the additional authenticated
+/// data (the Go reference passes it to `aead.Open`).
+fn decrypt_aead_aad(
+    aead: &Aes128Gcm,
+    nonce: &[u8; NONCE_SIZE],
+    cipher: &[u8],
+    aad: &[u8],
+) -> io::Result<Vec<u8>> {
+    aead.decrypt(AesNonce::from_slice(nonce), Payload { msg: cipher, aad })
+        .map_err(|_| aead_error())
+}
+
 /// Uniform in [0, max), mirroring the `cryptoRandomInt` rejection sampling
 /// used by the Go reference.
 fn crypto_random_int(max: u64) -> u64 {
@@ -2030,7 +2042,7 @@ impl V6RecordReader for V6ShapedReader {
         let (padding_part, payload_part) = body.split_at_mut(padding_length);
         self.profile
             .mix_padding_payload(seq, padding_part, &mut payload_part[..payload_length + TAG_LEN]);
-        match decrypt_aead(aead, &self.nonce, &payload_part[..payload_length + TAG_LEN], padding_part) {
+        match decrypt_aead_aad(aead, &self.nonce, &payload_part[..payload_length + TAG_LEN], padding_part) {
             Ok(payload) => {
                 increment_nonce(&mut self.nonce);
                 Poll::Ready(Ok(payload))
