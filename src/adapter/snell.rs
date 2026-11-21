@@ -2289,6 +2289,52 @@ mod v46_tests {
         assert_eq!(out, b"hello v6 unshaped");
     }
 
+    #[test]
+    fn v6_shaped_segments() {
+        let profile = V6Profile::new(b"pw");
+        let mut writer = V6ShapedWriter::new(b"pw", profile.clone()).unwrap();
+        let salt: [u8; V6_SALT_SIZE] = writer.salt.clone().try_into().unwrap();
+        let mut reader = V6ShapedReader::new(b"pw", profile.clone());
+        reader.aead = Some(v6_aead(b"pw", &salt).unwrap());
+        let out = writer.append_record(Vec::new(), b"hi").unwrap();
+
+        let mut pos = 0;
+        let salt_block_len = profile.salt_block_len;
+        assert_eq!(
+            reader.profile.extract_salt(&out[pos..pos + salt_block_len]),
+            writer.salt,
+            "salt block round trip"
+        );
+        pos += salt_block_len;
+
+        let prefix_length = profile.record_prefix_len(0);
+        let prefix = out[pos..pos + prefix_length].to_vec();
+        pos += prefix_length;
+        let header_cipher = out[pos..pos + V6_HEADER_CIPHER_SIZE].to_vec();
+        pos += V6_HEADER_CIPHER_SIZE;
+        let header =
+            decrypt_aead_aad(&writer.aead, &[0u8; NONCE_SIZE], &header_cipher, &prefix)
+                .expect("header decrypt");
+        let (padding_length, payload_length) = v6_parse_header(&header, false).unwrap();
+        assert_eq!(payload_length, 2, "payload length from the header");
+
+        let body_len = padding_length + payload_length + TAG_LEN;
+        assert_eq!(pos + body_len, out.len(), "record ends after the body");
+        let body = out[pos..pos + body_len].to_vec();
+        let mut padding = body[..padding_length].to_vec();
+        let mut payload = body[padding_length..].to_vec();
+        profile.mix_padding_payload(0, &mut padding, &mut payload[..payload_length + TAG_LEN]);
+        let nonce2 = {
+            let mut n = [0u8; NONCE_SIZE];
+            increment_nonce(&mut n);
+            n
+        };
+        let plain =
+            decrypt_aead_aad(&writer.aead, &nonce2, &payload[..payload_length + TAG_LEN], &padding)
+                .expect("payload decrypt");
+        assert_eq!(plain, b"hi");
+    }
+
     #[tokio::test]
     async fn v6_shaped_round_trips() {
         let (a, b) = duplex(1 << 16);
