@@ -1932,6 +1932,10 @@ impl V6ShapedWriter {
             self.profile.fill_padding(seq, &mut p);
             p
         };
+        // The prefix lives in the record (the Go writer fills it in place);
+        // the reader reads it back as the header seal's AAD.
+        record[offset..offset + prefix_length].copy_from_slice(&prefix);
+        offset += prefix_length;
         {
             let mut header_plain = [0u8; V6_HEADER_PLAIN_SIZE];
             v6_put_header(&mut header_plain, padding_length, payload.len());
