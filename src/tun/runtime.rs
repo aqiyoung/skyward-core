@@ -218,6 +218,9 @@ fn handle_dns_packet6<T: Read + Write + Send + 'static>(
         1 => Some(std::net::IpAddr::V4(crate::fake_ip::fake_ip_for(
             name.trim_end_matches('.'),
         ))),
+        28 => Some(std::net::IpAddr::V6(crate::fake_ip::fake_ipv6_for(
+            name.trim_end_matches('.'),
+        ))),
         _ => None,
     };
     let response = build_dns_response(payload, answer_ip);
@@ -348,6 +351,9 @@ fn handle_dns_packet<T: Read + Write + Send + 'static>(
 
     let answer_ip = match qtype {
         1 => Some(std::net::IpAddr::V4(crate::fake_ip::fake_ip_for(
+            name.trim_end_matches('.'),
+        ))),
+        28 => Some(std::net::IpAddr::V6(crate::fake_ip::fake_ipv6_for(
             name.trim_end_matches('.'),
         ))),
         _ => None,
@@ -548,7 +554,7 @@ mod tests {
         assert_eq!(&dns_reply[question_end..question_end + 2], &[0xc0, 0x0c]);
         let fake_ip = Ipv4Addr::from(<[u8; 4]>::try_from(&dns_reply[question_end + 12..]).unwrap());
         assert_eq!(
-            crate::fake_ip::hostname_for(fake_ip).as_deref(),
+            crate::fake_ip::hostname_for(fake_ip.into()).as_deref(),
             Some("reply.example")
         );
     }
@@ -642,5 +648,27 @@ mod tests {
         assert_eq!(checksum6(server.octets(), client.octets(), 17, udp), 0);
         // The request packet itself is well-formed too.
         assert_eq!(request[6], 17);
+    }
+
+    #[test]
+    fn ipv6_dns_aaaa_query_is_answered_with_a_fake_v6() {
+        let server: std::net::Ipv6Addr = "fdfe:dcba:9876::2".parse().unwrap();
+        let client: std::net::Ipv6Addr = "fdfe:dcba:9876::1".parse().unwrap();
+        let query = dns_query("v6.test", 28);
+        let request = build_udp_packet6(client, server, 53123, 53, &query);
+        let io = Arc::new(Mutex::new(std::io::Cursor::new(Vec::new())));
+        handle_dns_packet6(&request, server.octets(), client.octets(), &io);
+        let reply = io.lock().unwrap().get_ref().clone();
+        assert!(!reply.is_empty(), "AAAA must be answered with a fake v6");
+        let udp = &reply[40..];
+        let len = u16::from_be_bytes([udp[4], udp[5]]) as usize;
+        let payload = &udp[8..len];
+        assert_eq!(u16::from_be_bytes([payload[6], payload[7]]), 1, "one answer");
+        let fake = crate::fake_ip::fake_ipv6_for("v6.test");
+        assert!(
+            payload.windows(16).any(|window| window == fake.octets()),
+            "the fake v6 {fake} must appear in the answer"
+        );
+        assert_eq!(crate::fake_ip::hostname_for(fake.into()).as_deref(), Some("v6.test"));
     }
 }

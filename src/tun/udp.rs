@@ -101,13 +101,9 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
         while tasks.try_join_next().is_some() {}
         tasks.spawn(async move {
             let engine = crate::runtime_state::engine().await.unwrap_or(fallback_engine);
-            // Fake IPs are IPv4 for now; v6 destinations route by address.
-            let target = match key.dst {
-                IpAddr::V4(v4) => match crate::fake_ip::hostname_for(v4) {
-                    Some(host) => TargetAddr::Domain(host, key.dst_port),
-                    None => TargetAddr::Ip(IpAddr::V4(v4), key.dst_port),
-                },
-                IpAddr::V6(v6) => TargetAddr::Ip(IpAddr::V6(v6), key.dst_port),
+            let target = match crate::fake_ip::hostname_for(key.dst) {
+                Some(host) => TargetAddr::Domain(host, key.dst_port),
+                None => TargetAddr::Ip(key.dst, key.dst_port),
             };
             let (conn, route, final_name) = match tokio::time::timeout(DIAL_TIMEOUT, engine.dial_udp(&target)).await {
                 Ok(Ok(dialed)) => dialed,

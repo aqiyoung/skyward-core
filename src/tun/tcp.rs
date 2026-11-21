@@ -465,16 +465,12 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
         let relay_failed = flow.relay_failed.clone();
         let fallback_engine = self.engine.clone();
         let io = self.io.clone();
-        // If the destination is a fake-ip we handed out in DNS, recover the
-        // original hostname so rules match by domain and proxies receive the
-        // real host instead of a synthetic address. Fake IPs are v4 for now;
-        // v6 destinations route by address.
-        let target = match key.target_ip {
-            IpAddr::V4(v4) => match crate::fake_ip::hostname_for(v4) {
-                Some(host) => TargetAddr::Domain(host, key.target_port),
-                None => TargetAddr::Ip(IpAddr::V4(v4), key.target_port),
-            },
-            IpAddr::V6(v6) => TargetAddr::Ip(IpAddr::V6(v6), key.target_port),
+        // If the destination is a fake-ip we handed out in DNS (either
+        // family), recover the original hostname so rules match by domain and
+        // proxies receive the real host instead of a synthetic address.
+        let target = match crate::fake_ip::hostname_for(key.target_ip) {
+            Some(host) => TargetAddr::Domain(host, key.target_port),
+            None => TargetAddr::Ip(key.target_ip, key.target_port),
         };
         let mut tasks = self.tasks.lock().unwrap();
         while tasks.try_join_next().is_some() {}
