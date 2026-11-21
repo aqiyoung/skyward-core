@@ -87,7 +87,7 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
                 Some(host) => TargetAddr::Domain(host, key.dst_port),
                 None => TargetAddr::Ip(key.dst.into(), key.dst_port),
             };
-            let (conn, rule, final_name) = match tokio::time::timeout(DIAL_TIMEOUT, engine.dial_udp(&target)).await {
+            let (conn, route, final_name) = match tokio::time::timeout(DIAL_TIMEOUT, engine.dial_udp(&target)).await {
                 Ok(Ok(dialed)) => dialed,
                 Ok(Err(e)) => {
                     crate::tun::runtime::diag_udp(format!(
@@ -114,11 +114,12 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
                 .connections
                 .add(
                     &target,
-                    &rule,
-                    "",
-                    vec![final_name, rule.clone()],
+                    &route.rule,
+                    &route.payload,
+                    route.chains(&final_name),
                     crate::tunnel::connection::Network::Udp,
                     Some((key.src.to_string(), key.src_port)),
+                    Some(key.dst.into()),
                 )
                 .await;
             let relay = async {

@@ -461,9 +461,6 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             Some(host) => TargetAddr::Domain(host, key.target_port),
             None => TargetAddr::Ip(std::net::IpAddr::V4(key.target_ip), key.target_port),
         };
-        // Log the resolved target (domain when known), not the fake IP, so a
-        // log export names the site a flow belongs to.
-        let addr = target.address();
         let mut tasks = self.tasks.lock().unwrap();
         while tasks.try_join_next().is_some() {}
         tasks.spawn(async move {
@@ -475,10 +472,47 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             let engine = crate::runtime_state::engine()
                 .await
                 .unwrap_or(fallback_engine);
-            // Rules and the chain are decided before dialling so the connection
-            // the App lists names the same route the packet actually took.
-            let rule = engine.decide(&target).await;
-            let final_name = engine.outbounds.resolve(&rule).await;
+            let original_ip = match &target {
+                // Never use a synthetic fake IP for real IP-rule matching.
+                TargetAddr::Domain(..) => None,
+                TargetAddr::Ip(ip, _) => Some(*ip),
+            };
+            let prepare = async {
+                let sniffed = super::sniff::inspect(
+                    &engine.config.sniffer, &target, key.client_ip.into(), key.target_ip.into(),
+                    &to_net, &upload_closed,
+                ).await;
+                let (route_target, dial_target) = match sniffed {
+                    Some((host, override_destination)) => {
+                        let identified = TargetAddr::Domain(host, key.target_port);
+                        let dial_target = if override_destination { identified.clone() } else { target.clone() };
+                        (identified, dial_target)
+                    }
+                    None => (target.clone(), target.clone()),
+                };
+                let route = engine.decide_route(&route_target, original_ip).await;
+                let final_name = engine.outbounds.resolve(&route.target).await;
+                (route_target, dial_target, route, final_name)
+            };
+            // Cancellation covers hostname collection AND DNS/rule selection,
+            // not just the subsequent dial and relay.
+            let (route_target, dial_target, route, final_name) = tokio::select! {
+                biased;
+                _ = cancel.notified() => {
+                    relay_failed.store(true, Ordering::Relaxed);
+                    done.store(true, Ordering::Relaxed);
+                    return;
+                }
+                _ = engine.close_signal.notified() => {
+                    relay_failed.store(true, Ordering::Relaxed);
+                    done.store(true, Ordering::Relaxed);
+                    return;
+                }
+                prepared = prepare => prepared,
+            };
+            let addr = route_target.address();
+            flow_diag(format!("flow {} original={}:{} matched={}:{} policy={} outbound={}",
+                addr, key.target_ip, key.target_port, route.rule, route.payload, route.target, final_name));
             let mut stream: BoxedStream = tokio::select! {
                 _ = cancel.notified() => {
                     relay_failed.store(true, Ordering::Relaxed);
@@ -493,7 +527,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                     done.store(true, Ordering::Relaxed);
                     return;
                 }
-                result = tokio::time::timeout(std::time::Duration::from_secs(10), engine.dial_named(&final_name, &target)) => {
+                result = tokio::time::timeout(std::time::Duration::from_secs(10), engine.dial_named(&final_name, &dial_target)) => {
                     match result {
                         Ok(Ok(s)) => {
                             flow_diag(format!("flow {} connected via {}", addr, final_name));
@@ -520,12 +554,13 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             let (connection, up_counter, down_counter) = engine
                 .connections
                 .add(
-                    &target,
-                    &rule,
-                    "",
-                    vec![final_name.clone(), rule.clone()],
+                    &route_target,
+                    &route.rule,
+                    &route.payload,
+                    route.chains(&final_name),
                     crate::tunnel::connection::Network::Tcp,
                     Some((key.client_ip.to_string(), key.client_port)),
+                    Some(key.target_ip.into()),
                 )
                 .await;
             let mut read_buf = vec![0u8; 16 * 1024];
@@ -922,6 +957,156 @@ mod tests {
         );
         let io = Arc::new(Mutex::new(TestIo { out: Vec::new() }));
         (TcpManager::new(engine, io.clone()), io)
+    }
+
+    /// Exercise SYN/ACK, fragmented application bytes, routing, proxy CONNECT,
+    /// unchanged relay bytes and the exact metadata emitted to the App.
+    async fn assert_sniffed_tun_flow(
+        payload: Vec<u8>, enabled: bool, extra: &str, rules: &str,
+        expected_connect: &str, expected_host: &str, expected_rule: &str, expected_payload: &str,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected_bytes = payload.clone();
+        let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") { head.push(stream.read_u8().await.unwrap()); }
+            stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
+            let mut actual = vec![0; expected_bytes.len()];
+            stream.read_exact(&mut actual).await.unwrap();
+            assert_eq!(actual, expected_bytes, "sniffing must preserve every relayed byte");
+            observed_tx.send(String::from_utf8(head).unwrap()).unwrap();
+            let _ = release_rx.await;
+        });
+        let config = Config::from_str(&format!(r#"
+proxies:
+  - name: TEST-PROXY
+    type: http
+    server: 127.0.0.1
+    port: {port}
+proxy-groups:
+  - name: POLICY
+    type: select
+    proxies: [TEST-PROXY]
+sniffer:
+  enable: {enabled}
+  sniff:
+    TLS:
+      ports: [443]
+    HTTP:
+      ports: ['443']
+{extra}
+rules:
+{rules}
+"#)).unwrap();
+        let engine = Arc::new(Engine::new(config, Arc::new(TrafficStats::default()), std::path::Path::new(".")).await);
+        let io = Arc::new(Mutex::new(TestIo { out: Vec::new() }));
+        let mut tcp = TcpManager::new(engine.clone(), io.clone());
+        let client = Ipv4Addr::new(10, 0, 0, 2);
+        let target = Ipv4Addr::new(203, 0, 113, 42);
+        tcp.handle_packet(&client_packet(client, target, 40000, 443, 1000, 0, SYN, &[]));
+        let isn = parse_tcp(&io.lock().unwrap().out, 20).unwrap().seq;
+        tcp.handle_packet(&client_packet(client, target, 40000, 443, 1001, isn.wrapping_add(1), ACK, &[]));
+        // Real IP packets carry the ClientHello/Host across multiple segments.
+        let split = payload.len() / 3;
+        tcp.handle_packet(&client_packet(client, target, 40000, 443, 1001, isn.wrapping_add(1), PSH | ACK, &payload[..split]));
+        for _ in 0..4 { tokio::task::yield_now().await; }
+        tcp.handle_packet(&client_packet(client, target, 40000, 443, 1001 + split as u32, isn.wrapping_add(1), PSH | ACK, &payload[split..]));
+        let head = tokio::time::timeout(std::time::Duration::from_secs(3), observed_rx).await.unwrap().unwrap();
+        assert!(head.starts_with(&format!("CONNECT {expected_connect} HTTP/1.1\r\n")), "{head}");
+        let entries = engine.connections.snapshot().await;
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.metadata.host, expected_host);
+        assert_eq!(entry.metadata.destination_ip, "203.0.113.42");
+        assert_eq!(entry.metadata.source_ip, "10.0.0.2");
+        assert_eq!(entry.rule, expected_rule);
+        assert_eq!(entry.rule_payload, expected_payload);
+        assert_eq!(entry.chains, vec!["TEST-PROXY", "POLICY"]);
+        assert_eq!(entry.upload, payload.len() as u64);
+        tcp.shutdown().await;
+        let _ = release_tx.send(());
+        server.await.unwrap();
+        assert!(engine.connections.snapshot().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tun_fragmented_tls_sni_matches_domain_instead_of_catch_all() {
+        assert_sniffed_tun_flow(super::super::sniff::test_client_hello("service.test", true), true, "",
+            "  - DOMAIN,service.test,POLICY\n  - MATCH,REJECT", "service.test:443", "service.test", "Domain", "service.test").await;
+    }
+
+    #[tokio::test]
+    async fn tun_fragmented_http_host_matches_domain_and_preserves_payload() {
+        assert_sniffed_tun_flow(b"GET /path HTTP/1.1\r\nHost: service.test:443\r\n\r\nbody".to_vec(), true, "",
+            "  - DOMAIN-SUFFIX,service.test,POLICY\n  - MATCH,REJECT", "service.test:443", "service.test", "DomainSuffix", "service.test").await;
+    }
+
+    #[tokio::test]
+    async fn tun_sniff_override_false_routes_by_domain_but_dials_original_ip() {
+        assert_sniffed_tun_flow(super::super::sniff::test_client_hello("service.test", false), true, "  override-destination: false",
+            "  - DOMAIN,service.test,POLICY\n  - MATCH,REJECT", "203.0.113.42:443", "service.test", "Domain", "service.test").await;
+    }
+
+    #[tokio::test]
+    async fn tun_sniffing_preserves_original_ip_rule_precedence() {
+        assert_sniffed_tun_flow(super::super::sniff::test_client_hello("service.test", false), true, "  override-destination: false",
+            "  - IP-CIDR,203.0.113.0/24,POLICY,no-resolve\n  - DOMAIN,service.test,REJECT\n  - MATCH,REJECT",
+            "203.0.113.42:443", "service.test", "IPCIDR", "203.0.113.0/24").await;
+    }
+
+    #[tokio::test]
+    async fn tun_disabled_or_excluded_sniffing_keeps_real_catch_all_and_unknown_host() {
+        for (enabled, extra) in [(false, ""), (true, "  skip-domain: ['+.test']"), (true, "  parse-pure-ip: false")] {
+            assert_sniffed_tun_flow(super::super::sniff::test_client_hello("service.test", false), enabled, extra,
+                "  - DOMAIN,service.test,REJECT\n  - MATCH,POLICY", "203.0.113.42:443", "", "Match", "").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn tun_non_http_tls_traffic_legitimately_matches_catch_all() {
+        assert_sniffed_tun_flow(b"SSH-2.0-test\r\n".to_vec(), true, "",
+            "  - DOMAIN,service.test,REJECT\n  - MATCH,POLICY", "203.0.113.42:443", "", "Match", "").await;
+    }
+
+    #[tokio::test]
+    async fn tun_shutdown_cancels_pending_hostname_inspection() {
+        let config = Config::from_str("sniffer:\n  enable: true\n  sniff:\n    TLS:\n      ports: [443]\nrules: ['MATCH,REJECT']").unwrap();
+        let engine = Arc::new(Engine::new(config, Arc::new(TrafficStats::default()), std::path::Path::new(".")).await);
+        let io = Arc::new(Mutex::new(TestIo { out: Vec::new() }));
+        let mut tcp = TcpManager::new(engine.clone(), io);
+        tcp.handle_packet(&client_packet(Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(203, 0, 113, 42), 40000, 443, 1000, 0, SYN, &[]));
+        tokio::task::yield_now().await;
+        tokio::time::timeout(std::time::Duration::from_millis(200), tcp.shutdown()).await.unwrap();
+        assert!(engine.connections.snapshot().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tun_reset_and_engine_close_cancel_hostname_wait() {
+        for reset in [true, false] {
+            let config = Config::from_str("sniffer:\n  enable: true\n  sniff:\n    TLS:\n      ports: [443]\nrules: ['MATCH,REJECT']").unwrap();
+            let engine = Arc::new(Engine::new(config, Arc::new(TrafficStats::default()), std::path::Path::new(".")).await);
+            let io = Arc::new(Mutex::new(TestIo { out: Vec::new() }));
+            let mut tcp = TcpManager::new(engine.clone(), io);
+            let key = FlowKey { client_ip: Ipv4Addr::new(10, 0, 0, 2), client_port: 40000,
+                target_ip: Ipv4Addr::new(203, 0, 113, 42), target_port: 443 };
+            tcp.handle_packet(&client_packet(key.client_ip, key.target_ip, key.client_port, key.target_port, 1000, 0, SYN, &[]));
+            let done = tcp.flows.get(&key).unwrap().done.clone();
+            for _ in 0..4 { tokio::task::yield_now().await; }
+            if reset {
+                tcp.handle_packet(&client_packet(key.client_ip, key.target_ip, key.client_port, key.target_port, 1001, 0, RST, &[]));
+            } else {
+                engine.close_connections().await;
+            }
+            tokio::time::timeout(std::time::Duration::from_millis(200), async {
+                while !done.load(Ordering::Relaxed) { tokio::task::yield_now().await; }
+            }).await.expect("cancellation must not wait out the sniff deadline");
+            tcp.shutdown().await;
+            assert!(engine.connections.snapshot().await.is_empty());
+        }
     }
 
     #[tokio::test]

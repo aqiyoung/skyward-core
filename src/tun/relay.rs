@@ -143,6 +143,11 @@ impl ByteQueue {
         self.inner.lock().unwrap().len()
     }
 
+    /// Inspect a bounded prefix without consuming bytes from the relay.
+    pub fn peek(&self, limit: usize) -> Vec<u8> {
+        self.inner.lock().unwrap().iter().take(limit).copied().collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

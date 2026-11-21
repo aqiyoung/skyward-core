@@ -58,6 +58,24 @@ fn wildcard_regex(pattern: &str) -> Option<Regex> {
 }
 
 impl Rule {
+    /// mihomo-compatible names consumed by the App's request list.
+    pub fn type_name(&self) -> &'static str {
+        match self.kind {
+            RuleKind::Domain => "Domain",
+            RuleKind::DomainSuffix => "DomainSuffix",
+            RuleKind::DomainKeyword => "DomainKeyword",
+            RuleKind::DomainRegex => "DomainRegex",
+            RuleKind::DomainWildcard => "DomainWildcard",
+            RuleKind::IpCidr => "IPCIDR",
+            RuleKind::IpSuffix => "IPSuffix",
+            RuleKind::GeoIp => "GeoIP",
+            RuleKind::GeoSite => "GeoSite",
+            RuleKind::DstPort => "DstPort",
+            RuleKind::RuleSet => "RuleSet",
+            RuleKind::Match => "Match",
+        }
+    }
+
     pub fn parse(line: &str) -> Option<Self> {
         let raw = line.trim().to_string();
         if raw.is_empty() || raw.starts_with('#') {

@@ -24,6 +24,24 @@ use crate::rules::RuleSet;
 
 use connection::{ConnectionTracker, Network};
 
+/// The matched rule is distinct from its outbound policy/group.
+#[derive(Debug, Clone)]
+pub struct RouteDecision {
+    pub target: String,
+    pub rule: String,
+    pub payload: String,
+}
+
+impl RouteDecision {
+    pub fn chains(&self, final_name: &str) -> Vec<String> {
+        if final_name == self.target {
+            vec![final_name.to_string()]
+        } else {
+            vec![final_name.to_string(), self.target.clone()]
+        }
+    }
+}
+
 /// AsyncWrite wrapper that feeds bytes moved through it into the traffic counters.
 struct CountingWriter<W> {
     inner: W,
@@ -145,6 +163,8 @@ impl Engine {
         }
 
         let mode = RwLock::new(config.mode.clone());
+        log(format!("engine: TCP sniffer enable={} parse-pure-ip={} override-destination={} protocols={:?}; QUIC sniffing unsupported",
+            config.sniffer.enable, config.sniffer.parse_pure_ip, config.sniffer.override_destination, config.sniffer.sniff));
         log(format!("engine: loading geo ({:?})", t0.elapsed()));
         // mihomo keeps GeoX files in the core home dir, which may differ from
         // the config file's parent. Search both so GEOIP/GEOSITE rules work.
@@ -183,17 +203,26 @@ impl Engine {
 
     /// Choose a rule target based on the active mode and the rule set.
     pub async fn decide(&self, target: &TargetAddr) -> String {
+        self.decide_route(target, None).await.target
+    }
+
+    pub async fn decide_route(&self, target: &TargetAddr, original_ip: Option<std::net::IpAddr>) -> RouteDecision {
         let mode = self.mode.read().await.clone();
         match mode.as_str() {
-            "direct" => "DIRECT".to_string(),
-            "global" => "GLOBAL".to_string(),
+            "direct" => RouteDecision { target: "DIRECT".into(), rule: String::new(), payload: String::new() },
+            "global" => RouteDecision { target: "GLOBAL".into(), rule: String::new(), payload: String::new() },
             _ => {
-                let resolved = match target {
-                    TargetAddr::Domain(h, _) => self.resolver.resolve_first(h).await.ok(),
-                    TargetAddr::Ip(ip, _) => Some(*ip),
+                let resolved = match (original_ip, target) {
+                    (Some(ip), _) => Some(ip),
+                    (_, TargetAddr::Domain(h, _)) => self.resolver.resolve_first(h).await.ok(),
+                    (_, TargetAddr::Ip(ip, _)) => Some(*ip),
                 };
                 match self.rules.find(target, resolved, Some(&self.geo), Some(&self.providers)) {
-                    Some(rule) => rule.target.clone(),
+                    Some(rule) => RouteDecision {
+                        target: rule.target.clone(),
+                        rule: rule.type_name().to_string(),
+                        payload: rule.value.clone(),
+                    },
                     None => {
                         // No rule matched (e.g. GEOIP/GEOSITE with empty geo data,
                         // or RULE-SET with no provider). Say why instead of
@@ -206,7 +235,7 @@ impl Engine {
                                 target.address(), self.geo.geoip.len(), self.geo.geosite.len(), self.providers.len()
                             ));
                         }
-                        "DIRECT".to_string()
+                        RouteDecision { target: "DIRECT".into(), rule: String::new(), payload: String::new() }
                     }
                 }
             }
@@ -250,20 +279,20 @@ impl Engine {
     pub async fn dial_udp(
         &self,
         target: &TargetAddr,
-    ) -> io::Result<(Box<dyn crate::adapter::PacketConn>, String, String)> {
-        let rule_target = self.decide(target).await;
-        let final_name = self.outbounds.resolve(&rule_target).await;
+    ) -> io::Result<(Box<dyn crate::adapter::PacketConn>, RouteDecision, String)> {
+        let route = self.decide_route(target, None).await;
+        let final_name = self.outbounds.resolve(&route.target).await;
         dial_diag(format!(
             "dial_udp {} -> rule={} outbound={}",
             target.address(),
-            rule_target,
+            route.target,
             final_name
         ));
         let outbound = self.outbounds.outbound(&final_name).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("unknown outbound '{}'", final_name))
         })?;
         match outbound.connect_udp(target).await {
-            Ok(conn) => Ok((conn, rule_target, final_name)),
+            Ok(conn) => Ok((conn, route, final_name)),
             Err(e) => {
                 dial_diag(format!(
                     "dial_udp {} via {} FAILED: {}",
@@ -288,7 +317,8 @@ impl Engine {
     /// Drive a single inbound connection to completion. `prefix` carries bytes
     /// already consumed from the inbound during handshakes (e.g. an HTTP head).
     pub async fn handle(&self, target: TargetAddr, inbound: TcpStream, prefix: &[u8]) -> io::Result<()> {
-        let rule_target = self.decide(&target).await;
+        let route = self.decide_route(&target, None).await;
+        let rule_target = route.target.clone();
         let final_name = self.outbounds.resolve(&rule_target).await;
 
         tracing::info!(
@@ -303,7 +333,7 @@ impl Engine {
             .ok()
             .map(|addr| (addr.ip().to_string(), addr.port()));
         let (connection, up_counter, down_counter) = self.connections
-            .add(&target, &rule_target, "", vec![final_name.clone(), rule_target.clone()], Network::Tcp, source)
+            .add(&target, &route.rule, &route.payload, route.chains(&final_name), Network::Tcp, source, None)
             .await;
 
         let outbound = self.outbounds.outbound(&final_name);

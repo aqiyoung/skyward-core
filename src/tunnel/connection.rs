@@ -157,15 +157,19 @@ impl ConnectionTracker {
         chain: Vec<String>,
         network: Network,
         source: Option<(String, u16)>,
+        original_ip: Option<std::net::IpAddr>,
     ) -> (ConnectionLease, Arc<AtomicU64>, Arc<AtomicU64>) {
         let id = format!("{:032x}", rand::random::<u128>());
         let cancel = Arc::new(Notify::new());
         let upload = Arc::new(AtomicU64::new(0));
         let download = Arc::new(AtomicU64::new(0));
-        let (host, destination_ip) = match target {
+        let (host, mut destination_ip) = match target {
             TargetAddr::Domain(h, _) => (h.clone(), String::new()),
-            TargetAddr::Ip(ip, _) => (ip.to_string(), ip.to_string()),
+            TargetAddr::Ip(ip, _) => (String::new(), ip.to_string()),
         };
+        if let Some(ip) = original_ip {
+            destination_ip = ip.to_string();
+        }
         let (source_ip, source_port) = match source {
             Some((ip, port)) => (ip, port.to_string()),
             None => (String::new(), String::new()),
@@ -311,10 +315,29 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn raw_ip_has_no_invented_host_and_sniffed_host_keeps_original_ip() {
+        let tracker = Arc::new(ConnectionTracker::new());
+        let ip = "203.0.113.42".parse::<std::net::IpAddr>().unwrap();
+        let (raw, _, _) = tracker.add(&TargetAddr::Ip(ip, 443), "Match", "", vec!["DIRECT".into()], Network::Tcp, None, Some(ip)).await;
+        let items = tracker.snapshot().await;
+        assert_eq!(items[0].metadata.host, "");
+        assert_eq!(items[0].metadata.destination_ip, ip.to_string());
+        drop(raw);
+        let (_sniffed, _, _) = tracker.add(&TargetAddr::Domain("service.test".into(), 443), "Domain", "service.test",
+            vec!["DIRECT".into()], Network::Tcp, None, Some(ip)).await;
+        let items = tracker.snapshot().await;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].metadata.host, "service.test");
+        assert_eq!(items[0].metadata.destination_ip, ip.to_string());
+        assert_eq!(items[0].rule, "Domain");
+        assert_eq!(items[0].rule_payload, "service.test");
+    }
+
+    #[tokio::test]
     async fn tracks_connection_lifecycle() {
         let tracker = Arc::new(ConnectionTracker::new());
         let target = TargetAddr::Domain("example.com".into(), 443);
-        let (id, up, down) = tracker.add(&target, "MATCH", "", vec!["DIRECT".into()], Network::Tcp, None).await;
+        let (id, up, down) = tracker.add(&target, "MATCH", "", vec!["DIRECT".into()], Network::Tcp, None, None).await;
         up.store(12, Ordering::Relaxed);
         down.store(34, Ordering::Relaxed);
         let snapshot = tracker.snapshot().await;
@@ -337,7 +360,7 @@ mod tests {
     async fn request_event_carries_tracker_info() {
         let tracker = Arc::new(ConnectionTracker::new());
         let target = TargetAddr::Domain("example.com".into(), 443);
-        let (id, _, _) = tracker.add(&target, "MATCH", "", vec!["DIRECT".into()], Network::Tcp, None).await;
+        let (id, _, _) = tracker.add(&target, "MATCH", "", vec!["DIRECT".into()], Network::Tcp, None, None).await;
         let snapshot = tracker.snapshot().await;
         let event: serde_json::Value =
             serde_json::from_str(&request_event_json(&snapshot[0])).unwrap();
