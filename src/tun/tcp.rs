@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -49,9 +49,9 @@ fn diag(message: String) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FlowKey {
-    pub client_ip: Ipv4Addr,
+    pub client_ip: IpAddr,
     pub client_port: u16,
-    pub target_ip: Ipv4Addr,
+    pub target_ip: IpAddr,
     pub target_port: u16,
 }
 
@@ -129,15 +129,25 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
 
     /// Handle one raw IPv4 packet read from the TUN.
     pub fn handle_packet(&mut self, packet: &[u8]) {
-        let Some(ip) = parse_ipv4(packet) else { return };
-        if ip.proto != 6 {
+        let (proto, ihl, client_ip, target_ip) = match packet.first().map(|b| b >> 4) {
+            Some(4) => {
+                let Some(ip) = parse_ipv4(packet) else { return };
+                (ip.proto, ip.ihl, ip.src.into(), ip.dst.into())
+            }
+            Some(6) => {
+                let Some(ip) = parse_ipv6(packet) else { return };
+                (ip.proto, ip.ihl, IpAddr::V6(ip.src), IpAddr::V6(ip.dst))
+            }
+            _ => return,
+        };
+        if proto != 6 {
             return;
         }
-        let Some(tcp) = parse_tcp(packet, ip.ihl) else { return };
+        let Some(tcp) = parse_tcp(packet, ihl) else { return };
         let key = FlowKey {
-            client_ip: ip.src,
+            client_ip,
             client_port: tcp.src_port,
-            target_ip: ip.dst,
+            target_ip,
             target_port: tcp.dst_port,
         };
 
@@ -220,7 +230,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                 }
             }
 
-            let payload = tcp.payload(packet, ip.ihl);
+            let payload = tcp.payload(packet, ihl);
             let mut act = Act::None;
 
             if flow.fin_sent {
@@ -457,10 +467,14 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
         let io = self.io.clone();
         // If the destination is a fake-ip we handed out in DNS, recover the
         // original hostname so rules match by domain and proxies receive the
-        // real host instead of a synthetic address.
-        let target = match crate::fake_ip::hostname_for(key.target_ip) {
-            Some(host) => TargetAddr::Domain(host, key.target_port),
-            None => TargetAddr::Ip(std::net::IpAddr::V4(key.target_ip), key.target_port),
+        // real host instead of a synthetic address. Fake IPs are v4 for now;
+        // v6 destinations route by address.
+        let target = match key.target_ip {
+            IpAddr::V4(v4) => match crate::fake_ip::hostname_for(v4) {
+                Some(host) => TargetAddr::Domain(host, key.target_port),
+                None => TargetAddr::Ip(IpAddr::V4(v4), key.target_port),
+            },
+            IpAddr::V6(v6) => TargetAddr::Ip(IpAddr::V6(v6), key.target_port),
         };
         let mut tasks = self.tasks.lock().unwrap();
         while tasks.try_join_next().is_some() {}
@@ -672,12 +686,11 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
     }
 }
 
-/// Build the dial target directly from the parsed flow key. The target IP is
-/// already an `Ipv4Addr` from the packet; never round-trip through an
-/// `"ip:port"` string parsed as `IpAddr` (that always failed and dropped every
-/// TUN connection).
+/// Build the dial target directly from the parsed flow key. Never round-trip
+/// through an `"ip:port"` string (that always failed and dropped every TUN
+/// connection).
 fn key_target_addr(key: &FlowKey) -> TargetAddr {
-    TargetAddr::Ip(std::net::IpAddr::V4(key.target_ip), key.target_port)
+    TargetAddr::Ip(key.target_ip, key.target_port)
 }
 
 pub(crate) struct Ipv4Info {
@@ -700,6 +713,57 @@ pub(crate) fn parse_ipv4(packet: &[u8]) -> Option<Ipv4Info> {
         dst: Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]),
         proto: packet[9],
         ihl,
+    })
+}
+
+pub(crate) struct Ipv6Info {
+    pub src: Ipv6Addr,
+    pub dst: Ipv6Addr,
+    pub proto: u8,
+    /// Offset of the transport header (fixed header plus extension headers).
+    pub ihl: usize,
+}
+
+/// Parse an IPv6 packet, walking the extension-header chain (hop-by-hop,
+/// routing, destination options, fragment, AH) to find the transport protocol.
+pub(crate) fn parse_ipv6(packet: &[u8]) -> Option<Ipv6Info> {
+    if packet.len() < 40 || packet[0] >> 4 != 6 {
+        return None;
+    }
+    let payload_len = u16::from_be_bytes([packet[4], packet[5]]) as usize;
+    let end = (40 + payload_len).min(packet.len());
+    let mut next_header = packet[6];
+    let mut offset = 40usize;
+    while offset < end {
+        let length = match next_header {
+            // These carry their length in 8-byte units, minus the first one.
+            0 | 43 | 60 => match packet.get(offset + 1) {
+                Some(len) => (*len as usize + 1) * 8,
+                None => return None,
+            },
+            // AH counts 32-bit words, minus the first two.
+            51 => match packet.get(offset + 1) {
+                Some(len) => (*len as usize + 2) * 4,
+                None => return None,
+            },
+            44 => 8, // fragment
+            _ => break,
+        };
+        if length == 0 || packet.len() < offset + length {
+            return None;
+        }
+        next_header = packet[offset];
+        offset += length;
+    }
+    let mut src = [0u8; 16];
+    let mut dst = [0u8; 16];
+    src.copy_from_slice(&packet[8..24]);
+    dst.copy_from_slice(&packet[24..40]);
+    Some(Ipv6Info {
+        src: Ipv6Addr::from(src),
+        dst: Ipv6Addr::from(dst),
+        proto: next_header,
+        ihl: offset,
     })
 }
 
@@ -739,10 +803,10 @@ fn parse_tcp(packet: &[u8], ihl: usize) -> Option<TcpHeader> {
     })
 }
 
-/// Build a complete IPv4/TCP packet with valid checksums.
+/// Build a complete TCP packet with valid checksums over IPv4 or IPv6.
 fn build_packet(
-    src: Ipv4Addr,
-    dst: Ipv4Addr,
+    src: impl Into<IpAddr>,
+    dst: impl Into<IpAddr>,
     src_port: u16,
     dst_port: u16,
     seq: u32,
@@ -753,12 +817,12 @@ fn build_packet(
     build_packet_opts(src, dst, src_port, dst_port, seq, ack, flags, &[], payload)
 }
 
-/// Build an IPv4/TCP packet with TCP options (already padded to a multiple
-/// of 4 bytes), e.g. the MSS option on a SYN-ACK.
+/// Build a TCP packet with TCP options (already padded to a multiple of 4
+/// bytes), e.g. the MSS option on a SYN-ACK.
 #[allow(clippy::too_many_arguments)]
 fn build_packet_opts(
-    src: Ipv4Addr,
-    dst: Ipv4Addr,
+    src: impl Into<IpAddr>,
+    dst: impl Into<IpAddr>,
     src_port: u16,
     dst_port: u16,
     seq: u32,
@@ -767,19 +831,8 @@ fn build_packet_opts(
     options: &[u8],
     payload: &[u8],
 ) -> Vec<u8> {
+    let (src, dst) = (src.into(), dst.into());
     let header_len = 20 + options.len();
-    let mut ip = [0u8; 20];
-    let total_len = 20 + header_len + payload.len();
-    ip[0] = 0x45;
-    ip[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-    ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
-    ip[8] = 64;
-    ip[9] = 6;
-    ip[12..16].copy_from_slice(&src.octets());
-    ip[16..20].copy_from_slice(&dst.octets());
-    let ip_checksum = checksum(&ip);
-    ip[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
-
     let mut tcp = vec![0u8; header_len + payload.len()];
     tcp[0..2].copy_from_slice(&src_port.to_be_bytes());
     tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
@@ -791,63 +844,132 @@ fn build_packet_opts(
     tcp[20..20 + options.len()].copy_from_slice(options);
     tcp[header_len..].copy_from_slice(payload);
 
-    let mut pseudo = Vec::with_capacity(12 + tcp.len());
-    pseudo.extend_from_slice(&src.octets());
-    pseudo.extend_from_slice(&dst.octets());
-    pseudo.push(0);
-    pseudo.push(6);
-    pseudo.extend_from_slice(&(tcp.len() as u16).to_be_bytes());
-    pseudo.extend_from_slice(&tcp);
-    let tcp_checksum = checksum(&pseudo);
-    tcp[16..18].copy_from_slice(&tcp_checksum.to_be_bytes());
+    match (src, dst) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            let mut ip = [0u8; 20];
+            let total_len = 20 + tcp.len();
+            ip[0] = 0x45;
+            ip[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+            ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
+            ip[8] = 64;
+            ip[9] = 6;
+            ip[12..16].copy_from_slice(&src.octets());
+            ip[16..20].copy_from_slice(&dst.octets());
+            let ip_checksum = checksum(&ip);
+            ip[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
 
-    let mut out = Vec::with_capacity(total_len);
-    out.extend_from_slice(&ip);
-    out.extend_from_slice(&tcp);
-    out
+            let mut pseudo = Vec::with_capacity(12 + tcp.len());
+            pseudo.extend_from_slice(&src.octets());
+            pseudo.extend_from_slice(&dst.octets());
+            pseudo.push(0);
+            pseudo.push(6);
+            pseudo.extend_from_slice(&(tcp.len() as u16).to_be_bytes());
+            pseudo.extend_from_slice(&tcp);
+            let tcp_checksum = checksum(&pseudo);
+            tcp[16..18].copy_from_slice(&tcp_checksum.to_be_bytes());
+
+            let mut out = Vec::with_capacity(total_len);
+            out.extend_from_slice(&ip);
+            out.extend_from_slice(&tcp);
+            out
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            let mut ip = [0u8; 40];
+            ip[0] = 0x60;
+            ip[4..6].copy_from_slice(&(tcp.len() as u16).to_be_bytes());
+            ip[6] = 6; // TCP
+            ip[7] = 64;
+            ip[8..24].copy_from_slice(&src.octets());
+            ip[24..40].copy_from_slice(&dst.octets());
+
+            let mut pseudo = Vec::with_capacity(40 + tcp.len());
+            pseudo.extend_from_slice(&src.octets());
+            pseudo.extend_from_slice(&dst.octets());
+            pseudo.extend_from_slice(&(tcp.len() as u32).to_be_bytes());
+            pseudo.extend_from_slice(&[0, 0, 0, 6]);
+            pseudo.extend_from_slice(&tcp);
+            let tcp_checksum = checksum(&pseudo);
+            tcp[16..18].copy_from_slice(&tcp_checksum.to_be_bytes());
+
+            let mut out = Vec::with_capacity(40 + tcp.len());
+            out.extend_from_slice(&ip);
+            out.extend_from_slice(&tcp);
+            out
+        }
+        _ => Vec::new(), // a flow never mixes families
+    }
 }
 
-/// Build an IPv4/UDP packet with valid checksums.
+/// Build a UDP packet with valid checksums over IPv4 or IPv6.
 pub(crate) fn build_udp_packet(
-    src: Ipv4Addr,
-    dst: Ipv4Addr,
+    src: impl Into<IpAddr>,
+    dst: impl Into<IpAddr>,
     src_port: u16,
     dst_port: u16,
     payload: &[u8],
 ) -> Vec<u8> {
-    let mut ip = [0u8; 20];
+    let (src, dst) = (src.into(), dst.into());
     let udp_len = 8 + payload.len();
-    let total_len = 20 + udp_len;
-    ip[0] = 0x45;
-    ip[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-    ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
-    ip[8] = 64;
-    ip[9] = 17;
-    ip[12..16].copy_from_slice(&src.octets());
-    ip[16..20].copy_from_slice(&dst.octets());
-    let ip_checksum = checksum(&ip);
-    ip[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
-
     let mut udp = vec![0u8; udp_len];
     udp[0..2].copy_from_slice(&src_port.to_be_bytes());
     udp[2..4].copy_from_slice(&dst_port.to_be_bytes());
     udp[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
     udp[8..].copy_from_slice(payload);
 
-    let mut pseudo = Vec::with_capacity(12 + udp.len());
-    pseudo.extend_from_slice(&src.octets());
-    pseudo.extend_from_slice(&dst.octets());
-    pseudo.push(0);
-    pseudo.push(17);
-    pseudo.extend_from_slice(&(udp_len as u16).to_be_bytes());
-    pseudo.extend_from_slice(&udp);
-    let udp_checksum = checksum(&pseudo);
-    udp[6..8].copy_from_slice(&udp_checksum.to_be_bytes());
+    match (src, dst) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            let mut ip = [0u8; 20];
+            let total_len = 20 + udp_len;
+            ip[0] = 0x45;
+            ip[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+            ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+            ip[8] = 64;
+            ip[9] = 17;
+            ip[12..16].copy_from_slice(&src.octets());
+            ip[16..20].copy_from_slice(&dst.octets());
+            let ip_checksum = checksum(&ip);
+            ip[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
 
-    let mut out = Vec::with_capacity(total_len);
-    out.extend_from_slice(&ip);
-    out.extend_from_slice(&udp);
-    out
+            let mut pseudo = Vec::with_capacity(12 + udp.len());
+            pseudo.extend_from_slice(&src.octets());
+            pseudo.extend_from_slice(&dst.octets());
+            pseudo.push(0);
+            pseudo.push(17);
+            pseudo.extend_from_slice(&(udp_len as u16).to_be_bytes());
+            pseudo.extend_from_slice(&udp);
+            let udp_checksum = checksum(&pseudo);
+            udp[6..8].copy_from_slice(&udp_checksum.to_be_bytes());
+
+            let mut out = Vec::with_capacity(total_len);
+            out.extend_from_slice(&ip);
+            out.extend_from_slice(&udp);
+            out
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            let mut ip = [0u8; 40];
+            ip[0] = 0x60;
+            ip[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+            ip[6] = 17; // UDP
+            ip[7] = 64;
+            ip[8..24].copy_from_slice(&src.octets());
+            ip[24..40].copy_from_slice(&dst.octets());
+
+            let mut pseudo = Vec::with_capacity(40 + udp.len());
+            pseudo.extend_from_slice(&src.octets());
+            pseudo.extend_from_slice(&dst.octets());
+            pseudo.extend_from_slice(&(udp_len as u32).to_be_bytes());
+            pseudo.extend_from_slice(&[0, 0, 0, 17]);
+            pseudo.extend_from_slice(&udp);
+            let udp_checksum = checksum(&pseudo);
+            udp[6..8].copy_from_slice(&udp_checksum.to_be_bytes());
+
+            let mut out = Vec::with_capacity(40 + udp.len());
+            out.extend_from_slice(&ip);
+            out.extend_from_slice(&udp);
+            out
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Build an ICMP destination/port-unreachable packet answering `original`
@@ -915,9 +1037,9 @@ mod tests {
     #[test]
     fn flow_key_builds_a_valid_dial_target() {
         let key = FlowKey {
-            client_ip: Ipv4Addr::new(198, 18, 0, 1),
+            client_ip: Ipv4Addr::new(198, 18, 0, 1).into(),
             client_port: 40000,
-            target_ip: Ipv4Addr::new(91, 108, 56, 150),
+            target_ip: Ipv4Addr::new(91, 108, 56, 150).into(),
             target_port: 443,
         };
         let target = key_target_addr(&key);
@@ -958,8 +1080,8 @@ mod tests {
     }
 
     fn client_packet(
-        client: Ipv4Addr,
-        target: Ipv4Addr,
+        client: impl Into<IpAddr>,
+        target: impl Into<IpAddr>,
         cport: u16,
         tport: u16,
         seq: u32,
@@ -986,6 +1108,7 @@ mod tests {
     /// Exercise SYN/ACK, fragmented application bytes, routing, proxy CONNECT,
     /// unchanged relay bytes and the exact metadata emitted to the App.
     async fn assert_sniffed_tun_flow(
+        client_ip: IpAddr, target_ip: IpAddr,
         payload: Vec<u8>, enabled: bool, extra: &str, rules: &str,
         expected_connect: &str, expected_host: &str, expected_rule: &str, expected_payload: &str,
     ) {
@@ -1055,8 +1178,8 @@ rules:
         crate::runtime_state::set_engine(engine.clone()).await;
         let io = Arc::new(Mutex::new(TestIo { out: Vec::new() }));
         let mut tcp = TcpManager::new(engine.clone(), io.clone());
-        let client = Ipv4Addr::new(10, 0, 0, 2);
-        let target = Ipv4Addr::new(203, 0, 113, 42);
+        let client = client_ip;
+        let target = target_ip;
         tcp.handle_packet(&client_packet(client, target, 40000, 443, 1000, 0, SYN, &[]));
         let isn = parse_tcp(&io.lock().unwrap().out, 20).unwrap().seq;
         tcp.handle_packet(&client_packet(client, target, 40000, 443, 1001, isn.wrapping_add(1), ACK, &[]));
@@ -1088,8 +1211,8 @@ rules:
             }
         }).await.expect("connection should exist");
         assert_eq!(entry.metadata.host, expected_host);
-        assert_eq!(entry.metadata.destination_ip, "203.0.113.42");
-        assert_eq!(entry.metadata.source_ip, "10.0.0.2");
+        assert_eq!(entry.metadata.destination_ip, target_ip.to_string());
+        assert_eq!(entry.metadata.source_ip, client_ip.to_string());
         assert_eq!(entry.rule, expected_rule);
         assert_eq!(entry.rule_payload, expected_payload);
         assert_eq!(entry.chains, vec!["TEST-PROXY", "POLICY"]);
@@ -1150,25 +1273,62 @@ rules:
     }
     #[tokio::test]
     async fn tun_fragmented_tls_sni_matches_domain_instead_of_catch_all() {
-        assert_sniffed_tun_flow(super::super::sniff::test_client_hello("service.test", true), true, "",
+        assert_sniffed_tun_flow(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42)),
+            super::super::sniff::test_client_hello("service.test", true), true, "",
             "  - DOMAIN,service.test,POLICY\n  - MATCH,REJECT", "service.test:443", "service.test", "Domain", "service.test").await;
     }
 
     #[tokio::test]
+    async fn tun_fragmented_tls_sni_over_ipv6() {
+        assert_sniffed_tun_flow(
+            IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2)),
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 42)),
+            super::super::sniff::test_client_hello("service.test", true), true, "",
+            "  - DOMAIN,service.test,POLICY\n  - MATCH,REJECT",
+            "service.test:443", "service.test", "Domain", "service.test").await;
+    }
+
+    #[test]
+    fn ipv6_headers_parse_with_and_without_extension_headers() {
+        let client = Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 2);
+        let target = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 42);
+        let syn = build_packet(IpAddr::V6(client), IpAddr::V6(target), 40000, 443, 1000, 0, SYN, &[]);
+        let ip = parse_ipv6(&syn).expect("valid v6 packet");
+        assert_eq!((ip.src, ip.dst, ip.proto, ip.ihl), (client, target, 6, 40));
+
+        // One hop-by-hop extension header in front of TCP.
+        let mut ext = vec![0u8; 8];
+        ext[0] = 6; // next header: TCP
+        ext[1] = 0; // length: 1 unit of 8 bytes
+        let mut packet = vec![0u8; 40 + ext.len()];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(&(ext.len() as u16).to_be_bytes());
+        packet[6] = 0; // hop-by-hop first
+        packet[8..24].copy_from_slice(&client.octets());
+        packet[24..40].copy_from_slice(&target.octets());
+        packet[40..].copy_from_slice(&ext);
+        let ip = parse_ipv6(&packet).expect("extension headers walk to TCP");
+        assert_eq!((ip.proto, ip.ihl), (6, 48));
+    }
+
+    #[tokio::test]
     async fn tun_fragmented_http_host_matches_domain_and_preserves_payload() {
-        assert_sniffed_tun_flow(b"GET /path HTTP/1.1\r\nHost: service.test:443\r\n\r\nbody".to_vec(), true, "",
+        assert_sniffed_tun_flow(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42)),
+            b"GET /path HTTP/1.1\r\nHost: service.test:443\r\n\r\nbody".to_vec(), true, "",
             "  - DOMAIN-SUFFIX,service.test,POLICY\n  - MATCH,REJECT", "service.test:443", "service.test", "DomainSuffix", "service.test").await;
     }
 
     #[tokio::test]
     async fn tun_sniff_override_false_routes_by_domain_but_dials_original_ip() {
-        assert_sniffed_tun_flow(super::super::sniff::test_client_hello("service.test", false), true, "  override-destination: false",
+        assert_sniffed_tun_flow(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42)),
+            super::super::sniff::test_client_hello("service.test", false), true, "  override-destination: false",
             "  - DOMAIN,service.test,POLICY\n  - MATCH,REJECT", "203.0.113.42:443", "service.test", "Domain", "service.test").await;
     }
 
     #[tokio::test]
     async fn tun_sniffing_preserves_original_ip_rule_precedence() {
-        assert_sniffed_tun_flow(super::super::sniff::test_client_hello("service.test", false), true, "  override-destination: false",
+        assert_sniffed_tun_flow(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42)),
+            super::super::sniff::test_client_hello("service.test", false), true, "  override-destination: false",
             "  - IP-CIDR,203.0.113.0/24,POLICY,no-resolve\n  - DOMAIN,service.test,REJECT\n  - MATCH,REJECT",
             "203.0.113.42:443", "service.test", "IPCIDR", "203.0.113.0/24").await;
     }
@@ -1176,14 +1336,16 @@ rules:
     #[tokio::test]
     async fn tun_disabled_or_excluded_sniffing_keeps_real_catch_all_and_unknown_host() {
         for (enabled, extra) in [(false, ""), (true, "  skip-domain: ['+.test']"), (true, "  parse-pure-ip: false")] {
-            assert_sniffed_tun_flow(super::super::sniff::test_client_hello("service.test", false), enabled, extra,
+            assert_sniffed_tun_flow(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42)),
+                super::super::sniff::test_client_hello("service.test", false), enabled, extra,
                 "  - DOMAIN,service.test,REJECT\n  - MATCH,POLICY", "203.0.113.42:443", "", "Match", "").await;
         }
     }
 
     #[tokio::test]
     async fn tun_non_http_tls_traffic_legitimately_matches_catch_all() {
-        assert_sniffed_tun_flow(b"SSH-2.0-test\r\n".to_vec(), true, "",
+        assert_sniffed_tun_flow(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42)),
+            b"SSH-2.0-test\r\n".to_vec(), true, "",
             "  - DOMAIN,service.test,REJECT\n  - MATCH,POLICY", "203.0.113.42:443", "", "Match", "").await;
     }
 
@@ -1210,8 +1372,8 @@ rules:
             crate::runtime_state::set_engine(engine.clone()).await;
             let io = Arc::new(Mutex::new(TestIo { out: Vec::new() }));
             let mut tcp = TcpManager::new(engine.clone(), io);
-            let key = FlowKey { client_ip: Ipv4Addr::new(10, 0, 0, 2), client_port: 40000,
-                target_ip: Ipv4Addr::new(203, 0, 113, 42), target_port: 443 };
+            let key = FlowKey { client_ip: Ipv4Addr::new(10, 0, 0, 2).into(), client_port: 40000,
+                target_ip: Ipv4Addr::new(203, 0, 113, 42).into(), target_port: 443 };
             tcp.handle_packet(&client_packet(key.client_ip, key.target_ip, key.client_port, key.target_port, 1000, 0, SYN, &[]));
             let done = tcp.flows.get(&key).unwrap().done.clone();
             for _ in 0..4 { tokio::task::yield_now().await; }

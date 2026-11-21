@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -46,9 +46,9 @@ fn account(engine: &Engine, final_name: &str, bytes: u64, upload: bool) {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct SessionKey {
-    src: Ipv4Addr,
+    src: IpAddr,
     src_port: u16,
-    dst: Ipv4Addr,
+    dst: IpAddr,
     dst_port: u16,
 }
 
@@ -73,7 +73,7 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
     }
 
     /// Forward one outbound UDP payload from the TUN.
-    pub fn handle_packet(&self, src: Ipv4Addr, src_port: u16, dst: Ipv4Addr, dst_port: u16, payload: &[u8]) {
+    pub fn handle_packet(&self, src: IpAddr, src_port: u16, dst: IpAddr, dst_port: u16, payload: &[u8]) {
         let key = SessionKey { src, src_port, dst, dst_port };
         let sender = {
             let mut sessions = self.sessions.lock().unwrap();
@@ -101,9 +101,13 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
         while tasks.try_join_next().is_some() {}
         tasks.spawn(async move {
             let engine = crate::runtime_state::engine().await.unwrap_or(fallback_engine);
-            let target = match crate::fake_ip::hostname_for(key.dst) {
-                Some(host) => TargetAddr::Domain(host, key.dst_port),
-                None => TargetAddr::Ip(key.dst.into(), key.dst_port),
+            // Fake IPs are IPv4 for now; v6 destinations route by address.
+            let target = match key.dst {
+                IpAddr::V4(v4) => match crate::fake_ip::hostname_for(v4) {
+                    Some(host) => TargetAddr::Domain(host, key.dst_port),
+                    None => TargetAddr::Ip(IpAddr::V4(v4), key.dst_port),
+                },
+                IpAddr::V6(v6) => TargetAddr::Ip(IpAddr::V6(v6), key.dst_port),
             };
             let (conn, route, final_name) = match tokio::time::timeout(DIAL_TIMEOUT, engine.dial_udp(&target)).await {
                 Ok(Ok(dialed)) => dialed,
@@ -137,7 +141,7 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
                     route.chains(&final_name),
                     crate::tunnel::connection::Network::Udp,
                     Some((key.src.to_string(), key.src_port)),
-                    Some(key.dst.into()),
+                    Some(key.dst),
                 )
                 .await;
             let relay = async {
@@ -220,52 +224,50 @@ fn refuse<T: Write>(io: &Arc<Mutex<T>>, key: &SessionKey, payload_len: usize) {
     }
 }
 
-/// The refusal quotes a synthetic copy of the triggering datagram; the
-/// IPv4 and UDP headers are all the receiving stack matches on.
+/// The refusal quotes a synthetic copy of the triggering datagram; the IP
+/// and UDP headers are all the receiving stack matches on.
 fn refuse_packet(key: &SessionKey, payload_len: usize) -> Option<Vec<u8>> {
-    let mut original = vec![0u8; 28];
-    original[0] = 0x45;
-    original[2..4].copy_from_slice(&((28 + payload_len) as u16).to_be_bytes());
-    original[8] = 64;
-    original[9] = 17;
-    original[12..16].copy_from_slice(&key.src.octets());
-    original[16..20].copy_from_slice(&key.dst.octets());
-    original[20..22].copy_from_slice(&key.src_port.to_be_bytes());
-    original[22..24].copy_from_slice(&key.dst_port.to_be_bytes());
-    original[24..26].copy_from_slice(&((8 + payload_len) as u16).to_be_bytes());
-    crate::tun::tcp::build_icmp_port_unreachable(&original, 20)
+    match (key.src, key.dst) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            let mut original = vec![0u8; 28];
+            original[0] = 0x45;
+            original[2..4].copy_from_slice(&((28 + payload_len) as u16).to_be_bytes());
+            original[8] = 64;
+            original[9] = 17;
+            original[12..16].copy_from_slice(&src.octets());
+            original[16..20].copy_from_slice(&dst.octets());
+            original[20..22].copy_from_slice(&key.src_port.to_be_bytes());
+            original[22..24].copy_from_slice(&key.dst_port.to_be_bytes());
+            original[24..26].copy_from_slice(&((8 + payload_len) as u16).to_be_bytes());
+            crate::tun::tcp::build_icmp_port_unreachable(&original, 20)
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            let mut original = vec![0u8; 48];
+            original[0] = 0x60;
+            original[4..6].copy_from_slice(&((8 + payload_len) as u16).to_be_bytes());
+            original[6] = 17;
+            original[7] = 64;
+            original[8..24].copy_from_slice(&src.octets());
+            original[24..40].copy_from_slice(&dst.octets());
+            original[40..42].copy_from_slice(&key.src_port.to_be_bytes());
+            original[42..44].copy_from_slice(&key.dst_port.to_be_bytes());
+            original[44..46].copy_from_slice(&((8 + payload_len) as u16).to_be_bytes());
+            crate::tun::runtime::build_icmp6_unreachable(&original, 4)
+        }
+        _ => None,
+    }
 }
 
-/// Build a complete IPv4/UDP packet carrying `payload` from
-/// (src, src_port) to (dst, dst_port), with both checksums filled in.
+/// Build a complete UDP packet carrying `payload` from (src, src_port) to
+/// (dst, dst_port) over either address family.
 pub fn build_udp_reply(
-    src: Ipv4Addr,
+    src: IpAddr,
     src_port: u16,
-    dst: Ipv4Addr,
+    dst: IpAddr,
     dst_port: u16,
     payload: &[u8],
 ) -> Vec<u8> {
-    let udp_len = 8 + payload.len();
-    let total_len = 20 + udp_len;
-    let mut packet = vec![0u8; total_len];
-    packet[0] = 0x45; // version + IHL
-    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-    let id: u16 = rand::random();
-    packet[4..6].copy_from_slice(&id.to_be_bytes());
-    packet[8] = 64; // TTL
-    packet[9] = 17; // UDP
-    packet[12..16].copy_from_slice(&src.octets());
-    packet[16..20].copy_from_slice(&dst.octets());
-    let ip_sum = checksum(&packet[..20]);
-    packet[10..12].copy_from_slice(&ip_sum.to_be_bytes());
-
-    packet[20..22].copy_from_slice(&src_port.to_be_bytes());
-    packet[22..24].copy_from_slice(&dst_port.to_be_bytes());
-    packet[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
-    packet[28..].copy_from_slice(payload);
-    let udp_sum = checksum_udp(src, dst, &packet[20..]);
-    packet[26..28].copy_from_slice(&(if udp_sum == 0 { 0xffff } else { udp_sum }).to_be_bytes());
-    packet
+    crate::tun::tcp::build_udp_packet(src, dst, src_port, dst_port, payload)
 }
 
 fn checksum(data: &[u8]) -> u16 {
@@ -314,6 +316,31 @@ mod tests {
             0
         );
         assert_eq!(&packet[28..], b"hello");
+    }
+
+    #[test]
+    fn udp_reply_and_refusal_exist_for_both_families() {
+        let v6 = build_udp_reply(
+            "fd00::1".parse().unwrap(),
+            53,
+            "2001:db8::1".parse().unwrap(),
+            443,
+            b"abc",
+        );
+        assert_eq!(v6[0], 0x60);
+        assert_eq!(super::super::tcp::parse_ipv6(&v6).unwrap().proto, 17);
+
+        let key = SessionKey {
+            src: "fd00::1".parse().unwrap(),
+            src_port: 53210,
+            dst: "2001:db8::9".parse().unwrap(),
+            dst_port: 443,
+        };
+        let packet = refuse_packet(&key, 1200).unwrap();
+        assert_eq!(packet[0], 0x60);
+        assert_eq!(packet[6], 58); // next header: ICMPv6
+        assert_eq!(packet[40], 1); // destination unreachable
+        assert_eq!(packet[41], 4); // port unreachable
     }
 
     #[test]

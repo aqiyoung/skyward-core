@@ -102,11 +102,19 @@ impl Default for SessionManager {
 
 fn endpoint_to_target(endpoint: smoltcp::wire::IpEndpoint) -> TargetAddr {
     let port = endpoint.port;
-    // Only IPv4 is enabled (proto-ipv6 feature is off).
-    let IpAddress::Ipv4(v4) = endpoint.addr;
-    let mut octets = [0u8; 4];
-    octets.copy_from_slice(v4.as_bytes());
-    TargetAddr::Ip(std::net::IpAddr::V4(std::net::Ipv4Addr::from(octets)), port)
+    let addr = match endpoint.addr {
+        IpAddress::Ipv4(v4) => {
+            let mut octets = [0u8; 4];
+            octets.copy_from_slice(v4.as_bytes());
+            std::net::IpAddr::V4(std::net::Ipv4Addr::from(octets))
+        }
+        IpAddress::Ipv6(v6) => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(v6.as_bytes());
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets))
+        }
+    };
+    TargetAddr::Ip(addr, port)
 }
 
 /// A byte queue shared between the synchronous poll thread and an async task.
