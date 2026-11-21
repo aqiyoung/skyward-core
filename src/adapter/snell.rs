@@ -351,7 +351,7 @@ impl Outbound for SnellOutbound {
         }
         let tcp = tcp.ok_or_else(|| last_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no Snell server address")))?;
 
-        let base: BoxedStream = if self.use_tls {
+        let mut base: BoxedStream = if self.use_tls {
             connect_tls(&self.sni, tcp, self.verify).await?
         } else {
             Box::new(tcp)
@@ -1950,7 +1950,8 @@ impl V6ShapedWriter {
             let payload_start = offset;
             let mut region = record[payload_start..payload_start + payload_cipher_length].to_vec();
             region[..payload.len()].copy_from_slice(payload);
-            let sealed = seal_aead(&self.aead, &self.nonce, &region[..payload.len()], record_padding(&record[padding_start..padding_start + padding_length]))?;
+            let sealed =
+                seal_aead_aad(&self.aead, &self.nonce, &region[..payload.len()], &record[padding_start..padding_start + padding_length])?;
             increment_nonce(&mut self.nonce);
             record[payload_start..payload_start + payload_cipher_length].copy_from_slice(&sealed);
             let (padding_part, payload_part) = record.split_at_mut(payload_start);
@@ -2174,7 +2175,7 @@ async fn read_v6_reply(reader: &mut dyn V6RecordReader, inner: &mut BoxedStream)
 
 async fn connect_v6(mut base: BoxedStream, psk: &[u8], mode: V6Mode, target: &TargetAddr) -> io::Result<BoxedStream> {
     let header = connect_command(target);
-    let (mut writer, reader): (Box<dyn V6RecordWriter>, Box<dyn V6RecordReader>) = match mode {
+    let (mut writer, mut reader): (Box<dyn V6RecordWriter>, Box<dyn V6RecordReader>) = match mode {
         V6Mode::UnsafeRaw => (Box::new(V6RawWriter), Box::new(V6RawReader)),
         V6Mode::Unshaped => {
             let w = V6UnshapedWriter::new(psk)?;
