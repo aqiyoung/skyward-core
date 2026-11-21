@@ -89,17 +89,7 @@ pub(super) async fn inspect(
         return None;
     }
     let mut budget = AttemptBudget { queue, overflow: AtomicBool::new(false) };
-    let mut sniff = Box::pin(sniff(&mut bytes, &mut budget, config, upload_closed, http, tls, start));
-    loop {
-        let Some(remaining) = DEADLINE.checked_sub(start.elapsed()) else {
-            return sniff.await;
-        };
-        tokio::select! {
-            biased;
-            result = &mut sniff => return result,
-            _ = tokio::time::sleep(remaining) => return sniff.await,
-        }
-    }
+    sniff(&mut bytes, &mut budget, config, upload_closed, http, tls, start).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -113,25 +103,6 @@ async fn sniff(
     start: std::time::Instant,
 ) -> Option<(String, bool)> {
     loop {
-        if bytes.is_empty() {
-            if !budget.can_send(bytes) {
-                return None;
-            }
-            let before = budget.queue.peek(LIMIT).len();
-            tokio::select! {
-                _ = budget.queue.notified() => {}
-                _ = tokio::time::sleep(DEADLINE) => {}
-            }
-            let after = budget.queue.peek(LIMIT);
-            if before == after.len() && !budget.queue.is_empty() {
-                bytes.extend_from_slice(&after);
-            } else {
-                *bytes = after;
-            }
-        }
-        if start.elapsed() >= DEADLINE {
-            return None;
-        }
         let (result, settings) = if bytes.first() == Some(&22) {
             (if tls.is_some() { tls_host(bytes) } else { Parsed::NotHost }, tls)
         } else if bytes.is_empty() {
@@ -151,22 +122,26 @@ async fn sniff(
             Parsed::NotHost => return None,
             Parsed::Retry | Parsed::Complete => {
                 budget.note_more(bytes, upload_closed);
-                if !budget.can_send(bytes) {
+                if !budget.can_send(bytes) || start.elapsed() >= DEADLINE {
                     return None;
                 }
-                *bytes = {
-                    let mut read = 0usize;
-                    let mut tail = [0u8; 256];
-                    while read < tail.len() {
-                        let n = budget.queue.pop(&mut tail[read..]);
-                        if n == 0 {
-                            break;
-                        }
-                        read += n;
+                // Wait for new bytes to arrive, or give up at the deadline.
+                // The prefix is re-peeked, never consumed: the relay still
+                // owns every byte.
+                let mut notified = Box::pin(budget.queue.notified());
+                tokio::select! {
+                    biased;
+                    _ = notified.as_mut() => {}
+                    _ = tokio::time::sleep(DEADLINE) => {}
+                }
+                let after = budget.queue.peek(LIMIT);
+                if after == *bytes {
+                    if start.elapsed() >= DEADLINE {
+                        return None;
                     }
-                    bytes.extend_from_slice(&tail[..read]);
-                    bytes.clone()
-                };
+                    continue;
+                }
+                *bytes = after;
             }
         }
     }
