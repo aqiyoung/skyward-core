@@ -289,6 +289,10 @@ fn finish_tun(rt: &tokio::runtime::Runtime, session: TunSession) {
     if let Err(error) = rt.block_on(session.task) {
         tracing::warn!(%error, "TUN task failed while stopping");
     }
+    // The relays are gone; persist the running totals now so a quick
+    // restart does not lose the last window (note_change flushes at most
+    // every five seconds).
+    crate::runtime_state::traffic().flush();
 }
 
 #[no_mangle]

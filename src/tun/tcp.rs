@@ -704,6 +704,11 @@ pub(crate) fn parse_ipv4(packet: &[u8]) -> Option<Ipv4Info> {
     if packet.len() < ihl {
         return None;
     }
+    // Drop non-first IPv4 fragments: only the first carries the transport
+    // header, and without reassembly the rest cannot be parsed.
+    if u16::from_be_bytes([packet[6], packet[7]]) & 0x1fff != 0 {
+        return None;
+    }
     Some(Ipv4Info {
         src: Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]),
         dst: Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]),
@@ -742,7 +747,19 @@ pub(crate) fn parse_ipv6(packet: &[u8]) -> Option<Ipv6Info> {
                 Some(len) => (*len as usize + 2) * 4,
                 None => return None,
             },
-            44 => 8, // fragment
+            44 => {
+                // Fragment header (RFC 8200 §4.5): only the first fragment
+                // (offset 0) carries the transport header right behind it.
+                // Later fragments are mid-stream: parsing the fragment
+                // payload as a transport header would misread random bytes,
+                // so reject them — the TUN loop does not reassemble, and
+                // guessing would create phantom flows or RSTs.
+                let frag = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]);
+                if frag & 0x1fff != 0 {
+                    return None;
+                }
+                8
+            }
             _ => break,
         };
         if length == 0 || packet.len() < offset + length {

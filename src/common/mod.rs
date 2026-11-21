@@ -122,11 +122,22 @@ impl TrafficStats {
                 self.download.store(down, Ordering::Relaxed);
                 self.proxy_upload.store(proxy_up, Ordering::Relaxed);
                 self.proxy_download.store(proxy_down, Ordering::Relaxed);
+            } else {
+                tracing::warn!(
+                    "unreadable {}: restarting totals at zero",
+                    path.display()
+                );
             }
         }
         if let Ok(mut slot) = self.persist.lock() {
             *slot = Some(PersistSlot { path, last_write: Instant::now() });
         }
+        self.write_now();
+    }
+
+    /// Flush the current totals to the persistence file now, so a kill
+    /// shortly after is less likely to lose the latest window.
+    pub fn flush(&self) {
         self.write_now();
     }
 
@@ -157,7 +168,16 @@ impl TrafficStats {
             self.proxy_upload.load(Ordering::Relaxed),
             self.proxy_download.load(Ordering::Relaxed)
         );
-        let _ = std::fs::write(path, body);
+        // Write to a sibling temp file and rename: a crash mid-write must
+        // not truncate the running total, and a corrupt file must be
+        // detectable and replaced, not silently read as zero.
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return;
+        };
+        let tmp = path.with_file_name(format!("{name}.tmp"));
+        if std::fs::write(&tmp, body.as_bytes()).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
     }
 
     pub fn snapshot(&self) -> TrafficSnapshot {

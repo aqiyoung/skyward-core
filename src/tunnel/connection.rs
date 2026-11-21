@@ -106,20 +106,19 @@ struct Entry {
 }
 
 pub struct ConnectionLease {
-    id: String,
+    entry: Arc<Entry>,
     tracker: Arc<ConnectionTracker>,
-    cancel: Arc<Notify>,
 }
 
 impl ConnectionLease {
     pub async fn closed(&self) {
-        self.cancel.notified().await;
+        self.entry.cancel.notified().await;
     }
 }
 
 impl Drop for ConnectionLease {
     fn drop(&mut self) {
-        self.tracker.forget(&self.id);
+        self.tracker.record_at_drop(&self.entry);
     }
 }
 
@@ -153,7 +152,7 @@ pub enum Network {
 
 #[derive(Default)]
 pub struct ConnectionTracker {
-    entries: RwLock<HashMap<String, Entry>>,
+    entries: RwLock<HashMap<String, Arc<Entry>>>,
     /// Last traffic totals reported to the App per connection id; the
     /// request-traffic watch diffs against this map.
     watch_reported: Mutex<HashMap<String, (u64, u64)>>,
@@ -220,11 +219,12 @@ impl ConnectionTracker {
             download: 0,
             start: iso8601(now_millis()),
         };
-        self.entries.write().unwrap().insert(id.clone(), Entry {
+        let entry = Arc::new(Entry {
             info: info.clone(),
             counters: Counters { upload: upload.clone(), download: download.clone() },
             cancel: cancel.clone(),
         });
+        self.entries.write().unwrap().insert(id.clone(), entry.clone());
         // The App's request list is event-fed (the Go core announces each
         // connection as it opens); without this event the list stays empty.
         crate::jni::emit_event_json(&request_event_json(&info));
@@ -233,7 +233,7 @@ impl ConnectionTracker {
             let tracker = self.clone();
             tokio::spawn(async move { tracker.run_traffic_watch().await });
         }
-        (ConnectionLease { id, tracker: self.clone(), cancel }, upload, download)
+        (ConnectionLease { entry, tracker: self.clone() }, upload, download)
     }
 
     /// One-second traffic reports for the App's request list, mirroring
@@ -313,12 +313,14 @@ impl ConnectionTracker {
         self.entries.read().unwrap().len()
     }
 
-    /// Remove an entry and keep its final accounting; returns it when the id
-    /// was live.
-    fn forget(&self, id: &str) -> Option<Entry> {
-        let entry = self.entries.write().unwrap().remove(id)?;
-        self.record_closed(&entry);
-        Some(entry)
+    /// Record the closed history for `entry`: drop it from the live map
+    /// (no-op when close()/close_all() already detached it) and append its
+    /// final accounting. Called by the lease's Drop — by then the flow has
+    /// finished every counter increment, so the summary matches the global
+    /// totals even when the App only drains it after the flow ended.
+    fn record_at_drop(&self, entry: &Entry) {
+        self.entries.write().unwrap().remove(&entry.info.id);
+        self.record_closed(entry);
     }
 
     /// Collect (and clear) the finished connections since the last call.
@@ -326,9 +328,10 @@ impl ConnectionTracker {
         self.closed.lock().unwrap().drain(..).collect()
     }
 
-    /// Close a connection by id. Returns false when it does not exist.
+    /// Close a connection by id. The lease records history when its flow
+    /// ends; returns false when the id was not live.
     pub async fn close(&self, id: &str) -> bool {
-        let entry = self.forget(id);
+        let entry = self.entries.write().unwrap().remove(id);
         if let Some(entry) = entry {
             entry.cancel.notify_one();
             true
@@ -338,16 +341,14 @@ impl ConnectionTracker {
     }
 
     pub async fn close_all(&self) -> usize {
-        let drained: Vec<Entry> = {
+        let drained: Vec<Arc<Entry>> = {
             let mut entries = self.entries.write().unwrap();
             entries.drain().map(|(_, entry)| entry).collect()
         };
-        let count = drained.len();
-        for entry in drained {
-            self.record_closed(&entry);
+        for entry in &drained {
             entry.cancel.notify_one();
         }
-        count
+        drained.len()
     }
 
     fn record_closed(&self, entry: &Entry) {

@@ -146,6 +146,10 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
                     "udp session {}:{} -> {} first send failed: {}",
                     key.src, key.src_port, target.address(), e
                 ));
+                // Drop the session entry we inserted in handle_packet: the
+                // task is gone, and a stale entry would swallow later
+                // datagrams into a dead channel.
+                sessions.lock().unwrap().remove(&key);
                 return;
             }
             up_counter.fetch_add(first_payload.len() as u64, Ordering::Relaxed);

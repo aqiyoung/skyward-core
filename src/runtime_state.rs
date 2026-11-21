@@ -35,7 +35,16 @@ pub async fn engine() -> Option<Arc<Engine>> {
 
 /// Build an engine from a config and install it as the active one.
 pub async fn apply_config(config: Config, config_path: PathBuf, data_dir: PathBuf) -> Arc<Engine> {
-    let engine = Arc::new(Engine::new(config, traffic(), &data_dir).await);
+    let old = ENGINE.read().await.clone();
+    let mut engine = Engine::new(config, traffic(), &data_dir).await;
+    if let Some(old) = old {
+        // Keep connection history across a profile switch: connections of
+        // the previous engine record their closed summaries into the
+        // tracker the App polls — the fresh tracker installed by
+        // Engine::new would orphan them.
+        engine.connections = old.connections.clone();
+    }
+    let engine = Arc::new(engine);
     // The dashboard's running total survives restarts; it is mirrored next to
     // the active profile.
     traffic().enable_persistence(data_dir.join("traffic.json"));

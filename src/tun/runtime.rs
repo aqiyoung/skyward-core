@@ -179,7 +179,7 @@ fn handle_ipv6_packet<T: Read + Write + Send + 'static>(
                 let mut dst6 = [0u8; 16];
                 src6.copy_from_slice(&packet[8..24]);
                 dst6.copy_from_slice(&packet[24..40]);
-                handle_dns_packet6(packet, src6, dst6, io);
+                handle_dns_packet6(packet, ip.ihl, src6, dst6, io);
             } else if let (Some(src_port), Some(dst_port)) = (src_port, dst_port) {
                 udp.handle_packet(src, src_port, dst, dst_port, payload);
             }
@@ -193,11 +193,12 @@ fn handle_ipv6_packet<T: Read + Write + Send + 'static>(
 /// building are reused as-is; only the carrying UDP/IPv6 packet differs.
 fn handle_dns_packet6<T: Read + Write + Send + 'static>(
     packet: &[u8],
+    ihl: usize,
     src: [u8; 16],
     dst: [u8; 16],
     io: &Arc<Mutex<T>>,
 ) {
-    let Some(udp) = packet.get(40..) else { return };
+    let Some(udp) = packet.get(ihl..) else { return };
     if udp.len() < 8 {
         return;
     }
