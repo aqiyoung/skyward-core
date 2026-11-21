@@ -2302,7 +2302,7 @@ mod v46_tests {
         let salt_block_len = profile.salt_block_len;
         assert_eq!(
             reader.profile.extract_salt(&out[pos..pos + salt_block_len]),
-            writer.salt,
+            salt,
             "salt block round trip"
         );
         pos += salt_block_len;
