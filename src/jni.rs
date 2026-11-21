@@ -168,10 +168,11 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_forceGC(
 
 #[no_mangle]
 pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_updateDns(
-    _env: JNIEnv,
+    mut env: JNIEnv,
     _class: JObject,
-    _dns: JString,
+    dns: JString,
 ) {
+    crate::dns::update_system_dns(&java_string(&mut env, &dns));
 }
 
 #[no_mangle]
@@ -179,6 +180,14 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_resetNetwork(
     _env: JNIEnv,
     _class: JObject,
 ) {
+    crate::dns::clear_caches();
+    if let Some(rt) = tokio_runtime() {
+        rt.spawn(async {
+            if let Some(engine) = crate::runtime_state::engine().await {
+                engine.close_connections().await;
+            }
+        });
+    }
 }
 
 #[no_mangle]
@@ -280,6 +289,10 @@ fn finish_tun(rt: &tokio::runtime::Runtime, session: TunSession) {
     if let Err(error) = rt.block_on(session.task) {
         tracing::warn!(%error, "TUN task failed while stopping");
     }
+    // The relays are gone; persist the running totals now so a quick
+    // restart does not lose the last window (note_change flushes at most
+    // every five seconds).
+    crate::runtime_state::traffic().flush();
 }
 
 #[no_mangle]
@@ -362,7 +375,7 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
 }
 
 fn traffic_json(total: bool) -> String {
-    serde_json::json!(crate::runtime_state::traffic_snapshot(total)).to_string()
+    serde_json::json!(crate::runtime_state::traffic_snapshot(total, false)).to_string()
 }
 
 #[no_mangle]

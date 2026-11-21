@@ -1,28 +1,183 @@
 //! Shared types and primitives used across the kernel.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Kernel version reported by the CLI and the REST API.
-pub const VERSION: &str = "0.1.0-alpha.1";
+/// Kernel version reported by the CLI and the REST API. Kept in step with the
+/// App release line the Rust core ships in.
+pub const VERSION: &str = "1.0.1.4";
+
+/// DIRECT and REJECT are the built-in non-proxy outbounds; every other name
+/// counts towards the App's proxy-only statistics.
+pub fn is_proxied_outbound(name: &str) -> bool {
+    !matches!(name, "DIRECT" | "REJECT")
+}
 
 /// Process-wide traffic counters.
 #[derive(Debug, Default)]
 pub struct TrafficStats {
     upload: AtomicU64,
     download: AtomicU64,
+    /// The same totals restricted to connections that left through a proxy
+    /// (the App's "only count proxy traffic" setting).
+    proxy_upload: AtomicU64,
+    proxy_download: AtomicU64,
     rate_sample: Mutex<Option<(Instant, TrafficSnapshot, TrafficSnapshot)>>,
+    proxy_rate_sample: Mutex<Option<(Instant, (u64, u64), (u64, u64))>>,
+    persist: Mutex<Option<PersistSlot>>,
 }
+
+#[derive(Debug)]
+struct PersistSlot {
+    path: PathBuf,
+    last_write: Instant,
+}
+
+/// Mirroring cadence. Tests shorten it so they do not have to sleep.
+const PERSIST_INTERVAL: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(5)
+};
 
 impl TrafficStats {
     pub fn add_upload(&self, bytes: u64) {
         self.upload.fetch_add(bytes, Ordering::Relaxed);
+        self.note_change();
     }
 
     pub fn add_download(&self, bytes: u64) {
         self.download.fetch_add(bytes, Ordering::Relaxed);
+        self.note_change();
+    }
+
+    /// Count proxy-only bytes alongside the totals; DIRECT and REJECT flows
+    /// never call these.
+    pub fn add_proxy_upload(&self, bytes: u64) {
+        self.proxy_upload.fetch_add(bytes, Ordering::Relaxed);
+        self.note_change();
+    }
+
+    pub fn add_proxy_download(&self, bytes: u64) {
+        self.proxy_download.fetch_add(bytes, Ordering::Relaxed);
+        self.note_change();
+    }
+
+    /// Zero the cumulative counters, as the App's "reset traffic" action does.
+    pub fn reset(&self) {
+        self.upload.store(0, Ordering::Relaxed);
+        self.download.store(0, Ordering::Relaxed);
+        self.proxy_upload.store(0, Ordering::Relaxed);
+        self.proxy_download.store(0, Ordering::Relaxed);
+        if let Ok(mut sample) = self.rate_sample.lock() {
+            *sample = None;
+        }
+        if let Ok(mut sample) = self.proxy_rate_sample.lock() {
+            *sample = None;
+        }
+        self.write_now();
+    }
+
+    pub fn snapshot_proxied(&self) -> TrafficSnapshot {
+        TrafficSnapshot {
+            up: self.proxy_upload.load(Ordering::Relaxed),
+            down: self.proxy_download.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn rate_proxied(&self) -> TrafficSnapshot {
+        self.rate_proxied_at(Instant::now())
+    }
+
+    fn rate_proxied_at(&self, now: Instant) -> TrafficSnapshot {
+        let mut sample = self.proxy_rate_sample.lock().unwrap();
+        let current = self.snapshot_proxied();
+        let (last_time, last, rate) = sample.get_or_insert((now, (current.up, current.down), (0, 0)));
+        let elapsed = now.saturating_duration_since(*last_time);
+        if elapsed >= Duration::from_secs(1) {
+            let per_second = |bytes: u64| (bytes as f64 / elapsed.as_secs_f64()) as u64;
+            *rate = (
+                per_second(current.up.saturating_sub(last.0)),
+                per_second(current.down.saturating_sub(last.1)),
+            );
+            *last_time = now;
+            *last = (current.up, current.down);
+        }
+        TrafficSnapshot { up: rate.0, down: rate.1 }
+    }
+
+    /// Restore the cumulative totals from `path` and mirror later changes back
+    /// to it, so a process restart does not lose the running total.
+    pub fn enable_persistence(&self, path: PathBuf) {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                let up = value.get("up").and_then(|v| v.as_u64()).unwrap_or(0);
+                let down = value.get("down").and_then(|v| v.as_u64()).unwrap_or(0);
+                let proxy_up = value.get("proxyUp").and_then(|v| v.as_u64()).unwrap_or(0);
+                let proxy_down = value.get("proxyDown").and_then(|v| v.as_u64()).unwrap_or(0);
+                self.upload.store(up, Ordering::Relaxed);
+                self.download.store(down, Ordering::Relaxed);
+                self.proxy_upload.store(proxy_up, Ordering::Relaxed);
+                self.proxy_download.store(proxy_down, Ordering::Relaxed);
+            } else {
+                tracing::warn!(
+                    "unreadable {}: restarting totals at zero",
+                    path.display()
+                );
+            }
+        }
+        if let Ok(mut slot) = self.persist.lock() {
+            *slot = Some(PersistSlot { path, last_write: Instant::now() });
+        }
+        self.write_now();
+    }
+
+    /// Flush the current totals to the persistence file now, so a kill
+    /// shortly after is less likely to lose the latest window.
+    pub fn flush(&self) {
+        self.write_now();
+    }
+
+    fn note_change(&self) {
+        let Ok(mut slot) = self.persist.lock() else { return };
+        let Some(slot) = slot.as_mut() else { return };
+        if slot.last_write.elapsed() < PERSIST_INTERVAL {
+            return;
+        }
+        slot.last_write = Instant::now();
+        self.write_locked(&slot.path);
+    }
+
+    fn write_now(&self) {
+        if let Ok(mut slot) = self.persist.lock() {
+            if let Some(slot) = slot.as_mut() {
+                slot.last_write = Instant::now();
+                self.write_locked(&slot.path);
+            }
+        }
+    }
+
+    fn write_locked(&self, path: &Path) {
+        let body = format!(
+            "{{\"up\":{},\"down\":{},\"proxyUp\":{},\"proxyDown\":{}}}",
+            self.upload.load(Ordering::Relaxed),
+            self.download.load(Ordering::Relaxed),
+            self.proxy_upload.load(Ordering::Relaxed),
+            self.proxy_download.load(Ordering::Relaxed)
+        );
+        // Write to a sibling temp file and rename: a crash mid-write must
+        // not truncate the running total, and a corrupt file must be
+        // detectable and replaced, not silently read as zero.
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return;
+        };
+        let tmp = path.with_file_name(format!("{name}.tmp"));
+        if std::fs::write(&tmp, body.as_bytes()).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
     }
 
     pub fn snapshot(&self) -> TrafficSnapshot {
@@ -64,6 +219,30 @@ pub struct TrafficSnapshot {
 pub type SharedTraffic = Arc<TrafficStats>;
 
 #[cfg(test)]
+#[test]
+fn cumulative_totals_survive_a_fresh_stats_instance() {
+    let dir = std::env::temp_dir().join(format!("skyward-traffic-{}", rand::random::<u64>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("traffic.json");
+    let first = TrafficStats::default();
+    first.enable_persistence(path.clone());
+    first.add_upload(11);
+    first.add_download(13);
+    first.reset();
+    first.add_upload(1);
+    first.add_proxy_upload(4);
+    std::thread::sleep(Duration::from_millis(80));
+    first.add_upload(0); // a change past the mirror interval flushes
+
+    let second = TrafficStats::default();
+    second.enable_persistence(path);
+    assert_eq!(second.snapshot().up, 1);
+    assert_eq!(second.snapshot().down, 0);
+    assert_eq!(second.snapshot_proxied().up, 4);
+    assert_eq!(second.snapshot_proxied().down, 0);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn traffic_rate_is_per_second_and_does_not_consume_totals() {
     let traffic = TrafficStats::default();
@@ -141,4 +320,136 @@ impl TargetAddr {
             .next()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no address for host"))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Process attribution
+// ---------------------------------------------------------------------------
+
+/// The name of the process that owns the connection socket (local address
+/// `src:src_port`) — the Android equivalent of Go's
+/// `component/process.FindProcessName`. Matches the socket in
+/// `/proc/net/{tcp,tcp6,udp,udp6}` (exact IP+port preferred, then port-only,
+/// skipping inode==0), then scans `/proc/<pid>/fd` for that inode and returns
+/// the owner's first cmdline word.
+pub fn find_process_name(network: &str, src: IpAddr, src_port: u16) -> Option<String> {
+    let tables = match network.to_ascii_lowercase().as_str() {
+        p if p.starts_with("tcp") => ["/proc/net/tcp", "/proc/net/tcp6"],
+        p if p.starts_with("udp") => ["/proc/net/udp", "/proc/net/udp6"],
+        _ => return None,
+    };
+    for table in tables {
+        if let Some(inode) = socket_inode(table, src, src_port) {
+            if let Some(name) = process_of_inode(inode) {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+/// Parse a `/proc/net/{tcp,tcp6,udp,udp6}` local address field (`IP:PORT` in
+/// hex) into an `(IpAddr, u16)`.
+fn parse_hex_addr_port(s: &str) -> Option<(IpAddr, u16)> {
+    let colon = s.find(':')?;
+    let port = u16::from_str_radix(s.get(colon + 1..)?, 16).ok()?;
+    let hex = s.get(..colon)?;
+    match hex.len() {
+        8 => {
+            let v = u32::from_str_radix(hex, 16).ok()?;
+            Some((IpAddr::V4(Ipv4Addr::from(v)), port))
+        }
+        32 => {
+            let bytes = hex_decode(hex)?;
+            let array: [u8; 16] = bytes.try_into().ok()?;
+            Some((IpAddr::V6(Ipv6Addr::from(array)), port))
+        }
+        _ => None,
+    }
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// Scan a `/proc/net/{tcp,tcp6,udp,udp6}` table for a socket whose local
+/// port is `want_port`. Exact IP+port wins; otherwise the first port-only
+/// match is used (the socket may be listed with a different local address,
+/// e.g. the gateway, in TUN mode).
+fn socket_inode(table: &str, want: IpAddr, want_port: u16) -> Option<u32> {
+    let text = std::fs::read_to_string(table).ok()?;
+    let mut exact = None;
+    let mut port_only = None;
+    for line in text.lines().skip(1) {
+        // Kernel layout: `sl local rem st tx:rx tr:tm->when retrnsmt uid
+        // timeout inode ...` — uid at [7], inode at [9].
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 10 {
+            continue;
+        }
+        let Some((ip, port)) = parse_hex_addr_port(fields[1]) else {
+            continue;
+        };
+        if port != want_port {
+            continue;
+        }
+        let Ok(inode) = fields[9].parse::<u32>() else {
+            continue;
+        };
+        if inode == 0 {
+            continue; // no owner yet (TIME_WAIT, unconnected)
+        }
+        if ip == want && exact.is_none() {
+            exact = Some(inode);
+        } else if port_only.is_none() {
+            port_only = Some(inode);
+        }
+    }
+    exact.or(port_only)
+}
+
+/// Scan `/proc/<pid>/fd` for the socket inode and return the owner process's
+/// first cmdline word — the Android `resolveProcessNameByProcSearch`.
+fn process_of_inode(inode: u32) -> Option<String> {
+    let want = format!("socket:[{inode}]");
+    for entry in std::fs::read_dir("/proc").ok()? {
+        let entry = entry.ok()?;
+        let pid = entry.file_name().to_string_lossy().into_owned();
+        if !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let fds = match std::fs::read_dir(format!("/proc/{pid}/fd")) {
+            Ok(fds) => fds,
+            Err(_) => continue,
+        };
+        for fd in fds {
+            let Ok(fd) = fd else { continue };
+            let target = match fd.path().read_link() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if target.to_string_lossy() == want {
+                return process_name_of_pid(&pid);
+            }
+        }
+    }
+    None
+}
+
+/// The process's display name: the basename of its first cmdline word.
+fn process_name_of_pid(pid: &str) -> Option<String> {
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let first = cmdline.split(|b| *b == 0).next()?;
+    let name = String::from_utf8_lossy(first)
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    (!name.is_empty()).then_some(name)
 }

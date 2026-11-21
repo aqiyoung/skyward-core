@@ -35,7 +35,19 @@ pub async fn engine() -> Option<Arc<Engine>> {
 
 /// Build an engine from a config and install it as the active one.
 pub async fn apply_config(config: Config, config_path: PathBuf, data_dir: PathBuf) -> Arc<Engine> {
-    let engine = Arc::new(Engine::new(config, traffic(), &data_dir).await);
+    let old = ENGINE.read().await.clone();
+    let mut engine = Engine::new(config, traffic(), &data_dir).await;
+    if let Some(old) = old {
+        // Keep connection history across a profile switch: connections of
+        // the previous engine record their closed summaries into the
+        // tracker the App polls — the fresh tracker installed by
+        // Engine::new would orphan them.
+        engine.connections = old.connections.clone();
+    }
+    let engine = Arc::new(engine);
+    // The dashboard's running total survives restarts; it is mirrored next to
+    // the active profile.
+    traffic().enable_persistence(data_dir.join("traffic.json"));
     *ENGINE.write().await = Some(engine.clone());
     *CONFIG_PATH.write().await = Some(config_path);
     CORE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -172,11 +184,13 @@ pub async fn apply_config_from_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn traffic_snapshot(total: bool) -> crate::common::TrafficSnapshot {
-    if total {
-        traffic().snapshot()
-    } else {
-        traffic().rate()
+pub fn traffic_snapshot(total: bool, only_proxy: bool) -> crate::common::TrafficSnapshot {
+    let stats = traffic();
+    match (total, only_proxy) {
+        (true, true) => stats.snapshot_proxied(),
+        (true, false) => stats.snapshot(),
+        (false, true) => stats.rate_proxied(),
+        (false, false) => stats.rate(),
     }
 }
 
@@ -222,7 +236,9 @@ mod tests {
         // Global state is shared across tests in one process; don't assume it
         // starts empty — just verify an applied engine is retrievable.
         let config = Config::from_str("mode: rule\nrules:\n  - MATCH,DIRECT\n").unwrap();
-        let e = apply_config(config, PathBuf::from("c.yaml"), PathBuf::from(".")).await;
+        let dir = std::env::temp_dir().join(format!("skyward-state-{}", rand::random::<u64>()));
+        let e = apply_config(config, PathBuf::from("c.yaml"), dir.clone()).await;
         assert!(Arc::ptr_eq(&e, &engine().await.unwrap()));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -8,7 +8,7 @@ use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::adapter::tls::connect_tls;
+use crate::adapter::tls::connect_tls_http1;
 use crate::adapter::{BoxedStream, Outbound};
 use crate::common::TargetAddr;
 
@@ -91,7 +91,7 @@ impl Outbound for HttpOutbound {
         })?;
 
         let mut stream: BoxedStream = if self.use_tls {
-            connect_tls(&self.sni, tcp, self.verify).await?
+            connect_tls_http1(&self.sni, tcp, self.verify).await?
         } else {
             Box::new(tcp)
         };

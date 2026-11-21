@@ -148,11 +148,12 @@ fn home_dir_from_options(opts: *const SkywardOptions) -> Result<PathBuf, Skyward
 // ---- exported functions ----------------------------------------------------
 
 /// NUL-terminated copy of VERSION for the C ABI (Rust &str is not NUL-terminated).
-static VERSION_C: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "-alpha.1\0").as_bytes();
+static VERSION_C: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 
 #[no_mangle]
 pub extern "C" fn skyward_version() -> *const c_char {
-    VERSION_C.as_ptr() as *const c_char
+    let bytes = VERSION_C.get_or_init(|| format!("{}\0", VERSION).into_bytes());
+    bytes.as_ptr() as *const c_char
 }
 
 #[no_mangle]

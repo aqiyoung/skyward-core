@@ -119,6 +119,10 @@ pub fn invoke(data: &[u8]) -> Vec<u8> {
         "getTraffic" => handle_get_traffic(&call, false),
         "getTotalTraffic" => handle_get_traffic(&call, true),
         "resetTraffic" => handle_reset_traffic(&call),
+        "decryptConfig" => handle_decrypt_config(&call),
+        "dumpRuleSet" => handle_dump_rule_set(&call),
+        "compileRuleSet" => handle_compile_rule_set(&call),
+        "crash" => handle_crash(&call),
         "encodeShareLinks" => handle_encode_share_links(&call),
         "decodeShareLinks" => handle_decode_share_links(&call),
         "convertProxies" => handle_convert_proxies(&call),
@@ -131,11 +135,15 @@ pub fn invoke(data: &[u8]) -> Vec<u8> {
         "updateDns" => handle_update_dns(&call),
         "updateGeoData" => handle_update_geo_data(&call),
         "getConnections" => handle_get_connections(&call),
+        "takeClosedConnections" => handle_take_closed_connections(&call),
         "getConnectionCount" => handle_connection_count(&call),
         "closeConnections" => handle_close_connections(&call),
         "resetConnections" => handle_close_connections(&call),
         "closeConnection" => handle_close_connection(&call),
-        "clearDnsCache" => ok(&call.id, Value::Bool(true)),
+        "clearDnsCache" => {
+            crate::dns::clear_caches();
+            ok(&call.id, Value::Bool(true))
+        }
         "validateConfig" => handle_validate_config(&call),
         "setupConfig" => handle_setup_config(&call),
         "updateConfig" => handle_setup_config(&call),
@@ -956,7 +964,9 @@ fn handle_service_check(call: &MethodCall) -> Vec<u8> {
 }
 
 fn handle_get_traffic(call: &MethodCall, total: bool) -> Vec<u8> {
-    let snap = crate::runtime_state::traffic_snapshot(total);
+    // The App's setting restricts the reported numbers to proxied traffic.
+    let only_proxy = call.arguments.as_bool().unwrap_or(false);
+    let snap = crate::runtime_state::traffic_snapshot(total, only_proxy);
     if total {
         static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
         let should_log = {
@@ -975,7 +985,174 @@ fn handle_get_traffic(call: &MethodCall, total: bool) -> Vec<u8> {
 }
 
 fn handle_reset_traffic(call: &MethodCall) -> Vec<u8> {
+    crate::runtime_state::traffic().reset();
     ok(&call.id, Value::Bool(true))
+}
+
+/// The developer "force crash" probe: the Go core takes the process down so
+/// crash reporting can be exercised on a rooted build.
+fn handle_crash(_call: &MethodCall) -> Vec<u8> {
+    crate::jni::emit_log_event("[rust-core] crash requested by the app");
+    std::process::abort()
+}
+
+fn handle_decrypt_config(call: &MethodCall) -> Vec<u8> {
+    #[derive(Deserialize)]
+    struct Args {
+        path: String,
+        #[serde(rename = "age-secret-key", default)]
+        age_secret_key: String,
+    }
+    let args: Args = match serde_json::from_value(call.arguments.clone()) {
+        Ok(args) => args,
+        Err(e) => return err(&call.id, "invalid_arguments", e.to_string()),
+    };
+    match crate::age::decrypt_file(&args.path, &args.age_secret_key) {
+        Ok(text) => ok(&call.id, Value::String(text)),
+        Err(message) => err(&call.id, "decrypt_failed", message),
+    }
+}
+
+/// Text view of a rule-set file, mirroring the Go core's `handleDumpRuleSet`:
+/// an mrs set is dumped through DumpMrs (merged `+.` domains, expanded
+/// prefixes); anything else is returned as-is.
+fn handle_dump_rule_set(call: &MethodCall) -> Vec<u8> {
+    let path = call.arguments.as_str().unwrap_or("");
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(e) => return err(&call.id, "io_error", format!("read {}: {e}", path)),
+    };
+    if raw.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        use crate::rules::provider::Behavior;
+        let mut errors = Vec::new();
+        for behavior in [Behavior::Domain, Behavior::IpCidr] {
+            match crate::rules::mrs::dump_mrs(&raw, behavior) {
+                Ok(text) => return ok(&call.id, Value::String(text)),
+                Err(e) => errors.push(e.to_string()),
+            }
+        }
+        return err(&call.id, "rule_set_invalid", errors.join("; "));
+    }
+    match String::from_utf8(raw) {
+        Ok(text) => ok(&call.id, Value::String(text)),
+        Err(_) => err(
+            &call.id,
+            "decode_error",
+            "rule-set file is neither text nor an mrs set",
+        ),
+    }
+}
+
+/// `compileRuleSet`: compile the staged (or downloaded) source beside
+/// `home/providers/rules/<name>` into `<name>.mrs`, and report what it became.
+#[derive(Deserialize)]
+struct CompileRuleSetArgs {
+    name: String,
+    #[serde(default)]
+    url: String,
+}
+
+fn handle_compile_rule_set(call: &MethodCall) -> Vec<u8> {
+    let args: CompileRuleSetArgs = match serde_json::from_value(call.arguments.clone()) {
+        Ok(args) => args,
+        Err(e) => return err(&call.id, "invalid_arguments", e.to_string()),
+    };
+    if !IS_INIT.load(Ordering::Relaxed) {
+        return err(&call.id, "not_initialized", "core is not initialized");
+    }
+    // A name, never a path: the core may run with more privilege than the app.
+    let valid = !args.name.is_empty()
+        && !args.name.starts_with('.')
+        && args
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    if !valid {
+        return err(&call.id, "invalid_arguments", "invalid rule set name");
+    }
+    let Some(home) = HOME_DIR.get().filter(|s| !s.is_empty()).cloned() else {
+        return err(&call.id, "not_initialized", "core home directory is missing");
+    };
+
+    let future = compile_rule_set(PathBuf::from(home), args);
+    match block_on(future) {
+        Ok(Ok(value)) => ok(&call.id, value),
+        Ok(Err(e)) => err(&call.id, &e.code, e.message),
+        Err(e) => err(&call.id, "runtime_error", e),
+    }
+}
+
+async fn compile_rule_set(
+    home: PathBuf,
+    args: CompileRuleSetArgs,
+) -> Result<Value, MethodError> {
+    let dir = home.join("providers").join("rules");
+        let source = dir.join(&args.name);
+        let bytes = if !args.url.is_empty() {
+            let bytes =
+                crate::fetch::fetch_url_timeout(&args.url, std::time::Duration::from_secs(15))
+                    .await
+                    .map_err(|e| MethodError {
+                        code: "request_bad_response".into(),
+                        message: format!("download {}: {e}", args.url),
+                        details: None,
+                    })?;
+            write_rule_set_file(&source, &bytes).map_err(|e| MethodError {
+                code: "io_error".into(),
+                message: format!("write {}: {e}", source.display()),
+                details: None,
+            })?;
+            bytes
+        } else {
+            tokio::fs::read(&source).await.map_err(|e| MethodError {
+                code: "io_error".into(),
+                message: format!("read {}: {e}", source.display()),
+                details: None,
+            })?
+        };
+
+        let compiled = crate::rules::compile::compile(&bytes, args.url.is_empty())
+            .map_err(|e| MethodError {
+                code: match e {
+                    crate::rules::compile::CompileError::Empty => "rule_set_empty",
+                    crate::rules::compile::CompileError::Mixed => "rule_set_mixed",
+                    crate::rules::compile::CompileError::Invalid => "rule_set_invalid",
+                }
+                .into(),
+                message: "rule set cannot be compiled".into(),
+                details: None,
+            })?;
+
+        if let Some(mrs) = &compiled.mrs {
+            let target = dir.join(format!("{}.mrs", args.name));
+            write_rule_set_file(&target, mrs).map_err(|e| MethodError {
+                code: "io_error".into(),
+                message: format!("write {}: {e}", target.display()),
+                details: None,
+            })?;
+        }
+
+        let body = json!({
+            "behavior": compiled.behavior.as_str(),
+            "format": compiled.format,
+        });
+        Result::<Value, MethodError>::Ok(body)
+}
+
+/// Atomic-ish replace, so a planted link at the target is never followed.
+fn write_rule_set_file(path: &std::path::Path, buf: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!("{e}.tmp"))
+            .unwrap_or_else(|| "tmp".into()),
+    );
+    let _ = std::fs::remove_file(&temp);
+    std::fs::write(&temp, buf)?;
+    std::fs::rename(&temp, path)
 }
 
 fn handle_encode_share_links(call: &MethodCall) -> Vec<u8> {
@@ -1170,7 +1347,7 @@ fn handle_external_provider(call: &MethodCall) -> Vec<u8> {
 }
 
 fn handle_update_dns(call: &MethodCall) -> Vec<u8> {
-    // DNS reload is a no-op in this slice (the resolver cache is per-engine).
+    crate::dns::update_system_dns(call.arguments.as_str().unwrap_or(""));
     ok(&call.id, Value::Bool(true))
 }
 
@@ -1182,6 +1359,18 @@ fn handle_get_connections(call: &MethodCall) -> Vec<u8> {
         }
     };
     ok(&call.id, block_on(future).unwrap_or_else(|_| json!({"connections": []})))
+}
+
+/// Hand the App every connection that finished since the last call, so its
+/// history is complete even for traffic sampled too late or not at all.
+fn handle_take_closed_connections(call: &MethodCall) -> Vec<u8> {
+    let future = async {
+        match crate::runtime_state::engine().await {
+            Some(engine) => serde_json::json!(engine.connections.take_closed()),
+            None => serde_json::json!([]),
+        }
+    };
+    ok(&call.id, block_on(future).unwrap_or_else(|_| json!([])))
 }
 
 fn handle_connection_count(call: &MethodCall) -> Vec<u8> {
@@ -1578,6 +1767,12 @@ mod tests {
         serde_json::from_slice(&data).unwrap()
     }
 
+    fn temp_data_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("skyward-data-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn memory_stats_reports_real_rss() {
         let _guard = crate::runtime_state::TEST_LOCK.lock().unwrap();
@@ -1594,6 +1789,129 @@ mod tests {
         let r = response(invoke(br#"{"method":"coreVersion"}"#));
         assert!(r["result"].as_str().unwrap().starts_with("clash.meta/"));
         assert!(r["error"].is_null());
+    }
+
+    #[test]
+    fn decrypt_config_unwraps_armored_profile() {
+        use age::secrecy::ExposeSecret;
+        let identity = age::x25519::Identity::generate();
+        let armored = age::encrypt_and_armor(
+            &identity.to_public(),
+            b"proxies:\n  - name: test\n",
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("skyward-dec-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("profile.age");
+        std::fs::write(&file, armored).unwrap();
+        let payload = json!({
+            "method": "decryptConfig",
+            "arguments": {
+                "path": file.to_string_lossy(),
+                "age-secret-key": identity.to_string().expose_secret(),
+            }
+        })
+        .to_string();
+        let r = response(invoke(payload.as_bytes()));
+        assert!(r["error"].is_null(), "{r}");
+        assert_eq!(r["result"], "proxies:\n  - name: test\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dump_rule_set_returns_text_file_as_is() {
+        let dir = std::env::temp_dir().join(format!("skyward-dump-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("rules.txt");
+        std::fs::write(&file, "example.com\n").unwrap();
+        let payload = json!({
+            "method": "dumpRuleSet",
+            "arguments": file.to_string_lossy(),
+        })
+        .to_string();
+        let r = response(invoke(payload.as_bytes()));
+        assert!(r["error"].is_null(), "{r}");
+        assert_eq!(r["result"], "example.com\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn compile_rule_set_writes_a_loadable_mrs_beside_the_source() {
+        use crate::rules::provider::Behavior;
+        let dir = temp_data_dir().join("compile");
+        let rules = dir.join("providers").join("rules");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::write(rules.join("set"), "DOMAIN-SUFFIX,example.com\n").unwrap();
+
+        let out = block_on(compile_rule_set(
+            dir.clone(),
+            CompileRuleSetArgs { name: "set".into(), url: String::new() },
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(out["behavior"], "domain");
+        assert_eq!(out["format"], "text");
+
+        let mrs = std::fs::read(rules.join("set.mrs")).unwrap();
+        assert_eq!(
+            crate::rules::mrs::dump_mrs(&mrs, Behavior::Domain).unwrap(),
+            "+.example.com\n"
+        );
+        assert!(!crate::rules::mrs::parse_mrs(&mrs, Behavior::Domain)
+            .unwrap()
+            .is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn empty_staged_content_stays_classical_without_an_mrs() {
+        let dir = temp_data_dir().join("compile-empty");
+        let rules = dir.join("providers").join("rules");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::write(rules.join("set"), "").unwrap();
+        let out = block_on(compile_rule_set(
+            dir.clone(),
+            CompileRuleSetArgs { name: "set".into(), url: String::new() },
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(out["behavior"], "classical");
+        assert!(!rules.join("set.mrs").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn total_traffic_honours_the_proxy_only_flag() {
+        let _guard = crate::runtime_state::TEST_LOCK.lock().unwrap();
+        let traffic = crate::runtime_state::traffic();
+        traffic.reset();
+        traffic.add_upload(9);
+        traffic.add_download(6);
+        traffic.add_proxy_upload(2);
+        traffic.add_proxy_download(1);
+
+        let only_proxy = response(invoke(br#"{"method":"getTotalTraffic","arguments":true}"#));
+        assert_eq!(only_proxy["result"]["up"], serde_json::json!(2));
+        assert_eq!(only_proxy["result"]["down"], serde_json::json!(1));
+
+        let everything = response(invoke(br#"{"method":"getTotalTraffic","arguments":false}"#));
+        assert_eq!(everything["result"]["up"], serde_json::json!(9));
+        assert_eq!(everything["result"]["down"], serde_json::json!(6));
+
+        traffic.reset();
+    }
+
+    #[test]
+    fn reset_traffic_zeroes_cumulative_counters() {
+        let _guard = crate::runtime_state::TEST_LOCK.lock().unwrap();
+        let traffic = crate::runtime_state::traffic();
+        traffic.add_upload(7);
+        traffic.add_download(9);
+        let r = response(invoke(br#"{"method":"resetTraffic"}"#));
+        assert_eq!(r["result"], true);
+        let snap = traffic.snapshot();
+        assert_eq!((snap.up, snap.down), (0, 0));
     }
 
     #[test]
@@ -1686,7 +2004,7 @@ mod tests {
                 "proxies:\n  - {name: n1, type: direct}\nproxy-groups:\n  - {name: g1, type: select, proxies: [n1, DIRECT]}\n",
             ).unwrap(),
             std::path::PathBuf::from("c.yaml"),
-            std::path::PathBuf::from("."),
+            temp_data_dir(),
         ));
         let payload = serde_json::json!({
             "method": "quickSetup",
@@ -1708,7 +2026,7 @@ mod tests {
                 "proxies:\n  - {name: n1, type: direct}\nproxy-groups:\n  - {name: g1, type: select, proxies: [n1, DIRECT]}\n",
             ).unwrap(),
             std::path::PathBuf::from("c.yaml"),
-            std::path::PathBuf::from("."),
+            temp_data_dir(),
         ));
         let r = response(invoke(br#"{"method":"getProxies"}"#));
         assert!(r["result"]["all"].as_array().unwrap().iter().any(|n| n == "g1"));
@@ -1731,7 +2049,7 @@ mod tests {
                 "proxies:\n  - {name: n1, type: direct}\nproxy-groups:\n  - {name: g1, type: select, proxies: [n1, DIRECT]}\n",
             ).unwrap(),
             std::path::PathBuf::from("c.yaml"),
-            std::path::PathBuf::from("."),
+            temp_data_dir(),
         ));
         let payload = serde_json::json!({
             "method": "changeProxy",

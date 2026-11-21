@@ -38,6 +38,7 @@ pub struct Config {
     pub proxy_providers: HashMap<String, ProxyProviderDef>,
     pub rules: Vec<String>,
     pub dns: Option<DnsConfig>,
+    pub sniffer: SnifferConfig,
 }
 
 impl Default for Config {
@@ -60,6 +61,66 @@ impl Default for Config {
             proxy_providers: HashMap::new(),
             rules: Vec::new(),
             dns: None,
+            sniffer: SnifferConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct SnifferConfig {
+    pub enable: bool,
+    pub override_destination: bool,
+    pub force_dns_mapping: bool,
+    pub parse_pure_ip: bool,
+    pub force_domain: Vec<String>,
+    pub skip_domain: Vec<String>,
+    pub skip_src_address: Vec<String>,
+    pub skip_dst_address: Vec<String>,
+    pub sniff: HashMap<String, SniffProtocol>,
+}
+
+impl Default for SnifferConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            override_destination: true,
+            force_dns_mapping: true,
+            parse_pure_ip: true,
+            force_domain: Vec::new(),
+            skip_domain: Vec::new(),
+            skip_src_address: Vec::new(),
+            skip_dst_address: Vec::new(),
+            sniff: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct SniffProtocol {
+    pub ports: Vec<SniffPort>,
+    pub override_destination: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum SniffPort {
+    Number(u16),
+    Range(String),
+}
+
+impl SniffPort {
+    pub fn contains(&self, port: u16) -> bool {
+        match self {
+            Self::Number(value) => *value == port,
+            Self::Range(value) => match value.split_once('-') {
+                Some((low, high)) => match (low.trim().parse::<u16>(), high.trim().parse::<u16>()) {
+                    (Ok(low), Ok(high)) => (low..=high).contains(&port),
+                    _ => false,
+                },
+                None => value.parse::<u16>().ok() == Some(port),
+            },
         }
     }
 }
@@ -224,6 +285,17 @@ pub struct ProxyGroupDef {
     /// Provider names whose proxies should be included as members (`use:`).
     #[serde(rename = "use", default)]
     pub use_providers: Vec<String>,
+    #[serde(rename = "include-all", default)]
+    pub include_all: bool,
+    #[serde(rename = "include-all-proxies", default)]
+    pub include_all_proxies: bool,
+    #[serde(rename = "include-all-providers", default)]
+    pub include_all_providers: bool,
+    pub filter: Option<String>,
+    #[serde(rename = "exclude-filter")]
+    pub exclude_filter: Option<String>,
+    #[serde(rename = "exclude-type")]
+    pub exclude_type: Option<String>,
     pub url: Option<String>,
     pub interval: Option<u64>,
 }
