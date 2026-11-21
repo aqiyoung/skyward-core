@@ -2033,7 +2033,7 @@ impl V6RecordReader for V6ShapedReader {
             Poll::Ready(Ok(())) => {}
         }
         let prefix = head[..prefix_length].to_vec();
-        let header = match decrypt_aead(aead, &self.nonce, &head[prefix_length..]) {
+        let header = match decrypt_aead_aad(aead, &self.nonce, &head[prefix_length..], &prefix) {
             Ok(h) => h,
             Err(e) => return Poll::Ready(Err(e)),
         };
