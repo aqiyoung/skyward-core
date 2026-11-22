@@ -250,7 +250,7 @@ fn handle_dns_packet6<T: Read + Write + Send + 'static>(
         ))),
         _ => None,
     };
-    let response = build_dns_response(payload, answer_ip);
+    let response = build_dns_response(payload, answer_ip, qtype != 1);
     let reply = build_udp_packet6(
         std::net::Ipv6Addr::from(dst),
         std::net::Ipv6Addr::from(src),
@@ -382,7 +382,7 @@ fn handle_dns_packet<T: Read + Write + Send + 'static>(
         ))),
         _ => None,
     };
-    let response = build_dns_response(payload, answer_ip);
+    let response = build_dns_response(payload, answer_ip, qtype != 1);
     let packet = crate::tun::tcp::build_udp_packet(ip.dst, ip.src, 53, src_port, &response);
     if let Err(e) = io.lock().unwrap().write_all(&packet) {
         tracing::debug!("TUN DNS reply write failed: {}", e);
@@ -423,7 +423,11 @@ fn parse_dns_question(packet: &[u8]) -> Option<(Vec<u8>, u16)> {
     Some((labels, qtype))
 }
 
-fn build_dns_response(query: &[u8], answer_ip: Option<std::net::IpAddr>) -> Vec<u8> {
+fn build_dns_response(
+    query: &[u8],
+    answer_ip: Option<std::net::IpAddr>,
+    nxdomain: bool,
+) -> Vec<u8> {
     let mut out = query.to_vec();
     if out.len() < 12 {
         return out;
@@ -441,6 +445,13 @@ fn build_dns_response(query: &[u8], answer_ip: Option<std::net::IpAddr>) -> Vec<
     // QR=1, AA=1, RD preserved, RA=1.
     out[2] = (out[2] | 0x84) & 0xfb;
     out[3] |= 0x80;
+    // NXDOMAIN for AAAA queries: an empty NOERROR answer leaves some clients
+    // (notably mobile apps withHappy Eyeballs) probing IPv6 addresses from
+    // cache until they time out. A definitive "no such host" makes them fall
+    // back to IPv4 immediately, which the TUN handles.
+    if nxdomain {
+        out[3] |= 0x03;
+    }
     let answers: u16 = if answer_ip.is_some() { 1 } else { 0 };
     out[6..8].copy_from_slice(&0u16.to_be_bytes()); // ANCOUNT placeholder
     out[8..10].copy_from_slice(&0u16.to_be_bytes());
@@ -550,7 +561,7 @@ mod tests {
     #[test]
     fn builds_a_response() {
         let q = dns_query("example.com", 1);
-        let resp = build_dns_response(&q, Some("1.2.3.4".parse().unwrap()));
+        let resp = build_dns_response(&q, Some("1.2.3.4".parse().unwrap()), false);
         assert_eq!(u16::from_be_bytes([resp[2], resp[3]]) & 0x8000, 0x8000); // QR bit
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 1); // one answer
         assert!(resp.windows(4).any(|w| w == [1, 2, 3, 4]));
@@ -586,7 +597,7 @@ mod tests {
     #[test]
     fn nxdomain_has_no_answers() {
         let q = dns_query("nonexistent.invalid", 1);
-        let resp = build_dns_response(&q, None);
+        let resp = build_dns_response(&q, None, false);
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0);
     }
 
@@ -660,7 +671,7 @@ mod tests {
         assert_eq!(qtype, 1);
         let name = String::from_utf8_lossy(&qname);
         let answer = std::net::IpAddr::V4(crate::fake_ip::fake_ip_for(name.trim_end_matches('.')));
-        let response = build_dns_response(&query, Some(answer));
+        let response = build_dns_response(&query, Some(answer), false);
         let reply = build_udp_packet6(server, client, 53, 53123, &response);
         assert_eq!(&reply[8..24], &server.octets());
         assert_eq!(&reply[24..40], &client.octets());
