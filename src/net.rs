@@ -178,6 +178,61 @@ fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use async_trait::async_trait;
+
+    /// Records the target it was asked to connect to, and hands back a pipe
+    /// that immediately EOFs. Enough to observe the dial chain's behaviour.
+    struct SpyOutbound {
+        hits: Arc<Mutex<Vec<String>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Outbound for SpyOutbound {
+        fn name(&self) -> &str { "spy" }
+        fn kind(&self) -> &str { "spy" }
+        async fn connect(&self, target: &TargetAddr) -> io::Result<BoxedStream> {
+            self.hits.lock().unwrap().push(target.address().to_string());
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let (reader, _writer) = tokio::io::duplex(8);
+            Ok(Box::new(reader))
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_tcp_follows_dial_chain_instead_of_dialing_direct() {
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hop: Arc<dyn Outbound> = Arc::new(SpyOutbound { hits: hits.clone(), calls: calls.clone() });
+        let chain = DialChain { hops: vec![hop], names: Arc::new(vec!["entry".into()]) };
+
+        let addr: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let _ = DIAL_CHAIN.scope(chain, connect_tcp(addr)).await;
+
+        // With one entry hop in scope, connect_tcp must delegate to it (not
+        // open a direct socket): the spy saw exactly one dial to the address.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(hits.lock().unwrap().as_slice(), &["93.184.216.34:443".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn connect_tcp_without_chain_uses_direct_path() {
+        // No scope -> no spy involvement; a closed local port fails fast
+        // through the direct TcpSocket branch (the spy must not be called).
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hop: Arc<dyn Outbound> = Arc::new(SpyOutbound { hits: hits.clone(), calls: calls.clone() });
+        let chain = DialChain { hops: vec![hop], names: Arc::new(vec!["entry".into()]) };
+
+        // Scope a DIFFERENT task-local context that is then dropped: because
+        // scope ends before the dial, connect_tcp sees no chain here.
+        let _ = async { DIAL_CHAIN.scope(chain, async {}).await; }.await;
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let _ = connect_tcp(addr).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn builds_well_formed_query() {
