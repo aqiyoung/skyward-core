@@ -843,12 +843,28 @@ enum ProbeError {
 
 async fn timed<T>(
     timeout: std::time::Duration,
+    stage: &str,
     fut: impl std::future::Future<Output = std::io::Result<T>>,
 ) -> Result<T, ProbeError> {
     match tokio::time::timeout(timeout, fut).await {
-        Err(_) => Err(ProbeError::Timeout),
+        Err(_) => {
+            probe_diag(&format!("{}: timeout after {:?}", stage, timeout));
+            Err(ProbeError::Timeout)
+        }
         Ok(Ok(v)) => Ok(v),
-        Ok(Err(_)) => Err(ProbeError::Other),
+        Ok(Err(e)) => {
+            // Previously the IO error was swallowed, leaving only a bare
+            // "unavailable" with no clue which stage failed. Surface it.
+            probe_diag(&format!("{}: {}", stage, e));
+            Err(ProbeError::Other)
+        }
+    }
+}
+
+fn probe_diag(message: &str) {
+    static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+        crate::jni::emit_log_event(&format!("[rust-core] probe: {}", message));
     }
 }
 
@@ -878,12 +894,12 @@ async fn service_probe(
     let timeout = std::time::Duration::from_millis(timeout_ms as u64);
 
     let stream = if proxy_name.is_empty() {
-        timed(timeout, engine.dial(&target)).await?
+        timed(timeout, "dial", engine.dial(&target)).await?
     } else {
-        timed(timeout, engine.dial_named(proxy_name, &target)).await?
+        timed(timeout, "dial_named", engine.dial_named(proxy_name, &target)).await?
     };
     let mut stream = if use_tls {
-        timed(timeout, crate::adapter::tls::connect_tls_http1(host, stream, false)).await?
+        timed(timeout, "target_tls", crate::adapter::tls::connect_tls_http1(host, stream, false)).await?
     } else {
         stream
     };
@@ -892,18 +908,35 @@ async fn service_probe(
         "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n",
         path, authority
     );
-    timed(timeout, stream.write_all(request.as_bytes())).await?;
-    let mut buf = [0u8; 256];
-    let n = timed(timeout, stream.read(&mut buf)).await?;
-    let text = String::from_utf8_lossy(&buf[..n]);
-    let ok = text
-        .split_whitespace()
-        .nth(1)
-        .map(|code| code.starts_with('2') || code.starts_with('3'))
-        .unwrap_or(false);
+    timed(timeout, "request", stream.write_all(request.as_bytes())).await?;
+    // A single read may return a partial status line or an interim 1xx, so
+    // keep reading until a complete "HTTP/x.y NNN" line is present or the
+    // budget runs out.
+    let mut response = Vec::with_capacity(512);
+    let mut buf = [0u8; 512];
+    let ok = loop {
+        let n = timed(timeout, "read", stream.read(&mut buf)).await?;
+        if n == 0 {
+            break false;
+        }
+        response.extend_from_slice(&buf[..n]);
+        let text = String::from_utf8_lossy(&response);
+        if let Some(line) = text.lines().find(|l| l.starts_with("HTTP/")) {
+            if let Some(code) = line.split_whitespace().nth(1) {
+                break code.starts_with('2') || code.starts_with('3');
+            }
+        }
+        if response.len() > 16 * 1024 {
+            break false;
+        }
+    };
     if ok {
         Ok(())
     } else {
+        probe_diag(&format!(
+            "read: no 2xx/3xx status in {} bytes",
+            response.len()
+        ));
         Err(ProbeError::Other)
     }
 }
