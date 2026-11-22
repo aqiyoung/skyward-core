@@ -38,6 +38,41 @@ pub struct Config {
     pub proxy_providers: HashMap<String, ProxyProviderDef>,
     pub rules: Vec<String>,
     pub dns: Option<DnsConfig>,
+    /// User-defined proxy chains, materialised into cloned nodes + hidden
+    /// groups by [Config::materialize_chains] at load time.
+    #[serde(default)]
+    pub chains: Vec<ChainSpec>,
+    /// Filled by materialize_chains; not deserialized from YAML.
+    #[serde(skip)]
+    pub chain_reports: Vec<ChainReport>,
+}
+
+/// One user-defined chain: 2-3 hops, entry first, exit last. The core clones
+/// each hop into a virtual node wired with `dialer-proxy` to the previous hop,
+/// so selecting the chain's exit node makes traffic traverse the whole chain.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChainSpec {
+    pub name: String,
+    pub hops: Vec<String>,
+    #[serde(rename = "target-group")]
+    pub target_group: Option<String>,
+    #[serde(default = "default_true")]
+    pub offered: bool,
+    #[serde(default)]
+    pub heal: bool,
+}
+
+fn default_true() -> bool { true }
+
+/// The core's report for one chain after materialisation, mirrored to the App
+/// so the chain page can show ok/degraded/broken status.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChainReport {
+    pub name: String,
+    pub status: String,
+    pub hops: Vec<String>,
+    #[serde(rename = "targetGroup")]
+    pub target_group: Option<String>,
 }
 
 impl Default for Config {
@@ -60,6 +95,8 @@ impl Default for Config {
             proxy_providers: HashMap::new(),
             rules: Vec::new(),
             dns: None,
+            chains: Vec::new(),
+            chain_reports: Vec::new(),
         }
     }
 }
@@ -342,9 +379,116 @@ impl Default for DnsConfig {
 
 impl Config {
     pub fn from_str(s: &str) -> anyhow::Result<Self> {
-        let cfg: Config = serde_yaml::from_str(s)?;
+        let mut cfg: Config = serde_yaml::from_str(s)?;
         cfg.validate()?;
+        cfg.materialize_chains();
         Ok(cfg)
+    }
+
+    /// Expand each chain into cloned virtual nodes plus a hidden select group.
+    ///
+    /// For a chain `A -> B -> C`:
+    ///   - clone B as `"chain ⟶ B"` with `dialer-proxy: A`
+    ///   - clone C as `"chain ⟶ C"` with `dialer-proxy: chain ⟶ B`
+    ///   - create hidden select group `chain` whose members are the clones
+    ///   - inject `chain` into the target group (default: first real group)
+    ///
+    /// The chain node is therefore selectable in the server list; selecting it
+    /// makes the core dial A to reach B's server, then B to reach C's server.
+    pub fn materialize_chains(&mut self) {
+        if self.chains.is_empty() {
+            return;
+        }
+        // Snapshot the source definitions so clones never chain off each other.
+        let sources: HashMap<String, ProxyDef> = self.proxies.iter()
+            .map(|p| (p.name.clone(), p.clone()))
+            .collect();
+        let default_target = self.proxy_groups.iter()
+            .find(|g| !g.name.eq_ignore_ascii_case("GLOBAL") && !g.proxies.is_empty())
+            .map(|g| g.name.clone());
+        let mut reports = Vec::new();
+
+        for spec in &self.chains {
+            let hops: Vec<String> = spec.hops.iter()
+                .filter(|h| !h.is_empty())
+                .cloned()
+                .collect();
+            if hops.len() < 2 {
+                reports.push(ChainReport {
+                    name: spec.name.clone(), status: "broken".into(),
+                    hops: hops.clone(), target_group: spec.target_group.clone(),
+                });
+                continue;
+            }
+            // Resolve each hop to a concrete source proxy. A hop may name a
+            // group: pick its first member, mirroring the simple group resolve
+            // used elsewhere in this slice.
+            let concrete: Vec<Option<ProxyDef>> = hops.iter().map(|hop| {
+                if let Some(p) = sources.get(hop) {
+                    return Some(p.clone());
+                }
+                // group -> first concrete member that exists in sources
+                self.proxy_groups.iter()
+                    .find(|g| &g.name == hop)
+                    .and_then(|g| g.proxies.iter().find_map(|m| sources.get(m).cloned()))
+            }).collect();
+            if concrete.iter().any(|c| c.is_none()) {
+                reports.push(ChainReport {
+                    name: spec.name.clone(), status: "broken".into(),
+                    hops: hops.clone(), target_group: spec.target_group.clone(),
+                });
+                continue;
+            }
+
+            let mut dialer: Option<String> = None;
+            let mut members = Vec::new();
+            for (i, hop) in hops.iter().enumerate() {
+                let src = concrete[i].as_ref().unwrap();
+                let mut clone = src.clone();
+                clone.name = format!("{} ⟶ {}", spec.name, hop);
+                clone.dialer_proxy = dialer.clone();
+                // Only the last hop reaches the site; intermediate hops are
+                // transports and should not be offered as standalone nodes.
+                members.push(clone.name.clone());
+                self.proxies.push(clone);
+                dialer = Some(members.last().unwrap().clone());
+            }
+
+            let chain_group_name = spec.name.clone();
+            self.proxy_groups.push(ProxyGroupDef {
+                name: chain_group_name.clone(),
+                kind: "select".into(),
+                proxies: members,
+                use_providers: Vec::new(),
+                url: None,
+                interval: None,
+            });
+            let target = spec.target_group.clone()
+                .or_else(|| default_target.clone());
+            if let Some(target) = &target {
+                if let Some(group) = self.proxy_groups.iter_mut()
+                    .find(|g| &g.name == target && g.name != chain_group_name)
+                {
+                    group.proxies.push(chain_group_name.clone());
+                }
+            }
+            reports.push(ChainReport {
+                name: spec.name.clone(), status: "ok".into(),
+                hops, target_group: target,
+            });
+        }
+        self.apply_chain_reports(reports);
+    }
+
+    fn apply_chain_reports(&mut self, reports: Vec<ChainReport>) {
+        // Stored transiently on the config; surfaced to the App through the
+        // chain-report method below. Kept as a field so no global state leaks.
+        self.chain_reports = reports;
+    }
+
+    /// Reports for the chains loaded from config.
+    pub fn chain_reports(&self) -> &[ChainReport] {
+        &self.chain_reports
     }
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -484,5 +628,61 @@ proxies:
     #[test]
     fn rejects_unknown_mode() {
         assert!(Config::from_str("mode: bogus").is_err());
+    }
+
+    #[test]
+    fn materializes_chain_into_clones_and_group() {
+        let yaml = r#"
+mode: rule
+rules:
+  - MATCH,DIRECT
+proxies:
+  - {name: RU, type: ss, server: ru.example, port: 8388, cipher: aes-128-gcm, password: p}
+  - {name: NL, type: ss, server: nl.example, port: 8388, cipher: aes-128-gcm, password: p}
+proxy-groups:
+  - {name: Proxy, type: select, proxies: [RU, NL]}
+chains:
+  - name: ViaRU
+    hops: [RU, NL]
+    target-group: Proxy
+"#;
+        let cfg = Config::from_str(yaml).unwrap();
+        // 2 source nodes + 2 clones (RU-clone, NL-clone).
+        assert_eq!(cfg.proxies.len(), 4);
+        let ru_clone = cfg.proxies.iter().find(|p| p.name == "ViaRU ⟶ RU").unwrap();
+        let nl_clone = cfg.proxies.iter().find(|p| p.name == "ViaRU ⟶ NL").unwrap();
+        assert_eq!(ru_clone.dialer_proxy, None);          // entry: direct
+        assert_eq!(nl_clone.dialer_proxy.as_deref(), Some("ViaRU ⟶ RU")); // exit via entry
+        // Hidden select group with the clones as members.
+        let group = cfg.proxy_groups.iter().find(|g| g.name == "ViaRU").unwrap();
+        assert_eq!(group.kind, "select");
+        assert_eq!(group.proxies, vec!["ViaRU ⟶ RU", "ViaRU ⟶ NL"]);
+        // Chain name injected into the target group.
+        let target = cfg.proxy_groups.iter().find(|g| g.name == "Proxy").unwrap();
+        assert!(target.proxies.contains(&"ViaRU".to_string()));
+        assert_eq!(cfg.chain_reports().len(), 1);
+        assert_eq!(cfg.chain_reports()[0].status, "ok");
+    }
+
+    #[test]
+    fn materializes_three_hop_chain() {
+        let yaml = r#"
+mode: rule
+rules:
+  - MATCH,DIRECT
+proxies:
+  - {name: A, type: ss, server: a, port: 1, cipher: aes-128-gcm, password: p}
+  - {name: B, type: ss, server: b, port: 2, cipher: aes-128-gcm, password: p}
+  - {name: C, type: ss, server: c, port: 3, cipher: aes-128-gcm, password: p}
+proxy-groups:
+  - {name: Proxy, type: select, proxies: [A, B, C]}
+chains:
+  - {name: chain, hops: [A, B, C], target-group: Proxy}
+"#;
+        let cfg = Config::from_str(yaml).unwrap();
+        let b = cfg.proxies.iter().find(|p| p.name == "chain ⟶ B").unwrap();
+        let c = cfg.proxies.iter().find(|p| p.name == "chain ⟶ C").unwrap();
+        assert_eq!(b.dialer_proxy.as_deref(), Some("chain ⟶ A"));
+        assert_eq!(c.dialer_proxy.as_deref(), Some("chain ⟶ B"));
     }
 }

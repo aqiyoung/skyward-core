@@ -136,6 +136,7 @@ pub fn invoke(data: &[u8]) -> Vec<u8> {
         "resetConnections" => handle_close_connections(&call),
         "closeConnection" => handle_close_connection(&call),
         "clearDnsCache" => ok(&call.id, Value::Bool(true)),
+        "getChainReports" => handle_get_chain_reports(&call),
         "validateConfig" => handle_validate_config(&call),
         "setupConfig" => handle_setup_config(&call),
         "updateConfig" => handle_setup_config(&call),
@@ -1182,6 +1183,17 @@ fn handle_get_connections(call: &MethodCall) -> Vec<u8> {
         }
     };
     ok(&call.id, block_on(future).unwrap_or_else(|_| json!({"connections": []})))
+}
+
+fn handle_get_chain_reports(call: &MethodCall) -> Vec<u8> {
+    let future = async {
+        match crate::runtime_state::engine().await {
+            Some(engine) => serde_json::to_value(engine.config.chain_reports())
+                .unwrap_or(Value::Null),
+            None => Value::Array(Vec::new()),
+        }
+    };
+    ok(&call.id, block_on(future).unwrap_or(Value::Array(Vec::new())))
 }
 
 fn handle_connection_count(call: &MethodCall) -> Vec<u8> {
