@@ -355,7 +355,7 @@ mod tests {
         assert_eq!(event["data"]["metadata"]["host"], "example.com");
         assert_eq!(event["data"]["metadata"]["process"], "com.example.app");
         assert_eq!(event["data"]["rule"], "MATCH");
-        let all = tracker.snapshot_json();
+        let all = tracker.snapshot_json().await;
         assert_eq!(all["connections"][0]["metadata"]["process"], "com.example.app");
     }
 
