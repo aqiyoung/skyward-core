@@ -7,7 +7,7 @@
 //! proxy cannot know in advance.
 
 use std::io::{self, Read, Write};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -93,29 +93,16 @@ pub fn diag_udp(message: String) {
     }
 }
 
-/// Refused-packet diagnostics, on their own counter so the health-check
-/// storm that saturates `diag` cannot hide which apps are being refused
-/// (and how: v6 TCP, v6 UDP, or v4 UDP) while a failure is investigated.
-fn diag_refuse(message: String) {
-    static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    if COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
-        crate::jni::emit_log_event(&format!("[rust-core] {}", message));
-    }
-}
-
 fn handle_packet<T: Read + Write + Send + 'static>(
     packet: &[u8],
     tcp: &mut TcpManager<T>,
     udp: &UdpManager<T>,
     io: &Arc<Mutex<T>>,
 ) {
-    // The VPN service routes IPv6 into the TUN whenever the profile enables
-    // it, but this stack is IPv4-only. Dropping v6 packets silently (the old
-    // behaviour) black-holes every v6-preferred app: its traffic never even
-    // reaches DNS, and the app waits out long timeouts instead of falling
-    // back to IPv4. Refuse v6 fast instead (see handle_ipv6_packet).
+    // Dual-stack: v6 TCP/UDP is relayed through the same TCP/UDP managers as
+    // v4 (see handle_ipv6_packet); DNS still gets a direct fake-ip answer.
     if packet.first().map(|b| b >> 4) == Some(6) {
-        handle_ipv6_packet(packet, io);
+        handle_ipv6_packet(packet, tcp, udp, io);
         return;
     }
     let Some(ip) = super::tcp::parse_ipv4(packet) else {
@@ -135,7 +122,13 @@ fn handle_packet<T: Read + Write + Send + 'static>(
             } else if let (Some(src_port), Some(dst_port)) = (src_port, dst_port) {
                 let payload_start = ip.ihl + 8;
                 if let Some(payload) = packet.get(payload_start..) {
-                    udp.handle_packet(ip.src, src_port, ip.dst, dst_port, payload);
+                    udp.handle_packet(
+                        IpAddr::V4(ip.src),
+                        src_port,
+                        IpAddr::V4(ip.dst),
+                        dst_port,
+                        payload,
+                    );
                 }
             }
         }
@@ -160,60 +153,36 @@ pub(crate) fn icmp_budget() -> bool {
     state.1 <= 50
 }
 
-/// Handle one IPv6 packet from the TUN. This core terminates IPv4 only, so
-/// v6 traffic is refused *fast* rather than dropped silently: DNS queries
-/// (UDP/53) are answered over v6 transport with the same fake-ip answers the
-/// v4 path gives, and any other TCP/UDP packet gets an ICMPv6 Destination
-/// Unreachable, which makes the sending app abandon IPv6 and fall back to
-/// IPv4 at once — the same behaviour as joining a v4-only network.
-fn handle_ipv6_packet<T: Read + Write + Send + 'static>(packet: &[u8], io: &Arc<Mutex<T>>) {
-    if packet.len() < 40 {
+/// Handle one IPv6 packet from the TUN. DNS (UDP/53) keeps its direct fake-ip
+/// answer; every other TCP/UDP packet is handed to the regular proxy stacks,
+/// so IPv6-preferred apps no longer stall after an ICMP refusal.
+fn handle_ipv6_packet<T: Read + Write + Send + 'static>(
+    packet: &[u8],
+    tcp: &mut TcpManager<T>,
+    udp: &UdpManager<T>,
+    io: &Arc<Mutex<T>>,
+) {
+    let Some(ip) = super::tcp::parse_ipv6(packet) else {
         return;
-    }
-    let next_header = packet[6];
-    let mut src = [0u8; 16];
-    let mut dst = [0u8; 16];
-    src.copy_from_slice(&packet[8..24]);
-    dst.copy_from_slice(&packet[24..40]);
-    let payload = &packet[40..];
-    let src_port = payload
+    };
+    let transport = packet.get(ip.payload_offset..).unwrap_or(&[]);
+    let src_port = transport
         .get(0..2)
-        .map(|b| u16::from_be_bytes([b[0], b[1]]))
-        .unwrap_or(0);
-    let dst_port = payload
+        .map(|b| u16::from_be_bytes([b[0], b[1]]));
+    let dst_port = transport
         .get(2..4)
-        .map(|b| u16::from_be_bytes([b[0], b[1]]))
-        .unwrap_or(0);
-    let src6 = std::net::Ipv6Addr::from(src);
-    let dst6 = std::net::Ipv6Addr::from(dst);
-    match next_header {
+        .map(|b| u16::from_be_bytes([b[0], b[1]]));
+    match ip.next_header {
         17 => {
-            // UDP
-            if dst_port == 53 {
-                handle_dns_packet6(packet, src, dst, io);
-            } else if icmp_budget() {
-                diag_refuse(format!(
-                    "udp6 refuse {}:{} -> {}:{}",
-                    src6, src_port, dst6, dst_port
-                ));
-                if let Some(reply) = build_icmp6_unreachable(packet, 4) {
-                    let _ = io.lock().unwrap().write_all(&reply);
-                }
+            if dst_port == Some(53) {
+                handle_dns_packet6(packet, ip.src.octets(), ip.dst.octets(), io);
+            } else if let (Some(src_port), Some(dst_port), Some(payload)) =
+                (src_port, dst_port, transport.get(8..))
+            {
+                udp.handle_packet6(ip.src, src_port, ip.dst, dst_port, payload);
             }
         }
-        6 => {
-            // TCP: address unreachable is a hard error for connect(), so the
-            // app fails over to IPv4 immediately instead of timing out.
-            if icmp_budget() {
-                diag_refuse(format!(
-                    "tcp6 refuse {}:{} -> {}:{}",
-                    src6, src_port, dst6, dst_port
-                ));
-                if let Some(reply) = build_icmp6_unreachable(packet, 3) {
-                    let _ = io.lock().unwrap().write_all(&reply);
-                }
-            }
-        }
+        6 => tcp.handle_packet6(packet),
         _ => {}
     }
 }
@@ -317,11 +286,11 @@ fn build_udp_packet6(
     out
 }
 
-/// Build an ICMPv6 Destination Unreachable answering `original` (a full
-/// IPv6 packet). `code` is 3 (address unreachable) for TCP and 4 (port
-/// unreachable) for UDP. The reply quotes as much of the original packet as
+/// Build an ICMPv6 Destination Unreachable answering `original` (a full IPv6
+/// packet). Only used when a UDP session cannot be dialed at all: `code` is 4
+/// (port unreachable). The reply quotes as much of the original packet as
 /// fits inside the 1280-byte minimum IPv6 MTU.
-fn build_icmp6_unreachable(original: &[u8], code: u8) -> Option<Vec<u8>> {
+pub(crate) fn build_icmp6_unreachable(original: &[u8], code: u8) -> Option<Vec<u8>> {
     if original.len() < 40 {
         return None;
     }
@@ -383,7 +352,13 @@ fn handle_dns_packet<T: Read + Write + Send + 'static>(
         _ => None,
     };
     let response = build_dns_response(payload, answer_ip, qtype != 1);
-    let packet = crate::tun::tcp::build_udp_packet(ip.dst, ip.src, 53, src_port, &response);
+    let packet = crate::tun::tcp::build_udp_packet(
+        IpAddr::V4(ip.dst),
+        IpAddr::V4(ip.src),
+        53,
+        src_port,
+        &response,
+    );
     if let Err(e) = io.lock().unwrap().write_all(&packet) {
         tracing::debug!("TUN DNS reply write failed: {}", e);
     }
@@ -575,7 +550,13 @@ mod tests {
         let question_end = query.len();
         query[11] = 1;
         query.extend_from_slice(&[0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 0]);
-        let packet = super::super::tcp::build_udp_packet(client, dns, 12345, 53, &query);
+        let packet = super::super::tcp::build_udp_packet(
+            IpAddr::V4(client),
+            IpAddr::V4(dns),
+            12345,
+            53,
+            &query,
+        );
         let header = super::super::tcp::parse_ipv4(&packet).unwrap();
         let io = Arc::new(Mutex::new(std::io::Cursor::new(Vec::new())));
         handle_dns_packet(&packet, &header, &io);
@@ -604,8 +585,8 @@ mod tests {
     #[test]
     fn ipv4_info_parses_header() {
         let packet = crate::tun::tcp::build_udp_packet(
-            Ipv4Addr::new(198, 18, 0, 1),
-            Ipv4Addr::new(198, 18, 0, 2),
+            IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(198, 18, 0, 2)),
             12345,
             53,
             &[0xaa, 0xbb],
@@ -658,6 +639,47 @@ mod tests {
         src.copy_from_slice(&reply[8..24]);
         dst.copy_from_slice(&reply[24..40]);
         assert_eq!(checksum6(src, dst, 58, icmp), 0);
+    }
+
+    #[tokio::test]
+    async fn ipv6_tcp_syn_is_forwarded_not_refused() {
+        struct V6Io {
+            out: Vec<u8>,
+        }
+        impl Read for V6Io {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "no data"))
+            }
+        }
+        impl Write for V6Io {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.out.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let engine = Arc::new(
+            Engine::new(
+                crate::config::Config::default(),
+                Arc::new(crate::common::TrafficStats::default()),
+                std::path::Path::new("."),
+            )
+            .await,
+        );
+        let io = Arc::new(Mutex::new(V6Io { out: Vec::new() }));
+        let mut tcp = TcpManager::new(engine.clone(), io.clone());
+        let udp = UdpManager::new(engine, io.clone());
+
+        handle_packet(&v6_tcp_syn(), &mut tcp, &udp, &io);
+        let out = io.lock().unwrap().out.clone();
+        assert!(!out.is_empty(), "a v6 SYN must get a SYN-ACK, not a drop");
+        assert_eq!(out[0] >> 4, 6, "reply must be IPv6");
+        assert_eq!(out[6], 6, "reply must be TCP, not ICMPv6 unreachable");
+        assert_eq!(u16::from_be_bytes([out[40], out[41]]), 443);
+        assert_eq!(u16::from_be_bytes([out[42], out[43]]), 40000);
     }
 
     #[test]

@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -28,9 +28,9 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct SessionKey {
-    src: Ipv4Addr,
+    src: IpAddr,
     src_port: u16,
-    dst: Ipv4Addr,
+    dst: IpAddr,
     dst_port: u16,
 }
 
@@ -55,8 +55,20 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
     }
 
     /// Forward one outbound UDP payload from the TUN.
-    pub fn handle_packet(&self, src: Ipv4Addr, src_port: u16, dst: Ipv4Addr, dst_port: u16, payload: &[u8]) {
-        let key = SessionKey { src, src_port, dst, dst_port };
+    pub fn handle_packet(
+        &self,
+        src: IpAddr,
+        src_port: u16,
+        dst: IpAddr,
+        dst_port: u16,
+        payload: &[u8],
+    ) {
+        let key = SessionKey {
+            src,
+            src_port,
+            dst,
+            dst_port,
+        };
         let sender = {
             let mut sessions = self.sessions.lock().unwrap();
             if let Some(sender) = sessions.get(&key) {
@@ -82,6 +94,25 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
         let _ = sender.try_send(payload.to_vec());
     }
 
+    /// Forward one outbound IPv6/UDP payload from the TUN. Sessions are
+    /// keyed by `IpAddr`, so v6 shares the dial/relay path with v4.
+    pub fn handle_packet6(
+        &self,
+        src: Ipv6Addr,
+        src_port: u16,
+        dst: Ipv6Addr,
+        dst_port: u16,
+        payload: &[u8],
+    ) {
+        self.handle_packet(
+            IpAddr::V6(src),
+            src_port,
+            IpAddr::V6(dst),
+            dst_port,
+            payload,
+        );
+    }
+
     fn spawn_session(&self, key: SessionKey, mut rx: mpsc::Receiver<Vec<u8>>, first_payload: Vec<u8>, package: Option<String>) {
         let fallback_engine = self.engine.clone();
         let io = self.io.clone();
@@ -90,9 +121,14 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
         while tasks.try_join_next().is_some() {}
         tasks.spawn(async move {
             let engine = crate::runtime_state::engine().await.unwrap_or(fallback_engine);
-            let target = match crate::fake_ip::hostname_for(key.dst) {
-                Some(host) => TargetAddr::Domain(host, key.dst_port),
-                None => TargetAddr::Ip(key.dst.into(), key.dst_port),
+            // Fake IPs only exist for IPv4; real v6 destinations are dialed
+            // as-is, with no domain to recover from the packet.
+            let target = match key.dst {
+                IpAddr::V4(v4) => match crate::fake_ip::hostname_for(v4) {
+                    Some(host) => TargetAddr::Domain(host, key.dst_port),
+                    None => TargetAddr::Ip(key.dst, key.dst_port),
+                },
+                IpAddr::V6(_) => TargetAddr::Ip(key.dst, key.dst_port),
             };
             let (conn, rule, final_name) = match tokio::time::timeout(DIAL_TIMEOUT, engine.dial_udp(&target)).await {
                 Ok(Ok(dialed)) => dialed,
@@ -209,49 +245,83 @@ fn refuse<T: Write>(io: &Arc<Mutex<T>>, key: &SessionKey, payload_len: usize) {
 /// The refusal quotes a synthetic copy of the triggering datagram; the
 /// IPv4 and UDP headers are all the receiving stack matches on.
 fn refuse_packet(key: &SessionKey, payload_len: usize) -> Option<Vec<u8>> {
-    let mut original = vec![0u8; 28];
-    original[0] = 0x45;
-    original[2..4].copy_from_slice(&((28 + payload_len) as u16).to_be_bytes());
-    original[8] = 64;
-    original[9] = 17;
-    original[12..16].copy_from_slice(&key.src.octets());
-    original[16..20].copy_from_slice(&key.dst.octets());
-    original[20..22].copy_from_slice(&key.src_port.to_be_bytes());
-    original[22..24].copy_from_slice(&key.dst_port.to_be_bytes());
-    original[24..26].copy_from_slice(&((8 + payload_len) as u16).to_be_bytes());
-    crate::tun::tcp::build_icmp_port_unreachable(&original, 20)
+    match (key.src, key.dst) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            let mut original = vec![0u8; 28];
+            original[0] = 0x45;
+            original[2..4].copy_from_slice(&((28 + payload_len) as u16).to_be_bytes());
+            original[8] = 64;
+            original[9] = 17;
+            original[12..16].copy_from_slice(&src.octets());
+            original[16..20].copy_from_slice(&dst.octets());
+            original[20..22].copy_from_slice(&key.src_port.to_be_bytes());
+            original[22..24].copy_from_slice(&key.dst_port.to_be_bytes());
+            original[24..26].copy_from_slice(&((8 + payload_len) as u16).to_be_bytes());
+            crate::tun::tcp::build_icmp_port_unreachable(&original, 20)
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            // Same fast fallback for v6: quote a synthetic v6/UDP datagram in
+            // an ICMPv6 port-unreachable when an outbound cannot carry UDP.
+            let udp_len = 8 + payload_len;
+            let mut original = Vec::with_capacity(40 + 8);
+            original.push(0x60);
+            original.extend_from_slice(&[0, 0, 0]);
+            original.extend_from_slice(&(udp_len as u16).to_be_bytes());
+            original.push(17);
+            original.push(64);
+            original.extend_from_slice(&src.octets());
+            original.extend_from_slice(&dst.octets());
+            original.extend_from_slice(&key.src_port.to_be_bytes());
+            original.extend_from_slice(&key.dst_port.to_be_bytes());
+            original.extend_from_slice(&(udp_len as u16).to_be_bytes());
+            original.extend_from_slice(&[0; 4]); // checksum + unused
+            crate::tun::runtime::build_icmp6_unreachable(&original, 4)
+        }
+        _ => None,
+    }
 }
 
-/// Build a complete IPv4/UDP packet carrying `payload` from
-/// (src, src_port) to (dst, dst_port), with both checksums filled in.
+/// Build a complete IP/UDP packet carrying `payload` from (src, src_port) to
+/// (dst, dst_port), with the header and transport checksums filled in.
 pub fn build_udp_reply(
-    src: Ipv4Addr,
+    src: IpAddr,
     src_port: u16,
-    dst: Ipv4Addr,
+    dst: IpAddr,
     dst_port: u16,
     payload: &[u8],
 ) -> Vec<u8> {
-    let udp_len = 8 + payload.len();
-    let total_len = 20 + udp_len;
-    let mut packet = vec![0u8; total_len];
-    packet[0] = 0x45; // version + IHL
-    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-    let id: u16 = rand::random();
-    packet[4..6].copy_from_slice(&id.to_be_bytes());
-    packet[8] = 64; // TTL
-    packet[9] = 17; // UDP
-    packet[12..16].copy_from_slice(&src.octets());
-    packet[16..20].copy_from_slice(&dst.octets());
-    let ip_sum = checksum(&packet[..20]);
-    packet[10..12].copy_from_slice(&ip_sum.to_be_bytes());
+    match (src, dst) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            let udp_len = 8 + payload.len();
+            let total_len = 20 + udp_len;
+            let mut packet = vec![0u8; total_len];
+            packet[0] = 0x45; // version + IHL
+            packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+            let id: u16 = rand::random();
+            packet[4..6].copy_from_slice(&id.to_be_bytes());
+            packet[8] = 64; // TTL
+            packet[9] = 17; // UDP
+            packet[12..16].copy_from_slice(&src.octets());
+            packet[16..20].copy_from_slice(&dst.octets());
+            let ip_sum = checksum(&packet[..20]);
+            packet[10..12].copy_from_slice(&ip_sum.to_be_bytes());
 
-    packet[20..22].copy_from_slice(&src_port.to_be_bytes());
-    packet[22..24].copy_from_slice(&dst_port.to_be_bytes());
-    packet[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
-    packet[28..].copy_from_slice(payload);
-    let udp_sum = checksum_udp(src, dst, &packet[20..]);
-    packet[26..28].copy_from_slice(&(if udp_sum == 0 { 0xffff } else { udp_sum }).to_be_bytes());
-    packet
+            packet[20..22].copy_from_slice(&src_port.to_be_bytes());
+            packet[22..24].copy_from_slice(&dst_port.to_be_bytes());
+            packet[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
+            packet[28..].copy_from_slice(payload);
+            let udp_sum = checksum_udp(src, dst, &packet[20..]);
+            packet[26..28]
+                .copy_from_slice(&(if udp_sum == 0 { 0xffff } else { udp_sum }).to_be_bytes());
+            packet
+        }
+        // v6 needs the RFC 8200 pseudo-header checksum; the shared builder
+        // already handles it.
+        (IpAddr::V6(_), IpAddr::V6(_)) => {
+            crate::tun::tcp::build_udp_packet(src, dst, src_port, dst_port, payload)
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn checksum(data: &[u8]) -> u16 {
@@ -300,6 +370,84 @@ mod tests {
             0
         );
         assert_eq!(&packet[28..], b"hello");
+    }
+
+    #[tokio::test]
+    async fn ipv6_payload_opens_a_session_instead_of_refusing() {
+        let engine = Arc::new(
+            Engine::new(
+                crate::config::Config::default(),
+                Arc::new(crate::common::TrafficStats::default()),
+                std::path::Path::new("."),
+            )
+            .await,
+        );
+        let io = Arc::new(Mutex::new(std::io::Cursor::new(Vec::new())));
+        let mut udp = UdpManager::new(engine, io.clone());
+        udp.handle_packet6(
+            "fdfe:dcba:9876::1".parse().unwrap(),
+            53123,
+            "2606:4700::1".parse().unwrap(),
+            443,
+            b"hello",
+        );
+        assert_eq!(udp.sessions.lock().unwrap().len(), 1, "v6 UDP opens a session");
+        assert!(
+            io.lock().unwrap().get_ref().is_empty(),
+            "no immediate ICMPv6 refusal may be written"
+        );
+        udp.shutdown().await;
+    }
+
+    fn verify_checksum6(src: Ipv6Addr, dst: Ipv6Addr, proto: u8, data: &[u8]) -> u16 {
+        let mut buf = Vec::with_capacity(40 + data.len());
+        buf.extend_from_slice(&src.octets());
+        buf.extend_from_slice(&dst.octets());
+        buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&[0, 0, 0, proto]);
+        buf.extend_from_slice(data);
+        checksum(&buf)
+    }
+
+    #[test]
+    fn ipv6_udp_reply_has_ipv6_header_and_valid_checksum() {
+        let src: IpAddr = "fdfe:dcba:9876::2".parse().unwrap();
+        let dst: IpAddr = "fdfe:dcba:9876::1".parse().unwrap();
+        let packet = build_udp_reply(src, 443, dst, 53123, b"hello");
+        assert_eq!(packet.len(), 40 + 8 + 5);
+        assert_eq!(packet[0] >> 4, 6);
+        assert_eq!(packet[6], 17);
+        let IpAddr::V6(s6) = src else { unreachable!() };
+        let IpAddr::V6(d6) = dst else { unreachable!() };
+        let udp = &packet[40..];
+        assert_eq!(u16::from_be_bytes([udp[0], udp[1]]), 443);
+        assert_eq!(u16::from_be_bytes([udp[2], udp[3]]), 53123);
+        assert_eq!(verify_checksum6(s6, d6, 17, udp), 0);
+    }
+
+    #[test]
+    fn ipv6_refuse_packet_is_icmp6_port_unreachable() {
+        let key = SessionKey {
+            src: "fdfe:dcba:9876::1".parse().unwrap(),
+            src_port: 53123,
+            dst: "2606:4700::1".parse().unwrap(),
+            dst_port: 443,
+        };
+        let packet = refuse_packet(&key, 1200).unwrap();
+        assert_eq!(packet[0] >> 4, 6);
+        assert_eq!(packet[6], 58, "ICMPv6 next header");
+        let IpAddr::V6(src) = key.src else {
+            unreachable!()
+        };
+        let IpAddr::V6(dst) = key.dst else {
+            unreachable!()
+        };
+        assert_eq!(&packet[8..24], &dst.octets(), "answered by the target");
+        assert_eq!(&packet[24..40], &src.octets(), "sent to the app");
+        let icmp = &packet[40..];
+        assert_eq!(icmp[0], 1, "destination unreachable");
+        assert_eq!(icmp[1], 4, "port unreachable");
+        assert_eq!(verify_checksum6(dst, src, 58, icmp), 0);
     }
 
     #[test]

@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -48,9 +48,9 @@ fn diag(message: String) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FlowKey {
-    pub client_ip: Ipv4Addr,
+    pub client_ip: IpAddr,
     pub client_port: u16,
-    pub target_ip: Ipv4Addr,
+    pub target_ip: IpAddr,
     pub target_port: u16,
 }
 
@@ -106,7 +106,7 @@ pub struct TcpManager<T> {
     engine: Arc<Engine>,
     io: Arc<Mutex<T>>,
     tasks: Mutex<tokio::task::JoinSet<()>>,
-    /// Largest payload one packet written back to the TUN may carry: the
+    /// Largest payload one IPv4 packet written back to the TUN may carry: the
     /// interface MTU minus the IPv4+TCP headers. A larger packet is dropped
     /// by the kernel, and this stack keeps no retransmission state, so the
     /// bytes would be lost for good and the flow would stall.
@@ -129,6 +129,15 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
         self.mtu_payload = mtu.saturating_sub(40).max(536);
     }
 
+    /// IPv6 carries 20 more bytes of header than IPv4, so the same link MTU
+    /// leaves 20 fewer bytes for TCP payload (and for the advertised MSS).
+    fn payload_cap(&self, key: &FlowKey) -> usize {
+        match key.target_ip {
+            IpAddr::V6(_) => self.mtu_payload.saturating_sub(20),
+            IpAddr::V4(_) => self.mtu_payload,
+        }
+    }
+
     /// Handle one raw IPv4 packet read from the TUN.
     pub fn handle_packet(&mut self, packet: &[u8]) {
         let Some(ip) = parse_ipv4(packet) else { return };
@@ -136,10 +145,44 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             return;
         }
         let Some(tcp) = parse_tcp(packet, ip.ihl) else { return };
+        self.process_packet(
+            packet,
+            IpAddr::V4(ip.src),
+            IpAddr::V4(ip.dst),
+            ip.ihl,
+            tcp,
+        );
+    }
+
+    /// Handle one raw IPv6/TCP packet read from the TUN. The state machine is
+    /// shared with IPv4; only the addresses and transport offset differ.
+    pub fn handle_packet6(&mut self, packet: &[u8]) {
+        let Some(ip) = parse_ipv6(packet) else { return };
+        if ip.next_header != 6 {
+            return;
+        }
+        let Some(tcp) = parse_tcp(packet, ip.payload_offset) else { return };
+        self.process_packet(
+            packet,
+            IpAddr::V6(ip.src),
+            IpAddr::V6(ip.dst),
+            ip.payload_offset,
+            tcp,
+        );
+    }
+
+    fn process_packet(
+        &mut self,
+        packet: &[u8],
+        src: IpAddr,
+        dst: IpAddr,
+        payload_offset: usize,
+        tcp: TcpHeader,
+    ) {
         let key = FlowKey {
-            client_ip: ip.src,
+            client_ip: src,
             client_port: tcp.src_port,
-            target_ip: ip.dst,
+            target_ip: dst,
             target_port: tcp.dst_port,
         };
 
@@ -231,7 +274,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                 }
             }
 
-            let payload = tcp.payload(packet, ip.ihl);
+            let payload = tcp.payload(packet, payload_offset);
             let mut act = Act::None;
 
             if flow.fin_sent {
@@ -301,7 +344,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
     /// SYN-ACK carrying an MSS option, like a real stack sends: without it
     /// peers fall back to a 536-byte default segment size.
     fn send_syn_ack(&self, key: FlowKey, seq: u32, ack: u32) {
-        let mss = self.mtu_payload.min(u16::MAX as usize) as u16;
+        let mss = self.payload_cap(&key).min(u16::MAX as usize) as u16;
         let options = [2u8, 4, (mss >> 8) as u8, (mss & 0xff) as u8];
         let packet = build_packet_opts(
             key.target_ip,
@@ -366,7 +409,8 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             let Some(from_net) = self.flows.get(&key).map(|f| f.from_net.clone()) else {
                 continue;
             };
-            let mut buf = vec![0u8; self.mtu_payload];
+            let cap_limit = self.payload_cap(&key);
+            let mut buf = vec![0u8; cap_limit];
             for _ in 0..256 {
                 let (window_left, seq, ack) = {
                     let Some(flow) = self.flows.get(&key) else { break };
@@ -384,7 +428,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                 if window_left == 0 {
                     break;
                 }
-                let cap = (window_left as usize).min(self.mtu_payload);
+                let cap = (window_left as usize).min(cap_limit);
                 let n = from_net.pop(&mut buf[..cap]);
                 if n == 0 {
                     break;
@@ -470,9 +514,13 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
         // If the destination is a fake-ip we handed out in DNS, recover the
         // original hostname so rules match by domain and proxies receive the
         // real host instead of a synthetic address.
-        let target = match crate::fake_ip::hostname_for(key.target_ip) {
-            Some(host) => TargetAddr::Domain(host, key.target_port),
-            None => TargetAddr::Ip(std::net::IpAddr::V4(key.target_ip), key.target_port),
+        // Fake IPs only exist for IPv4; a real IPv6 destination is dialed as-is.
+        let target = match key.target_ip {
+            IpAddr::V4(v4) => match crate::fake_ip::hostname_for(v4) {
+                Some(host) => TargetAddr::Domain(host, key.target_port),
+                None => key_target_addr(&key),
+            },
+            IpAddr::V6(_) => key_target_addr(&key),
         };
         // Log the resolved target (domain when known), not the fake IP, so a
         // log export names the site a flow belongs to.
@@ -640,11 +688,11 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
 }
 
 /// Build the dial target directly from the parsed flow key. The target IP is
-/// already an `Ipv4Addr` from the packet; never round-trip through an
+/// already an `IpAddr` from the packet; never round-trip through an
 /// `"ip:port"` string parsed as `IpAddr` (that always failed and dropped every
 /// TUN connection).
 fn key_target_addr(key: &FlowKey) -> TargetAddr {
-    TargetAddr::Ip(std::net::IpAddr::V4(key.target_ip), key.target_port)
+    TargetAddr::Ip(key.target_ip, key.target_port)
 }
 
 pub(crate) struct Ipv4Info {
@@ -670,6 +718,56 @@ pub(crate) fn parse_ipv4(packet: &[u8]) -> Option<Ipv4Info> {
     })
 }
 
+pub(crate) struct Ipv6Info {
+    pub src: Ipv6Addr,
+    pub dst: Ipv6Addr,
+    /// Final protocol number after any extension headers (6 = TCP, 17 = UDP).
+    pub next_header: u8,
+    /// Byte offset at which the transport header starts.
+    pub payload_offset: usize,
+}
+
+/// Parse the fixed 40-byte IPv6 header, walking the common extension headers
+/// so TCP/UDP are read from the real transport header. The walk is bounded to
+/// a handful of headers so a malformed chain cannot stall the TUN read loop.
+pub(crate) fn parse_ipv6(packet: &[u8]) -> Option<Ipv6Info> {
+    if packet.len() < 40 || packet[0] >> 4 != 6 {
+        return None;
+    }
+    let mut next_header = packet[6];
+    let mut offset = 40usize;
+    for _ in 0..8 {
+        let len = match next_header {
+            // Hop-by-hop, routing, and destination options: the length field
+            // counts 8-byte units after the first one (RFC 8200 §4).
+            0 | 43 | 60 => (*packet.get(offset + 1)? as usize + 1) * 8,
+            // AH: length is in 32-bit words minus two (RFC 4302 §2).
+            51 => (*packet.get(offset + 1)? as usize + 2) * 4,
+            _ => break,
+        };
+        let following = *packet.get(offset)?;
+        offset = offset.checked_add(len)?;
+        if offset > packet.len() {
+            return None;
+        }
+        next_header = following;
+    }
+    if next_header == 59 {
+        // No next header (RFC 8200 §4.7).
+        return None;
+    }
+    let mut src = [0u8; 16];
+    let mut dst = [0u8; 16];
+    src.copy_from_slice(&packet[8..24]);
+    dst.copy_from_slice(&packet[24..40]);
+    Some(Ipv6Info {
+        src: Ipv6Addr::from(src),
+        dst: Ipv6Addr::from(dst),
+        next_header,
+        payload_offset: offset,
+    })
+}
+
 struct TcpHeader {
     src_port: u16,
     dst_port: u16,
@@ -681,8 +779,8 @@ struct TcpHeader {
 }
 
 impl TcpHeader {
-    fn payload<'a>(&self, packet: &'a [u8], ihl: usize) -> &'a [u8] {
-        let start = ihl + self.data_offset;
+    fn payload<'a>(&self, packet: &'a [u8], payload_offset: usize) -> &'a [u8] {
+        let start = payload_offset + self.data_offset;
         if start >= packet.len() {
             return &[];
         }
@@ -690,8 +788,10 @@ impl TcpHeader {
     }
 }
 
-fn parse_tcp(packet: &[u8], ihl: usize) -> Option<TcpHeader> {
-    let p = &packet[ihl..];
+/// `payload_offset` is the IPv4 IHL (20+), or 40 plus any IPv6 extension
+/// headers — the caller knows which family it parsed.
+fn parse_tcp(packet: &[u8], payload_offset: usize) -> Option<TcpHeader> {
+    let p = packet.get(payload_offset..)?;
     if p.len() < 20 {
         return None;
     }
@@ -706,10 +806,71 @@ fn parse_tcp(packet: &[u8], ihl: usize) -> Option<TcpHeader> {
     })
 }
 
-/// Build a complete IPv4/TCP packet with valid checksums.
+/// Checksum pseudo-header: RFC 791 §3.1 for IPv4, RFC 8200 §8.1 for IPv6.
+/// The v6 form is 16-byte src + 16-byte dst + 32-bit length + 3 zero bytes +
+/// the next-header number.
+fn pseudo_header(src: IpAddr, dst: IpAddr, proto: u8, len: usize) -> Vec<u8> {
+    match (src, dst) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            let mut pseudo = Vec::with_capacity(12);
+            pseudo.extend_from_slice(&src.octets());
+            pseudo.extend_from_slice(&dst.octets());
+            pseudo.push(0);
+            pseudo.push(proto);
+            pseudo.extend_from_slice(&(len as u16).to_be_bytes());
+            pseudo
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            let mut pseudo = Vec::with_capacity(40);
+            pseudo.extend_from_slice(&src.octets());
+            pseudo.extend_from_slice(&dst.octets());
+            pseudo.extend_from_slice(&(len as u32).to_be_bytes());
+            pseudo.extend_from_slice(&[0, 0, 0]);
+            pseudo.push(proto);
+            pseudo
+        }
+        // Both addresses always come from the same parsed packet.
+        _ => Vec::new(),
+    }
+}
+
+/// Build the IP header for an outbound packet. IPv6 has no header checksum;
+/// its mandatory transport checksum covers the pseudo-header instead.
+fn build_ip_header(src: IpAddr, dst: IpAddr, proto: u8, payload_len: usize) -> Vec<u8> {
+    match (src, dst) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            let mut ip = [0u8; 20];
+            ip[0] = 0x45;
+            ip[2..4].copy_from_slice(&((20 + payload_len) as u16).to_be_bytes());
+            ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
+            ip[8] = 64;
+            ip[9] = proto;
+            ip[12..16].copy_from_slice(&src.octets());
+            ip[16..20].copy_from_slice(&dst.octets());
+            let ip_checksum = checksum(&ip);
+            ip[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+            ip.to_vec()
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            let mut ip = Vec::with_capacity(40);
+            ip.push(0x60);
+            ip.extend_from_slice(&[0, 0, 0]); // traffic class + flow label
+            ip.extend_from_slice(&(payload_len as u16).to_be_bytes());
+            ip.push(proto);
+            ip.push(64); // hop limit
+            ip.extend_from_slice(&src.octets());
+            ip.extend_from_slice(&dst.octets());
+            ip
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Build a complete IP/TCP packet with valid checksums, v4 or v6 according to
+/// the address family of `src`/`dst`.
 fn build_packet(
-    src: Ipv4Addr,
-    dst: Ipv4Addr,
+    src: IpAddr,
+    dst: IpAddr,
     src_port: u16,
     dst_port: u16,
     seq: u32,
@@ -720,12 +881,12 @@ fn build_packet(
     build_packet_opts(src, dst, src_port, dst_port, seq, ack, flags, &[], payload)
 }
 
-/// Build an IPv4/TCP packet with TCP options (already padded to a multiple
-/// of 4 bytes), e.g. the MSS option on a SYN-ACK.
+/// Build an IP/TCP packet with TCP options (already padded to a multiple of
+/// 4 bytes), e.g. the MSS option on a SYN-ACK.
 #[allow(clippy::too_many_arguments)]
 fn build_packet_opts(
-    src: Ipv4Addr,
-    dst: Ipv4Addr,
+    src: IpAddr,
+    dst: IpAddr,
     src_port: u16,
     dst_port: u16,
     seq: u32,
@@ -735,19 +896,8 @@ fn build_packet_opts(
     payload: &[u8],
 ) -> Vec<u8> {
     let header_len = 20 + options.len();
-    let mut ip = [0u8; 20];
-    let total_len = 20 + header_len + payload.len();
-    ip[0] = 0x45;
-    ip[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-    ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
-    ip[8] = 64;
-    ip[9] = 6;
-    ip[12..16].copy_from_slice(&src.octets());
-    ip[16..20].copy_from_slice(&dst.octets());
-    let ip_checksum = checksum(&ip);
-    ip[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
-
-    let mut tcp = vec![0u8; header_len + payload.len()];
+    let payload_len = header_len + payload.len();
+    let mut tcp = vec![0u8; payload_len];
     tcp[0..2].copy_from_slice(&src_port.to_be_bytes());
     tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
     tcp[4..8].copy_from_slice(&seq.to_be_bytes());
@@ -758,60 +908,46 @@ fn build_packet_opts(
     tcp[20..20 + options.len()].copy_from_slice(options);
     tcp[header_len..].copy_from_slice(payload);
 
-    let mut pseudo = Vec::with_capacity(12 + tcp.len());
-    pseudo.extend_from_slice(&src.octets());
-    pseudo.extend_from_slice(&dst.octets());
-    pseudo.push(0);
-    pseudo.push(6);
-    pseudo.extend_from_slice(&(tcp.len() as u16).to_be_bytes());
+    let mut pseudo = pseudo_header(src, dst, 6, tcp.len());
     pseudo.extend_from_slice(&tcp);
     let tcp_checksum = checksum(&pseudo);
     tcp[16..18].copy_from_slice(&tcp_checksum.to_be_bytes());
 
-    let mut out = Vec::with_capacity(total_len);
+    let ip = build_ip_header(src, dst, 6, payload_len);
+    let mut out = Vec::with_capacity(ip.len() + tcp.len());
     out.extend_from_slice(&ip);
     out.extend_from_slice(&tcp);
     out
 }
 
-/// Build an IPv4/UDP packet with valid checksums.
+/// Build an IP/UDP packet with valid checksums, v4 or v6 according to the
+/// address family of `src`/`dst`.
 pub(crate) fn build_udp_packet(
-    src: Ipv4Addr,
-    dst: Ipv4Addr,
+    src: IpAddr,
+    dst: IpAddr,
     src_port: u16,
     dst_port: u16,
     payload: &[u8],
 ) -> Vec<u8> {
-    let mut ip = [0u8; 20];
     let udp_len = 8 + payload.len();
-    let total_len = 20 + udp_len;
-    ip[0] = 0x45;
-    ip[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-    ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
-    ip[8] = 64;
-    ip[9] = 17;
-    ip[12..16].copy_from_slice(&src.octets());
-    ip[16..20].copy_from_slice(&dst.octets());
-    let ip_checksum = checksum(&ip);
-    ip[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
-
     let mut udp = vec![0u8; udp_len];
     udp[0..2].copy_from_slice(&src_port.to_be_bytes());
     udp[2..4].copy_from_slice(&dst_port.to_be_bytes());
     udp[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
     udp[8..].copy_from_slice(payload);
 
-    let mut pseudo = Vec::with_capacity(12 + udp.len());
-    pseudo.extend_from_slice(&src.octets());
-    pseudo.extend_from_slice(&dst.octets());
-    pseudo.push(0);
-    pseudo.push(17);
-    pseudo.extend_from_slice(&(udp_len as u16).to_be_bytes());
+    let mut pseudo = pseudo_header(src, dst, 17, udp.len());
     pseudo.extend_from_slice(&udp);
-    let udp_checksum = checksum(&pseudo);
+    let mut udp_checksum = checksum(&pseudo);
+    // A computed zero checksum must be sent as all-ones over IPv6
+    // (RFC 8200 §8.1); both fold to the same value at the receiver.
+    if matches!(src, IpAddr::V6(_)) && udp_checksum == 0 {
+        udp_checksum = 0xffff;
+    }
     udp[6..8].copy_from_slice(&udp_checksum.to_be_bytes());
 
-    let mut out = Vec::with_capacity(total_len);
+    let ip = build_ip_header(src, dst, 17, udp_len);
+    let mut out = Vec::with_capacity(ip.len() + udp.len());
     out.extend_from_slice(&ip);
     out.extend_from_slice(&udp);
     out
@@ -878,12 +1014,16 @@ mod tests {
     use crate::config::Config;
     use crate::common::TrafficStats;
 
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
     #[test]
     fn flow_key_builds_a_valid_dial_target() {
         let key = FlowKey {
-            client_ip: Ipv4Addr::new(198, 18, 0, 1),
+            client_ip: v4(198, 18, 0, 1),
             client_port: 40000,
-            target_ip: Ipv4Addr::new(91, 108, 56, 150),
+            target_ip: v4(91, 108, 56, 150),
             target_port: 443,
         };
         let target = key_target_addr(&key);
@@ -911,8 +1051,8 @@ mod tests {
     }
 
     fn client_packet(
-        client: Ipv4Addr,
-        target: Ipv4Addr,
+        client: IpAddr,
+        target: IpAddr,
         cport: u16,
         tport: u16,
         seq: u32,
@@ -949,8 +1089,8 @@ mod tests {
     #[tokio::test]
     async fn syn_is_answered_with_syn_ack() {
         let (mut tcp, io) = manager().await;
-        let client = Ipv4Addr::new(198, 18, 0, 1);
-        let target = Ipv4Addr::new(1, 1, 1, 1);
+        let client = v4(198, 18, 0, 1);
+        let target = v4(1, 1, 1, 1);
         let syn = client_packet(client, target, 40000, 443, 1000, 0, SYN, &[]);
         tcp.handle_packet(&syn);
 
@@ -969,8 +1109,8 @@ mod tests {
     #[tokio::test]
     async fn payload_is_acked_and_queued_for_outbound() {
         let (mut tcp, io) = manager().await;
-        let client = Ipv4Addr::new(198, 18, 0, 1);
-        let target = Ipv4Addr::new(127, 0, 0, 1);
+        let client = v4(198, 18, 0, 1);
+        let target = v4(127, 0, 0, 1);
         let tport = 1u16;
         let cport = 40000u16;
         tcp.handle_packet(&client_packet(client, target, cport, tport, 1000, 0, SYN, &[]));
@@ -993,8 +1133,8 @@ mod tests {
     #[tokio::test]
     async fn unknown_flow_is_reset() {
         let (mut tcp, io) = manager().await;
-        let client = Ipv4Addr::new(198, 18, 0, 1);
-        let target = Ipv4Addr::new(9, 9, 9, 9);
+        let client = v4(198, 18, 0, 1);
+        let target = v4(9, 9, 9, 9);
         let pkt = client_packet(client, target, 40000, 443, 500, 0, ACK, &[]);
         tcp.handle_packet(&pkt);
         let out = io.lock().unwrap().out.clone();
@@ -1021,8 +1161,8 @@ mod tests {
 
         let (mut tcp, io) = manager().await;
         tcp.set_mtu(9000);
-        let client = Ipv4Addr::new(198, 18, 0, 1);
-        let target = Ipv4Addr::new(127, 0, 0, 1);
+        let client = v4(198, 18, 0, 1);
+        let target = v4(127, 0, 0, 1);
         let (cport, tport) = (40000u16, port);
 
         tcp.handle_packet(&client_packet(client, target, cport, tport, 1000, 0, SYN, &[]));
@@ -1080,8 +1220,8 @@ mod tests {
     #[tokio::test]
     async fn fin_half_closes_and_remote_eof_finishes() {
         let (mut tcp, io) = manager().await;
-        let client = Ipv4Addr::new(198, 18, 0, 1);
-        let target = Ipv4Addr::new(127, 0, 0, 1);
+        let client = v4(198, 18, 0, 1);
+        let target = v4(127, 0, 0, 1);
         let (cport, tport) = (40000u16, 1u16);
         tcp.handle_packet(&client_packet(client, target, cport, tport, 1000, 0, SYN, &[]));
         let synack = parse_tcp(&io.lock().unwrap().out.clone(), 20).unwrap();
@@ -1112,8 +1252,8 @@ mod tests {
     #[tokio::test]
     async fn duplicate_segment_is_not_queued_twice() {
         let (mut tcp, io) = manager().await;
-        let client = Ipv4Addr::new(198, 18, 0, 1);
-        let target = Ipv4Addr::new(127, 0, 0, 1);
+        let client = v4(198, 18, 0, 1);
+        let target = v4(127, 0, 0, 1);
         let (cport, tport) = (40000u16, 1u16);
         tcp.handle_packet(&client_packet(client, target, cport, tport, 1000, 0, SYN, &[]));
         tcp.handle_packet(&client_packet(client, target, cport, tport, 1001, 1, ACK, &[]));
@@ -1128,12 +1268,120 @@ mod tests {
     #[tokio::test]
     async fn syn_ack_carries_mss_option() {
         let (mut tcp, io) = manager().await;
-        let client = Ipv4Addr::new(198, 18, 0, 1);
-        let target = Ipv4Addr::new(1, 1, 1, 1);
+        let client = v4(198, 18, 0, 1);
+        let target = v4(1, 1, 1, 1);
         tcp.handle_packet(&client_packet(client, target, 40000, 443, 1000, 0, SYN, &[]));
         let out = io.lock().unwrap().out.clone();
         let reply = parse_tcp(&out, 20).expect("valid tcp");
         assert_eq!(reply.data_offset, 24, "SYN-ACK must carry 4 bytes of options");
         assert_eq!(&out[20 + 20..20 + 24], &[2, 4, 0x05, 0xb4], "MSS option = 1460");
+    }
+
+    /// Independently recompute a v6 checksum (RFC 8200 pseudo-header) so the
+    /// tests do not rely on the same helper the builder uses.
+    fn verify_checksum6(src: Ipv6Addr, dst: Ipv6Addr, proto: u8, data: &[u8]) -> u16 {
+        let mut pseudo = Vec::with_capacity(40 + data.len());
+        pseudo.extend_from_slice(&src.octets());
+        pseudo.extend_from_slice(&dst.octets());
+        pseudo.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        pseudo.extend_from_slice(&[0, 0, 0]);
+        pseudo.push(proto);
+        pseudo.extend_from_slice(data);
+        checksum(&pseudo)
+    }
+
+    #[test]
+    fn ipv6_build_packet_has_valid_header_and_checksum() {
+        let src: IpAddr = "fdfe:dcba:9876::1".parse().unwrap();
+        let dst: IpAddr = "2606:4700:3037::2".parse().unwrap();
+        let packet = build_packet_opts(src, dst, 40000, 443, 7, 9, ACK, &[], b"hello");
+        assert_eq!(packet.len(), 40 + 20 + 5);
+        assert_eq!(packet[0] >> 4, 6);
+        assert_eq!(&packet[4..6], &25u16.to_be_bytes(), "payload length");
+        assert_eq!(packet[6], 6, "TCP next header");
+        assert_eq!(packet[7], 64, "hop limit");
+        let IpAddr::V6(s6) = src else { unreachable!() };
+        let IpAddr::V6(d6) = dst else { unreachable!() };
+        assert_eq!(&packet[8..24], &s6.octets());
+        assert_eq!(&packet[24..40], &d6.octets());
+        let tcp = parse_tcp(&packet, 40).expect("tcp header at offset 40");
+        assert_eq!((tcp.src_port, tcp.dst_port), (40000, 443));
+        assert_eq!(tcp.payload(&packet, 40), b"hello");
+        assert_eq!(verify_checksum6(s6, d6, 6, &packet[40..]), 0);
+    }
+
+    #[test]
+    fn ipv6_build_udp_packet_has_valid_header_and_checksum() {
+        let src: IpAddr = "fdfe:dcba:9876::1".parse().unwrap();
+        let dst: IpAddr = "2606:4700:3037::2".parse().unwrap();
+        let packet = build_udp_packet(src, dst, 53123, 443, b"hello");
+        assert_eq!(packet.len(), 40 + 8 + 5);
+        assert_eq!(packet[0] >> 4, 6);
+        assert_eq!(&packet[4..6], &13u16.to_be_bytes());
+        assert_eq!(packet[6], 17, "UDP next header");
+        let IpAddr::V6(s6) = src else { unreachable!() };
+        let IpAddr::V6(d6) = dst else { unreachable!() };
+        assert_eq!(&packet[8..24], &s6.octets());
+        assert_eq!(&packet[24..40], &d6.octets());
+        assert_eq!(&packet[40..42], &53123u16.to_be_bytes());
+        assert_eq!(&packet[42..44], &443u16.to_be_bytes());
+        assert_eq!(verify_checksum6(s6, d6, 17, &packet[40..]), 0);
+    }
+
+    #[test]
+    fn parse_ipv6_walks_extension_headers() {
+        let src: Ipv6Addr = "fdfe:dcba:9876::1".parse().unwrap();
+        let dst: Ipv6Addr = "2606:4700::1".parse().unwrap();
+        let mut packet = vec![0x60, 0, 0, 0];
+        packet.extend_from_slice(&28u16.to_be_bytes()); // 8-byte extension + 20 TCP
+        packet.push(0); // hop-by-hop options first
+        packet.push(64);
+        packet.extend_from_slice(&src.octets());
+        packet.extend_from_slice(&dst.octets());
+        packet.extend_from_slice(&[6, 0, 0, 0, 0, 0, 0, 0]); // options, next = TCP
+        packet.extend_from_slice(&[0u8; 20]);
+        let info = parse_ipv6(&packet).unwrap();
+        assert_eq!(info.src, src);
+        assert_eq!(info.dst, dst);
+        assert_eq!(info.next_header, 6);
+        assert_eq!(info.payload_offset, 48);
+    }
+
+    #[tokio::test]
+    async fn ipv6_syn_gets_ipv6_syn_ack() {
+        let (mut tcp, io) = manager().await;
+        let client: IpAddr = "fdfe:dcba:9876::1".parse().unwrap();
+        let target: IpAddr = "2606:4700:3037::2".parse().unwrap();
+        let syn = build_packet(client, target, 40000, 443, 1000, 0, SYN, &[]);
+        tcp.handle_packet6(&syn);
+
+        let out = io.lock().unwrap().out.clone();
+        assert!(!out.is_empty(), "expected a SYN-ACK, not a silent drop");
+        assert_eq!(out[0] >> 4, 6, "reply must be IPv6, not an ICMP refusal");
+        assert_eq!(out[6], 6, "reply must carry TCP");
+        let reply = parse_tcp(&out, 40).expect("tcp header at offset 40");
+        assert_eq!(reply.flags & (SYN | ACK), SYN | ACK);
+        assert_eq!(reply.ack, 1001);
+        assert_eq!((reply.src_port, reply.dst_port), (443, 40000));
+        // IPv6 spends 20 more header bytes, so MSS drops from 1460 to 1440.
+        assert_eq!(&out[60..64], &[2, 4, 0x05, 0xa0]);
+        let IpAddr::V6(s6) = target else {
+            unreachable!()
+        };
+        let IpAddr::V6(d6) = client else {
+            unreachable!()
+        };
+        assert_eq!(verify_checksum6(s6, d6, 6, &out[40..]), 0);
+    }
+
+    #[test]
+    fn v6_flow_key_targets_ipv6_address() {
+        let key = FlowKey {
+            client_ip: "fdfe:dcba:9876::1".parse().unwrap(),
+            client_port: 40000,
+            target_ip: "2606:4700:3037::2".parse().unwrap(),
+            target_port: 443,
+        };
+        assert_eq!(key_target_addr(&key).address(), "[2606:4700:3037::2]:443");
     }
 }
