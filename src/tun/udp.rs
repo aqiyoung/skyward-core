@@ -64,9 +64,16 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
             } else {
                 let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
                 sessions.insert(key, tx.clone());
+                // Resolve the owner from the raw TUN tuple before spawning
+                // the dial task, while the socket is still live.
+                let package = crate::jni::resolve_app_package(
+                    crate::jni::IPPROTO_UDP,
+                    &format!("{}:{}", src, src_port),
+                    &format!("{}:{}", dst, dst_port),
+                );
                 // The first payload travels with the session task: if the
                 // dial fails it is the datagram the ICMP refusal answers.
-                self.spawn_session(key, rx, payload.to_vec());
+                self.spawn_session(key, rx, payload.to_vec(), package);
                 return;
             }
         };
@@ -75,7 +82,7 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
         let _ = sender.try_send(payload.to_vec());
     }
 
-    fn spawn_session(&self, key: SessionKey, mut rx: mpsc::Receiver<Vec<u8>>, first_payload: Vec<u8>) {
+    fn spawn_session(&self, key: SessionKey, mut rx: mpsc::Receiver<Vec<u8>>, first_payload: Vec<u8>, package: Option<String>) {
         let fallback_engine = self.engine.clone();
         let io = self.io.clone();
         let sessions = self.sessions.clone();
@@ -119,6 +126,7 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
                     vec![final_name, rule.clone()],
                     crate::tunnel::connection::Network::Udp,
                     Some((key.src.to_string(), key.src_port)),
+                    package,
                 )
                 .await;
             let relay = async {

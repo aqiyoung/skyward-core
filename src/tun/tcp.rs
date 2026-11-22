@@ -90,6 +90,9 @@ struct Flow {
     /// the flow so the app fails fast instead of hanging on a live-looking
     /// connection.
     relay_failed: Arc<AtomicBool>,
+    /// Owning Android package, resolved from the raw TUN tuple at SYN time
+    /// (before dialling) and reported to the App as metadata.process.
+    package: Option<String>,
     /// Segments sent to the app awaiting its ACK, oldest first.
     unacked: std::collections::VecDeque<Unacked>,
     /// The app's latest advertised receive window; caps unacked bytes.
@@ -149,9 +152,18 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                 }
                 return;
             }
+            // Resolve the owning app from the raw TUN tuple before dialling:
+            // afterwards the socket may be gone and getConnectionOwnerUid
+            // returns -1. Use the raw addresses, not the fake-ip target.
+            let package = crate::jni::resolve_app_package(
+                crate::jni::IPPROTO_TCP,
+                &format!("{}:{}", key.client_ip, key.client_port),
+                &format!("{}:{}", key.target_ip, key.target_port),
+            );
             let isn: u32 = rand::random();
             let flow = Flow {
                 key,
+                package,
                 state: State::SynReceived,
                 local_isn: isn,
                 local_next: isn.wrapping_add(1),
@@ -452,6 +464,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
         let upload_closed = flow.upload_closed.clone();
         let remote_eof = flow.remote_eof.clone();
         let relay_failed = flow.relay_failed.clone();
+        let package = flow.package.clone();
         let fallback_engine = self.engine.clone();
         let io = self.io.clone();
         // If the destination is a fake-ip we handed out in DNS, recover the
@@ -526,6 +539,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                     vec![final_name, rule.clone()],
                     crate::tunnel::connection::Network::Tcp,
                     Some((key.client_ip.to_string(), key.client_port)),
+                    package,
                 )
                 .await;
             let mut read_buf = vec![0u8; 16 * 1024];

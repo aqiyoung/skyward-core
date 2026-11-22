@@ -65,6 +65,10 @@ pub struct ConnectionMeta {
     pub destination_port: String,
     #[serde(default)]
     pub host: String,
+    /// Android package name. The App's Dart `Metadata.process` reads this key;
+    /// without it the usage breakdown collects everything under "unknown".
+    #[serde(default)]
+    pub process: String,
     #[serde(rename = "processPath", default)]
     pub process_path: String,
     #[serde(rename = "remoteDestination", default)]
@@ -157,6 +161,7 @@ impl ConnectionTracker {
         chain: Vec<String>,
         network: Network,
         source: Option<(String, u16)>,
+        process: Option<String>,
     ) -> (ConnectionLease, Arc<AtomicU64>, Arc<AtomicU64>) {
         let id = format!("{:032x}", rand::random::<u128>());
         let cancel = Arc::new(Notify::new());
@@ -180,6 +185,7 @@ impl ConnectionTracker {
                 destination_ip,
                 destination_port: target.port().to_string(),
                 host,
+                process: process.unwrap_or_default(),
                 process_path: String::new(),
                 remote_destination: String::new(),
                 source_geo_ip: Vec::new(),
@@ -314,7 +320,7 @@ mod tests {
     async fn tracks_connection_lifecycle() {
         let tracker = Arc::new(ConnectionTracker::new());
         let target = TargetAddr::Domain("example.com".into(), 443);
-        let (id, up, down) = tracker.add(&target, "MATCH", "", vec!["DIRECT".into()], Network::Tcp, None).await;
+        let (id, up, down) = tracker.add(&target, "MATCH", "", vec!["DIRECT".into()], Network::Tcp, None, None).await;
         up.store(12, Ordering::Relaxed);
         down.store(34, Ordering::Relaxed);
         let snapshot = tracker.snapshot().await;
@@ -337,14 +343,20 @@ mod tests {
     async fn request_event_carries_tracker_info() {
         let tracker = Arc::new(ConnectionTracker::new());
         let target = TargetAddr::Domain("example.com".into(), 443);
-        let (id, _, _) = tracker.add(&target, "MATCH", "", vec!["DIRECT".into()], Network::Tcp, None).await;
+        let (id, _, _) = tracker.add(
+            &target, "MATCH", "", vec!["DIRECT".into()], Network::Tcp, None,
+            Some("com.example.app".into()),
+        ).await;
         let snapshot = tracker.snapshot().await;
         let event: serde_json::Value =
             serde_json::from_str(&request_event_json(&snapshot[0])).unwrap();
         assert_eq!(event["type"], "request");
         assert_eq!(event["data"]["id"], id.id);
         assert_eq!(event["data"]["metadata"]["host"], "example.com");
+        assert_eq!(event["data"]["metadata"]["process"], "com.example.app");
         assert_eq!(event["data"]["rule"], "MATCH");
+        let all = tracker.snapshot_json();
+        assert_eq!(all["connections"][0]["metadata"]["process"], "com.example.app");
     }
 
     #[test]

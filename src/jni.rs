@@ -67,6 +67,87 @@ fn protect_diag(message: &str) {
     }
 }
 
+pub const IPPROTO_TCP: i32 = 6;
+pub const IPPROTO_UDP: i32 = 17;
+
+/// Attribute a flow to its owning Android package, mirroring the Go core's
+/// TunHandler.resolveUid -> resolvePackage path. Called at TUN packet time
+/// (before dialling) while the owning socket is still live; the uid lookup
+/// would fail if we waited until the connection is registered afterwards.
+///
+/// Returns None off-Android or when the host did not supply a resolver, so
+/// desktop behaviour is unchanged. Any Java exception is cleared here: an
+/// uncleared pending exception would crash the next JNI call.
+pub fn resolve_app_package(protocol: i32, source: &str, target: &str) -> Option<String> {
+    static FAIL_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let fail = |why: &str| {
+        if FAIL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
+            emit_log_event(&format!("[rust-core] resolve_package: {}", why));
+        }
+        None
+    };
+
+    let handler = TUN_HANDLER.lock().ok()?.as_ref()?.clone();
+    let vm = vm()?;
+    let mut env = match vm.attach_current_thread() {
+        Ok(e) => e,
+        Err(_) => return fail("attach_current_thread failed"),
+    };
+
+    let src = match env.new_string(source) {
+        Ok(s) => s,
+        Err(_) => return fail("new_string(source) failed"),
+    };
+    let dst = match env.new_string(target) {
+        Ok(s) => s,
+        Err(_) => return fail("new_string(target) failed"),
+    };
+    let uid_result = env.call_method(
+        handler.as_obj(),
+        "resolveUid",
+        "(ILjava/lang/String;Ljava/lang/String;)I",
+        &[
+            JValue::Int(protocol),
+            JValue::Object(src.as_ref()),
+            JValue::Object(dst.as_ref()),
+        ],
+    );
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+        return fail("resolveUid threw");
+    }
+    let uid = match uid_result.and_then(|v| v.i()) {
+        Ok(uid) => uid,
+        Err(_) => return fail("resolveUid failed"),
+    };
+    if uid < 0 {
+        return None;
+    }
+
+    let name_result = env.call_method(
+        handler.as_obj(),
+        "resolvePackage",
+        "(I)Ljava/lang/String;",
+        &[JValue::Int(uid)],
+    );
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+        return fail("resolvePackage threw");
+    }
+    let obj = match name_result.and_then(|v| v.l()) {
+        Ok(o) => o,
+        Err(_) => return fail("resolvePackage failed"),
+    };
+    if obj.is_null() {
+        return None;
+    }
+    let name = java_string(&mut env, &JString::from(obj));
+    if name.is_empty() {
+        return None;
+    }
+    Some(name)
+}
+
 pub(crate) fn tokio_runtime() -> Option<&'static tokio::runtime::Runtime> {
     TOKIO_RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()

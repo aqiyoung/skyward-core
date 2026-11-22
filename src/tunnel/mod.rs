@@ -293,7 +293,7 @@ impl Engine {
             .ok()
             .map(|addr| (addr.ip().to_string(), addr.port()));
         let (connection, up_counter, down_counter) = self.connections
-            .add(&target, &rule_target, "", vec![final_name.clone(), rule_target.clone()], Network::Tcp, source)
+            .add(&target, &rule_target, "", vec![final_name.clone(), rule_target.clone()], Network::Tcp, source, None)
             .await;
 
         let outbound = self.outbounds.outbound(&final_name);
