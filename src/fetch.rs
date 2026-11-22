@@ -73,7 +73,7 @@ async fn fetch_url_inner(url: &str) -> io::Result<Vec<u8>> {
         // Downloads (subscriptions, GeoX, providers) are always verified.
         connect_tls(&host, tcp, true).await?
     } else {
-        Box::new(tcp)
+        tcp
     };
 
     let request = format!(

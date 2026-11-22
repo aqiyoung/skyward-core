@@ -8,22 +8,59 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::AsRawFd;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::{TcpSocket, UdpSocket};
 
+use crate::adapter::{BoxedStream, Outbound};
+use crate::common::TargetAddr;
+
+/// The chain of entry proxies a dial must pass through before reaching the
+/// actual destination. Each hop connects to the next hop's server; the last
+/// hop connects directly. Scoped per task so concurrent dials keep separate
+/// chains and so spawned helper tasks inherit the right one.
+#[derive(Clone)]
+pub struct DialChain {
+    pub hops: Vec<Arc<dyn Outbound>>,
+    pub names: Arc<Vec<String>>,
+}
+
+tokio::task_local! {
+    pub static DIAL_CHAIN: DialChain;
+}
+
 /// Connect a TCP socket to `addr`, protecting it from the VPN first.
-pub async fn connect_tcp(addr: SocketAddr) -> io::Result<tokio::net::TcpStream> {
+///
+/// When a dial chain is in scope, the connection is opened through the entry
+/// hops instead of directly: `head.connect(addr)` yields a byte pipe to
+/// `addr` (the next hop's server), and recursion consumes the remaining hops.
+/// The direct branch is unchanged for ordinary dials, so no global state is
+/// touched and fetch/DIRECT traffic is never redirected.
+pub async fn connect_tcp(addr: SocketAddr) -> io::Result<BoxedStream> {
+    let chain = DIAL_CHAIN.try_with(|c| c.clone()).ok();
+    if let Some(chain) = chain {
+        if let Some((head, tail)) = chain.hops.split_first() {
+            let target = TargetAddr::Ip(addr.ip(), addr.port());
+            let rest = DialChain {
+                hops: tail.to_vec(),
+                names: chain.names,
+            };
+            let dial = head.connect(&target);
+            return DIAL_CHAIN.scope(rest, dial).await;
+        }
+    }
     let socket = if addr.is_ipv4() {
         TcpSocket::new_v4()?
     } else {
         TcpSocket::new_v6()?
     };
     crate::jni::protect_fd(socket.as_raw_fd());
-    socket
+    let stream = socket
         .connect(addr)
         .await
-        .map_err(|e| io::Error::new(e.kind(), e.to_string()))
+        .map_err(|e| io::Error::new(e.kind(), e.to_string()))?;
+    Ok(Box::new(stream))
 }
 
 /// Send one DNS query to `server` over a protected UDP socket and return the

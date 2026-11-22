@@ -10,7 +10,6 @@ use std::task::Poll;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 use crate::adapter::tls::{connect_tls, connect_tls_http1};
 use crate::adapter::ws::connect_ws;
@@ -154,7 +153,7 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 impl VlessOutbound {
-    async fn dial_server(&self) -> io::Result<tokio::net::TcpStream> {
+    async fn dial_server(&self) -> io::Result<BoxedStream> {
         let mut last_error = None;
         for addr in self.server.resolve_all().await? {
             match crate::net::connect_tcp(addr).await {
@@ -173,11 +172,11 @@ impl VlessOutbound {
     /// REALITY / TLS / plain, then WebSocket and gRPC wraps. No VLESS
     /// header is written and vision is not applied (both are TCP-session
     /// concerns handled by `connect`).
-    async fn wrap_transport(&self, tcp: tokio::net::TcpStream) -> io::Result<BoxedStream> {
+    async fn wrap_transport(&self, tcp: BoxedStream) -> io::Result<BoxedStream> {
         let mut stream: BoxedStream = if let Some(reality) = &self.reality {
             Box::new(
                 crate::adapter::tls13::connect_tls13(
-                    Box::new(tcp),
+                    tcp,
                     &crate::adapter::tls13::Tls13Options {
                         server_name: self.sni.clone(),
                         alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
@@ -208,7 +207,7 @@ impl VlessOutbound {
                 connect_tls(&self.sni, tcp, self.verify).await?
             }
         } else {
-            Box::new(tcp)
+            tcp
         };
 
         if self.use_ws {
@@ -353,7 +352,7 @@ impl Outbound for VlessOutbound {
                 if outbound.use_tls {
                     connect_tls_http1(&outbound.sni, tcp, outbound.verify).await
                 } else {
-                    Ok(Box::new(tcp) as BoxedStream)
+                    Ok(tcp)
                 }
             };
             let mut stream: BoxedStream = Box::new(
@@ -388,7 +387,7 @@ impl Outbound for VlessOutbound {
         if self.vision && !self.use_ws && !self.use_grpc && !self.use_h2 {
             if self.reality.is_none() && self.use_tls && !self.verify {
                 let mut tls = crate::adapter::tls13::connect_tls13(
-                    Box::new(tcp),
+                    tcp,
                     &crate::adapter::tls13::Tls13Options {
                         server_name: self.sni.clone(),
                         alpn: vec![b"http/1.1".to_vec()],
@@ -407,7 +406,7 @@ impl Outbound for VlessOutbound {
             }
             if let Some(reality) = &self.reality {
                 let mut tls = crate::adapter::tls13::connect_tls13(
-                    Box::new(tcp),
+                    tcp,
                     &crate::adapter::tls13::Tls13Options {
                         server_name: self.sni.clone(),
                         alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
@@ -471,7 +470,7 @@ impl Outbound for VlessOutbound {
                 if outbound.use_tls {
                     connect_tls_http1(&outbound.sni, tcp, outbound.verify).await
                 } else {
-                    Ok(Box::new(tcp) as BoxedStream)
+                    Ok(tcp)
                 }
             };
             Box::new(

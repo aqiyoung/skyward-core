@@ -103,7 +103,7 @@ impl Outbound for DirectOutbound {
         let mut last_error = None;
         for addr in target.resolve_all().await? {
             match crate::net::connect_tcp(addr).await {
-                Ok(stream) => return Ok(Box::new(stream)),
+                Ok(stream) => return Ok(stream),
                 Err(e) => last_error = Some(e),
             }
         }
@@ -282,6 +282,9 @@ fn region_tags(name: &str) -> Vec<String> {
 pub struct OutboundManager {
     pub outbounds: HashMap<String, Arc<dyn Outbound>>,
     pub groups: HashMap<String, GroupState>,
+    /// proxy name -> the proxy its TCP dials are chained through
+    /// (mihomo's `dialer-proxy`). Resolved to concrete nodes at dial time.
+    pub dialer_proxies: HashMap<String, String>,
 }
 
 pub fn build_outbound(def: &ProxyDef) -> Arc<dyn Outbound> {
@@ -586,8 +589,12 @@ impl OutboundManager {
         outbounds.insert("DIRECT".into(), Arc::new(DirectOutbound::new("DIRECT")));
         outbounds.insert("REJECT".into(), Arc::new(RejectOutbound::new("REJECT")));
 
+        let mut dialer_proxies: HashMap<String, String> = HashMap::new();
         for def in &config.proxies {
             let outbound = build_outbound(def);
+            if let Some(dialer) = &def.dialer_proxy {
+                dialer_proxies.insert(def.name.clone(), dialer.clone());
+            }
             outbounds.insert(def.name.clone(), outbound);
         }
 
@@ -649,7 +656,71 @@ impl OutboundManager {
             }
         }
 
-        Self { outbounds, groups }
+        Self { outbounds, groups, dialer_proxies }
+    }
+
+    /// Register a dialer-proxy link for a node added after construction
+    /// (e.g. from a proxy provider).
+    pub fn register_dialer_proxy(&mut self, name: String, dialer: String) {
+        self.dialer_proxies.insert(name, dialer);
+    }
+
+    /// Build the ordered list of entry hops a dial must pass through.
+    /// Group names are resolved to a concrete node now (the selection may
+    /// change later), and a repeated concrete name is a loop -> error.
+    async fn build_chain(&self, name: &str) -> io::Result<crate::net::DialChain> {
+        let mut hops: Vec<Arc<dyn Outbound>> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(name.to_string());
+        let mut current = name.to_string();
+        while let Some(dialer_name) = self.dialer_proxies.get(&current) {
+            let concrete = self.resolve(dialer_name).await;
+            if concrete == "DIRECT" || concrete == "REJECT" || !self.outbounds.contains_key(&concrete) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("dialer-proxy '{}' for '{}' has no usable node", dialer_name, current),
+                ));
+            }
+            if !seen.insert(concrete.clone()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("dialer-proxy loop at '{}'", concrete),
+                ));
+            }
+            let Some(outbound) = self.outbounds.get(&concrete) else {
+                return Err(io::Error::new(io::ErrorKind::NotFound, format!("no such proxy '{}'", concrete)));
+            };
+            hops.push(outbound.clone());
+            names.push(concrete.clone());
+            current = concrete;
+        }
+        Ok(crate::net::DialChain { hops, names: Arc::new(names) })
+    }
+
+    /// Connect through any configured dialer-proxy chain, then to `target`.
+    pub async fn connect_named(&self, name: &str, target: &TargetAddr) -> io::Result<BoxedStream> {
+        let outbound = self.outbound(name).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("no such proxy '{}'", name))
+        })?;
+        let chain = self.build_chain(name).await?;
+        crate::net::DIAL_CHAIN.scope(chain, outbound.connect(target)).await
+    }
+
+    /// UDP variant: the dialer-proxy hook only covers TCP-based transports.
+    /// QUIC/WireGuard datagram sockets cannot be chained, so refuse rather
+    /// than silently dial direct.
+    pub async fn connect_udp_named(&self, name: &str, target: &TargetAddr) -> io::Result<Box<dyn PacketConn>> {
+        if self.dialer_proxies.contains_key(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("dialer-proxy is not supported for UDP on '{}'", name),
+            ));
+        }
+        let outbound = self.outbound(name).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("no such proxy '{}'", name))
+        })?;
+        outbound.connect_udp(target).await
     }
 
     /// Resolve a rule target down to a concrete outbound name. A group's

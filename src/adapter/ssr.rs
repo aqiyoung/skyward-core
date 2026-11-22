@@ -21,7 +21,6 @@ use md5::{Digest, Md5};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::TcpStream;
 
 use crate::adapter::{BoxedStream, Outbound};
 use crate::common::TargetAddr;
@@ -228,7 +227,7 @@ impl StreamCipher {
 /// A stream-cipher-wrapped TCP stream. The server's IV is read lazily on the
 /// first read (the server sends it when it first writes).
 struct SsrStream {
-    inner: TcpStream,
+    inner: BoxedStream,
     enc: StreamCipher,
     dec: Option<StreamCipher>,
     key: Vec<u8>,
@@ -239,7 +238,7 @@ struct SsrStream {
 }
 
 impl SsrStream {
-    fn new(inner: TcpStream, enc: StreamCipher, key: Vec<u8>, cipher: CipherKind) -> Self {
+    fn new(inner: BoxedStream, enc: StreamCipher, key: Vec<u8>, cipher: CipherKind) -> Self {
         let iv_len = cipher.iv_len();
         Self {
             inner,

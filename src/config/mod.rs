@@ -126,6 +126,11 @@ pub struct ProxyDef {
     pub xhttp_opts: Option<XHttpOpts>,
     #[serde(rename = "http-opts")]
     pub http_opts: Option<HttpOpts>,
+    /// Chain this node through another proxy. The core builds a dial chain
+    /// at dial time: this node's TCP connection to its own server is opened
+    /// through the named proxy, mirroring mihomo's `dialer-proxy`.
+    #[serde(rename = "dialer-proxy")]
+    pub dialer_proxy: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

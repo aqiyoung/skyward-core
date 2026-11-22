@@ -20,7 +20,6 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::TcpStream;
 
 use crate::adapter::tls::{connect_tls, connect_tls_http1};
 use crate::adapter::ws::connect_ws;
@@ -596,7 +595,7 @@ pub struct VmessOutbound {
 }
 
 impl VmessOutbound {
-    async fn dial_server(&self) -> io::Result<tokio::net::TcpStream> {
+    async fn dial_server(&self) -> io::Result<BoxedStream> {
         let mut last_error = None;
         for addr in self.server.resolve_all().await? {
             match crate::net::connect_tcp(addr).await {
@@ -783,7 +782,7 @@ impl VmessOutbound {
                     if outbound.use_tls {
                         connect_tls_http1(&outbound.sni, tcp, outbound.verify).await
                     } else {
-                        Ok(Box::new(tcp) as BoxedStream)
+                        Ok(tcp)
                     }
                 }
             };

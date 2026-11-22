@@ -43,6 +43,13 @@ impl ProxyProvider {
     pub fn all_outbounds(&self) -> Vec<(String, Arc<dyn Outbound>)> {
         self.proxies.iter().map(|p| (p.def.name.clone(), p.outbound.clone())).collect()
     }
+
+    /// (node name, dialer-proxy) pairs carried by provider-supplied nodes.
+    pub fn all_dialer_proxies(&self) -> Vec<(String, String)> {
+        self.proxies.iter()
+            .filter_map(|p| p.def.dialer_proxy.as_ref().map(|d| (p.def.name.clone(), d.clone())))
+            .collect()
+    }
 }
 
 #[derive(Default)]
@@ -179,6 +186,10 @@ impl ProxyProviderRegistry {
 
     pub fn all_outbounds(&self) -> Vec<(String, Arc<dyn Outbound>)> {
         self.providers.values().flat_map(|p| p.all_outbounds()).collect()
+    }
+
+    pub fn all_dialer_proxies(&self) -> Vec<(String, String)> {
+        self.providers.values().flat_map(|p| p.all_dialer_proxies()).collect()
     }
 
     pub fn snapshot(&self) -> Vec<ProviderInfo> {

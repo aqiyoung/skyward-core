@@ -123,6 +123,9 @@ impl Engine {
         for (name, outbound) in &provider_nodes {
             outbounds.register(name.clone(), outbound.clone());
         }
+        for (name, dialer) in proxy_providers.all_dialer_proxies() {
+            outbounds.register_dialer_proxy(name, dialer);
+        }
         for g in &config.proxy_groups {
             if !g.use_providers.is_empty() {
                 let mut members = g.proxies.clone();
@@ -215,10 +218,7 @@ impl Engine {
             rule_target,
             final_name
         ));
-        let outbound = self.outbounds.outbound(&final_name).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("unknown outbound '{}'", final_name))
-        })?;
-        match outbound.connect(target).await {
+        match self.outbounds.connect_named(&final_name, target).await {
             Ok(stream) => Ok(stream),
             Err(e) => {
                 dial_diag(format!(
@@ -249,10 +249,7 @@ impl Engine {
             rule_target,
             final_name
         ));
-        let outbound = self.outbounds.outbound(&final_name).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("unknown outbound '{}'", final_name))
-        })?;
-        match outbound.connect_udp(target).await {
+        match self.outbounds.connect_udp_named(&final_name, target).await {
             Ok(conn) => Ok((conn, rule_target, final_name)),
             Err(e) => {
                 dial_diag(format!(
@@ -269,10 +266,7 @@ impl Engine {
     /// Dial a target through a specific outbound/group name (used by delay tests).
     pub async fn dial_named(&self, name: &str, target: &TargetAddr) -> io::Result<BoxedStream> {
         let final_name = self.outbounds.resolve(name).await;
-        let outbound = self.outbounds.outbound(&final_name).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("unknown outbound '{}'", final_name))
-        })?;
-        outbound.connect(target).await
+        self.outbounds.connect_named(&final_name, target).await
     }
 
     /// Drive a single inbound connection to completion. `prefix` carries bytes
@@ -296,10 +290,8 @@ impl Engine {
             .add(&target, &rule_target, "", vec![final_name.clone(), rule_target.clone()], Network::Tcp, source, None)
             .await;
 
-        let outbound = self.outbounds.outbound(&final_name);
-        let relay = async { match outbound {
-            Some(outbound) => {
-                match outbound.connect(&target).await {
+        let relay = async {
+                match self.outbounds.connect_named(&final_name, &target).await {
                     Err(e) => {
                         dial_diag(format!(
                             "dial {} via {} FAILED: {}",
@@ -326,9 +318,7 @@ impl Engine {
                         result
                     }
                 }
-            }
-            None => Err(io::Error::new(io::ErrorKind::NotFound, format!("unknown outbound '{}'", final_name))),
-        }};
+        };
         tokio::select! {
             biased;
             _ = connection.closed() => Ok(()),

@@ -22,7 +22,6 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use sha1::Sha1;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::TcpStream;
 
 use crate::adapter::{BoxedStream, Outbound};
 use crate::common::TargetAddr;
@@ -144,7 +143,7 @@ impl Cipher {
 
 /// Encrypted stream layered over the TCP connection to the SS server.
 struct SsStream {
-    inner: TcpStream,
+    inner: BoxedStream,
     cipher: Cipher,
     nonce_len: usize,
     read_nonce: [u8; 24],
@@ -165,7 +164,7 @@ struct SsStream {
 }
 
 impl SsStream {
-    fn new(inner: TcpStream, cipher: Cipher, nonce_len: usize) -> Self {
+    fn new(inner: BoxedStream, cipher: Cipher, nonce_len: usize) -> Self {
         Self {
             inner,
             cipher,
@@ -225,7 +224,7 @@ impl SsStream {
 }
 
 fn poll_read_into(
-    inner: &mut TcpStream,
+    inner: &mut BoxedStream,
     cx: &mut Context<'_>,
     dst: &mut [u8],
     filled: &mut usize,
