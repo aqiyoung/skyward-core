@@ -219,7 +219,7 @@ fn handle_dns_packet6<T: Read + Write + Send + 'static>(
         ))),
         _ => None,
     };
-    let response = build_dns_response(payload, answer_ip, qtype != 1);
+    let response = build_dns_response(payload, answer_ip, answer_nxdomain(qtype));
     let reply = build_udp_packet6(
         std::net::Ipv6Addr::from(dst),
         std::net::Ipv6Addr::from(src),
@@ -351,7 +351,7 @@ fn handle_dns_packet<T: Read + Write + Send + 'static>(
         ))),
         _ => None,
     };
-    let response = build_dns_response(payload, answer_ip, qtype != 1);
+    let response = build_dns_response(payload, answer_ip, answer_nxdomain(qtype));
     let packet = crate::tun::tcp::build_udp_packet(
         IpAddr::V4(ip.dst),
         IpAddr::V4(ip.src),
@@ -396,6 +396,23 @@ fn parse_dns_question(packet: &[u8]) -> Option<(Vec<u8>, u16)> {
     }
     let qtype = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
     Some((labels, qtype))
+}
+
+/// Whether a query of this type is answered with NXDOMAIN.
+///
+/// Only AAAA qualifies. NXDOMAIN (RFC 2308) means "this **name** does not
+/// exist" and resolvers cache it against the name, not against the record
+/// type -- so returning it for TXT(16), HTTPS/SVCB(65), CNAME(5), MX(15) and
+/// friends would poison the whole name and every later A lookup for it would
+/// be answered from that negative cache without ever reaching us. That shows
+/// up as an app whose traffic vanishes from the TUN entirely: no DNS query,
+/// no SYN, just silence.
+///
+/// A non-AAAA type we do not synthesise gets NOERROR with zero answers
+/// instead -- the name exists (we hand out a fake-ip for it), it simply has
+/// no record of that type.
+fn answer_nxdomain(qtype: u16) -> bool {
+    qtype == 28
 }
 
 fn build_dns_response(
@@ -580,6 +597,43 @@ mod tests {
         let q = dns_query("nonexistent.invalid", 1);
         let resp = build_dns_response(&q, None, false);
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0);
+    }
+
+    // NXDOMAIN is per NAME (RFC 2308), so only AAAA may use it. Any other
+    // type answered with NXDOMAIN poisons the name and kills later A lookups.
+    #[test]
+    fn only_aaaa_queries_are_nxdomain() {
+        assert!(answer_nxdomain(28)); // AAAA
+        for qtype in [1u16, 2, 5, 12, 15, 16, 33, 65] {
+            assert!(
+                !answer_nxdomain(qtype),
+                "qtype {qtype} must not be answered NXDOMAIN"
+            );
+        }
+    }
+
+    #[test]
+    fn aaaa_query_gets_nxdomain_with_no_answers() {
+        let q = dns_query("v6.example.com", 28);
+        let resp = build_dns_response(&q, None, answer_nxdomain(28));
+        assert_eq!(u16::from_be_bytes([resp[2], resp[3]]) & 0x000f, 3); // rcode=NXDOMAIN
+        assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0);
+    }
+
+    // A type we do not synthesise still proves the name exists: NOERROR with
+    // zero answers, never NXDOMAIN.
+    #[test]
+    fn unknown_qtype_is_noerror_without_answers() {
+        for qtype in [16u16, 65] {
+            let q = dns_query("svc.example.com", qtype);
+            let resp = build_dns_response(&q, None, answer_nxdomain(qtype));
+            assert_eq!(
+                u16::from_be_bytes([resp[2], resp[3]]) & 0x000f,
+                0,
+                "qtype {qtype}"
+            );
+            assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0);
+        }
     }
 
     #[test]
