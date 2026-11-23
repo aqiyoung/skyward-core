@@ -1,12 +1,43 @@
 //! The tunnel glues inbound connections to rules and outbound adapters.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
+
+/// Nodes that failed before any downstream bytes arrived for a destination.
+/// A later connection to the same site skips them (per-site failover). Entries
+/// expire so a recovered node gets retried.
+static NODE_FAILURES: LazyLock<Mutex<HashMap<String, (Instant, Vec<String>)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const FAILURE_TTL: Duration = Duration::from_secs(300);
+
+pub(crate) fn failed_nodes_for(target: &str) -> Vec<String> {
+    let mut map = NODE_FAILURES.lock().unwrap();
+    map.retain(|_, (at, _)| at.elapsed() < FAILURE_TTL);
+    map.get(target)
+        .map(|(_, nodes)| nodes.clone())
+        .unwrap_or_default()
+}
+
+pub(crate) fn note_failure(target: &str, node: &str) {
+    if node == "DIRECT" || node == "REJECT" {
+        return;
+    }
+    let mut map = NODE_FAILURES.lock().unwrap();
+    let entry = map
+        .entry(target.to_string())
+        .or_insert((Instant::now(), Vec::new()));
+    entry.0 = Instant::now();
+    if !entry.1.iter().any(|n| n == node) {
+        entry.1.push(node.to_string());
+    }
+}
 
 pub mod connection;
 

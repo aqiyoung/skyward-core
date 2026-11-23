@@ -801,6 +801,43 @@ impl OutboundManager {
         current
     }
 
+    /// Same as `resolve`, but avoids concrete nodes in `skip`. Used for
+    /// per-site failover: a node that died before delivering any bytes for
+    /// this destination is skipped on the next connection. If every member
+    /// is skipped, fall back to the ordinary selection rather than DIRECT.
+    pub async fn resolve_skipping(&self, name: &str, skip: &[String]) -> String {
+        if skip.is_empty() {
+            return self.resolve(name).await;
+        }
+        let mut current = name.to_string();
+        for _ in 0..16 {
+            let Some(group) = self.groups.get(&current) else {
+                return current;
+            };
+            let candidates: Vec<String> = group.members.iter()
+                .filter(|m| self.outbounds.contains_key(*m) || self.groups.contains_key(*m))
+                .filter(|m| !skip.contains(m))
+                .cloned()
+                .collect();
+            if candidates.is_empty() {
+                return self.resolve(name).await;
+            }
+            let preferred = group.selected().filter(|s| candidates.contains(s));
+            let next = preferred.unwrap_or_else(|| {
+                candidates
+                    .iter()
+                    .find(|m| *m != "DIRECT" && *m != "REJECT")
+                    .cloned()
+                    .unwrap_or_else(|| candidates[0].clone())
+            });
+            if next == current {
+                return current;
+            }
+            current = next;
+        }
+        current
+    }
+
     pub fn outbound(&self, name: &str) -> Option<Arc<dyn Outbound>> {
         self.outbounds.get(name).cloned()
     }

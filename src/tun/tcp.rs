@@ -552,7 +552,10 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             // Rules and the chain are decided before dialling so the connection
             // the App lists names the same route the packet actually took.
             let rule = engine.decide(&target).await;
-            let final_name = engine.outbounds.resolve(&rule).await;
+            // Per-site failover: skip nodes that died before any bytes came
+            // back for this destination on a previous connection.
+            let failed = crate::tunnel::failed_nodes_for(&target.address());
+            let final_name = engine.outbounds.resolve_skipping(&rule, &failed).await;
             let mut stream: BoxedStream = tokio::select! {
                 _ = cancel.notified() => {
                     relay_failed.store(true, Ordering::Relaxed);
@@ -576,6 +579,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                         Ok(Err(e)) => {
                             tracing::warn!("TUN flow {} dial failed: {}", addr, e);
                             diag(format!("flow {} dial failed: {}", addr, e));
+                            crate::tunnel::note_failure(&addr, &final_name);
                             // The manager resets the flow so the app fails
                             // fast instead of hanging on a dead connection.
                             relay_failed.store(true, Ordering::Relaxed);
@@ -584,6 +588,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                         }
                         Err(_) => {
                             diag(format!("flow {} dial timed out", addr));
+                            crate::tunnel::note_failure(&addr, &final_name);
                             relay_failed.store(true, Ordering::Relaxed);
                             done.store(true, Ordering::Relaxed);
                             return;
@@ -597,7 +602,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                     &target,
                     &rule,
                     "",
-                    vec![final_name, rule.clone()],
+                    vec![final_name.clone(), rule.clone()],
                     crate::tunnel::connection::Network::Tcp,
                     Some((key.client_ip.to_string(), key.client_port)),
                     package,
@@ -646,12 +651,18 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                     result = stream.read(&mut read_buf), if !over_cap => match result {
                         Ok(0) => {
                             end_reason = "remote_eof";
+                            if down_counter.load(Ordering::Relaxed) == 0 {
+                                crate::tunnel::note_failure(&addr, &final_name);
+                            }
                             remote_eof.store(true, Ordering::Relaxed);
                             break 'relay;
                         }
                         Err(e) => {
                             end_reason = "read_err";
                             flow_diag(format!("flow {} read failed: {}", addr, e));
+                            if down_counter.load(Ordering::Relaxed) == 0 {
+                                crate::tunnel::note_failure(&addr, &final_name);
+                            }
                             relay_failed.store(true, Ordering::Relaxed);
                             break 'relay;
                         }
