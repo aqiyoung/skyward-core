@@ -219,7 +219,7 @@ fn handle_dns_packet6<T: Read + Write + Send + 'static>(
         ))),
         _ => None,
     };
-    let response = build_dns_response(payload, answer_ip, answer_nxdomain(qtype));
+    let response = build_dns_response(payload, answer_ip, false);
     let reply = build_udp_packet6(
         std::net::Ipv6Addr::from(dst),
         std::net::Ipv6Addr::from(src),
@@ -351,7 +351,7 @@ fn handle_dns_packet<T: Read + Write + Send + 'static>(
         ))),
         _ => None,
     };
-    let response = build_dns_response(payload, answer_ip, answer_nxdomain(qtype));
+    let response = build_dns_response(payload, answer_ip, false);
     let packet = crate::tun::tcp::build_udp_packet(
         IpAddr::V4(ip.dst),
         IpAddr::V4(ip.src),
@@ -398,23 +398,10 @@ fn parse_dns_question(packet: &[u8]) -> Option<(Vec<u8>, u16)> {
     Some((labels, qtype))
 }
 
-/// Whether a query of this type is answered with NXDOMAIN.
-///
-/// Only AAAA qualifies. NXDOMAIN (RFC 2308) means "this **name** does not
-/// exist" and resolvers cache it against the name, not against the record
-/// type -- so returning it for TXT(16), HTTPS/SVCB(65), CNAME(5), MX(15) and
-/// friends would poison the whole name and every later A lookup for it would
-/// be answered from that negative cache without ever reaching us. That shows
-/// up as an app whose traffic vanishes from the TUN entirely: no DNS query,
-/// no SYN, just silence.
-///
-/// A non-AAAA type we do not synthesise gets NOERROR with zero answers
-/// instead -- the name exists (we hand out a fake-ip for it), it simply has
-/// no record of that type.
-fn answer_nxdomain(qtype: u16) -> bool {
-    qtype == 28
-}
-
+// Fake-ip mode never answers NXDOMAIN. RFC 2308 caches NXDOMAIN against the
+// NAME, so one such answer -- even for AAAA -- poisons every later A lookup
+// for that host without the query ever reaching us again. mihomo answers AAAA
+// and HTTPS/SVCB with NOERROR and zero answers (NODATA); we do the same.
 fn build_dns_response(
     query: &[u8],
     answer_ip: Option<std::net::IpAddr>,
@@ -437,10 +424,8 @@ fn build_dns_response(
     // QR=1, AA=1, RD preserved, RA=1.
     out[2] = (out[2] | 0x84) & 0xfb;
     out[3] |= 0x80;
-    // NXDOMAIN for AAAA queries: an empty NOERROR answer leaves some clients
-    // (notably mobile apps withHappy Eyeballs) probing IPv6 addresses from
-    // cache until they time out. A definitive "no such host" makes them fall
-    // back to IPv4 immediately, which the TUN handles.
+    // NXDOMAIN is never set in fake-ip mode (see above); callers pass false.
+    // NOERROR with zero answers makes clients fall back to the fake A record.
     if nxdomain {
         out[3] |= 0x03;
     }
@@ -599,24 +584,26 @@ mod tests {
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0);
     }
 
-    // NXDOMAIN is per NAME (RFC 2308), so only AAAA may use it. Any other
-    // type answered with NXDOMAIN poisons the name and kills later A lookups.
+    // NXDOMAIN is cached against the NAME (RFC 2308), so no fake-ip query may
+    // use it -- especially not AAAA, which modern apps query alongside A.
     #[test]
-    fn only_aaaa_queries_are_nxdomain() {
-        assert!(answer_nxdomain(28)); // AAAA
-        for qtype in [1u16, 2, 5, 12, 15, 16, 33, 65] {
-            assert!(
-                !answer_nxdomain(qtype),
+    fn no_query_type_is_nxdomain() {
+        for qtype in [1u16, 2, 5, 12, 15, 16, 28, 33, 65] {
+            let q = dns_query("example.com", qtype);
+            let resp = build_dns_response(&q, None, false);
+            assert_eq!(
+                u16::from_be_bytes([resp[2], resp[3]]) & 0x000f,
+                0,
                 "qtype {qtype} must not be answered NXDOMAIN"
             );
         }
     }
 
     #[test]
-    fn aaaa_query_gets_nxdomain_with_no_answers() {
+    fn aaaa_query_gets_noerror_with_no_answers() {
         let q = dns_query("v6.example.com", 28);
-        let resp = build_dns_response(&q, None, answer_nxdomain(28));
-        assert_eq!(u16::from_be_bytes([resp[2], resp[3]]) & 0x000f, 3); // rcode=NXDOMAIN
+        let resp = build_dns_response(&q, None, false);
+        assert_eq!(u16::from_be_bytes([resp[2], resp[3]]) & 0x000f, 0); // rcode=NOERROR
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0);
     }
 
@@ -626,7 +613,7 @@ mod tests {
     fn unknown_qtype_is_noerror_without_answers() {
         for qtype in [16u16, 65] {
             let q = dns_query("svc.example.com", qtype);
-            let resp = build_dns_response(&q, None, answer_nxdomain(qtype));
+            let resp = build_dns_response(&q, None, false);
             assert_eq!(
                 u16::from_be_bytes([resp[2], resp[3]]) & 0x000f,
                 0,
