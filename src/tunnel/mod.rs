@@ -1,6 +1,7 @@
 //! The tunnel glues inbound connections to rules and outbound adapters.
 
 use std::io;
+use std::net::IpAddr;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -181,27 +182,40 @@ impl Engine {
             "direct" => "DIRECT".to_string(),
             "global" => "GLOBAL".to_string(),
             _ => {
-                let resolved = match target {
-                    TargetAddr::Domain(h, _) => self.resolver.resolve_first(h).await.ok(),
-                    TargetAddr::Ip(ip, _) => Some(*ip),
-                };
-                match self.rules.find(target, resolved, Some(&self.geo), Some(&self.providers)) {
-                    Some(rule) => rule.target.clone(),
-                    None => {
-                        // No rule matched (e.g. GEOIP/GEOSITE with empty geo data,
-                        // or RULE-SET with no provider). Say why instead of
-                        // silently routing to DIRECT.
-                        static NO_MATCH: std::sync::atomic::AtomicUsize =
-                            std::sync::atomic::AtomicUsize::new(0);
-                        if NO_MATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
-                            crate::jni::emit_log_event(&format!(
-                                "[rust-core] no rule matched for {} (geoip={} geosite={} rule-providers={}); using DIRECT",
-                                target.address(), self.geo.geoip.len(), self.geo.geosite.len(), self.providers.len()
-                            ));
+                // Resolve only when a rule actually needs the target IP. A
+                // DOMAIN rule never does; mihomo resolves lazily too, so a
+                // real DNS lookup is not paid on every connection.
+                let mut resolved: Option<IpAddr> = None;
+                for rule in &self.rules.rules {
+                    let ip = if rule.needs_resolve(target) {
+                        if resolved.is_none() {
+                            resolved = match target {
+                                TargetAddr::Domain(h, _) => {
+                                    self.resolver.resolve_first(h).await.ok()
+                                }
+                                TargetAddr::Ip(ip, _) => Some(*ip),
+                            };
                         }
-                        "DIRECT".to_string()
+                        resolved
+                    } else {
+                        None
+                    };
+                    if rule.matches(target, ip, Some(&self.geo), Some(&self.providers)) {
+                        return rule.target.clone();
                     }
                 }
+                // No rule matched (e.g. GEOIP/GEOSITE with empty geo data,
+                // or RULE-SET with no provider). Say why instead of
+                // silently routing to DIRECT.
+                static NO_MATCH: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                if NO_MATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
+                    crate::jni::emit_log_event(&format!(
+                        "[rust-core] no rule matched for {} (geoip={} geosite={} rule-providers={}); using DIRECT",
+                        target.address(), self.geo.geoip.len(), self.geo.geosite.len(), self.providers.len()
+                    ));
+                }
+                "DIRECT".to_string()
             }
         }
     }

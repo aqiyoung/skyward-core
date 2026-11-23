@@ -142,6 +142,17 @@ impl Rule {
         })
     }
 
+    /// Whether matching this rule against a domain target needs its IP.
+    /// mihomo resolves DNS on demand, not once for every connection.
+    pub fn needs_resolve(&self, addr: &TargetAddr) -> bool {
+        !self.no_resolve
+            && matches!(addr, TargetAddr::Domain(..))
+            && matches!(
+                self.kind,
+                RuleKind::IpCidr | RuleKind::IpSuffix | RuleKind::GeoIp | RuleKind::RuleSet
+            )
+    }
+
     pub fn matches(
         &self,
         addr: &TargetAddr,
