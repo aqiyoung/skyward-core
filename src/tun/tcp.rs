@@ -649,8 +649,9 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                             remote_eof.store(true, Ordering::Relaxed);
                             break 'relay;
                         }
-                        Err(_) => {
+                        Err(e) => {
                             end_reason = "read_err";
+                            flow_diag(format!("flow {} read failed: {}", addr, e));
                             relay_failed.store(true, Ordering::Relaxed);
                             break 'relay;
                         }
