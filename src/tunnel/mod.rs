@@ -217,22 +217,27 @@ impl Engine {
                 // DOMAIN rule never does; mihomo resolves lazily too, so a
                 // real DNS lookup is not paid on every connection.
                 let mut resolved: Option<IpAddr> = None;
+                let mut attempted = false;
                 for rule in &self.rules.rules {
-                    let ip = if rule.needs_resolve(target) {
-                        if resolved.is_none() {
-                            resolved = match target {
-                                TargetAddr::Domain(h, _) => {
-                                    self.resolver.resolve_first(h).await.ok()
-                                }
-                                TargetAddr::Ip(ip, _) => Some(*ip),
-                            };
-                        }
-                        resolved
-                    } else {
-                        None
-                    };
-                    if rule.matches(target, ip, Some(&self.geo), Some(&self.providers)) {
+                    // Match hostname and literal-IP entries first. A classical
+                    // provider may contain both domain and IP entries; a domain
+                    // hit should not wait for an unnecessary DNS query.
+                    if rule.matches(target, None, Some(&self.geo), Some(&self.providers)) {
                         return rule.target.clone();
+                    }
+                    let needs_resolve = rule.needs_resolve(target)
+                        && (rule.kind != crate::rules::RuleKind::RuleSet
+                            || self.providers.needs_resolve(&rule.value, target));
+                    if needs_resolve {
+                        if !attempted {
+                            attempted = true;
+                            if let TargetAddr::Domain(h, _) = target {
+                                resolved = self.resolver.resolve_first(h).await.ok();
+                            }
+                        }
+                        if rule.matches(target, resolved, Some(&self.geo), Some(&self.providers)) {
+                            return rule.target.clone();
+                        }
                     }
                 }
                 // No rule matched (e.g. GEOIP/GEOSITE with empty geo data,

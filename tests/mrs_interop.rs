@@ -45,6 +45,7 @@ fn provider_from_fixture(file: &str, behavior: Behavior) -> RuleProvider {
 #[test]
 fn google_mrs_matches_google_domains() {
     let provider = provider_from_fixture("google.mrs", Behavior::Domain);
+    assert!(!provider.needs_resolve(&TargetAddr::Domain("google.com".into(), 443)));
     let geo = GeoData::default();
     let hits = |host: &str| provider.matches(&TargetAddr::Domain(host.into(), 443), None, &geo);
     assert!(hits("google.com"));
@@ -69,6 +70,7 @@ fn youtube_mrs_matches_youtube_domains() {
 #[test]
 fn private_ip_mrs_matches_private_ranges() {
     let provider = provider_from_fixture("private_ip.mrs", Behavior::IpCidr);
+    assert!(provider.needs_resolve(&TargetAddr::Domain("example.com".into(), 443)));
     let geo = GeoData::default();
     let hits = |ip: &str| {
         let ip: IpAddr = ip.parse().unwrap();

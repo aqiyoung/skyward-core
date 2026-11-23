@@ -162,7 +162,27 @@ impl RuleProvider {
             },
             Entry::Cidr(net) => ip.map(|ip| net.contains(&ip)).unwrap_or(false),
             Entry::IpRange(from, to) => ip.map(|ip| ip_in_range(ip, *from, *to)).unwrap_or(false),
-            Entry::Classical(rule) => rule.matches(addr, ip, Some(geo), None),
+            Entry::Classical(rule) => {
+                let entry_ip = if rule.no_resolve && matches!(addr, TargetAddr::Domain(..)) {
+                    None
+                } else {
+                    ip
+                };
+                rule.matches(addr, entry_ip, Some(geo), None)
+            },
+        })
+    }
+
+    /// Whether any entry can use a DNS result for this domain. Domain-only
+    /// providers (including MRS domain sets) must not trigger DNS lookups.
+    pub fn needs_resolve(&self, addr: &TargetAddr) -> bool {
+        if !matches!(addr, TargetAddr::Domain(..)) {
+            return false;
+        }
+        self.entries.iter().any(|entry| match entry {
+            Entry::Cidr(_) | Entry::IpRange(_, _) => true,
+            Entry::Classical(rule) => rule.needs_resolve(addr),
+            Entry::Domain { .. } => false,
         })
     }
 
@@ -277,6 +297,10 @@ impl ProviderRegistry {
             .unwrap_or(false)
     }
 
+    pub fn needs_resolve(&self, name: &str, addr: &TargetAddr) -> bool {
+        self.providers.get(name).map(|p| p.needs_resolve(addr)).unwrap_or(false)
+    }
+
     pub fn names(&self) -> Vec<&str> {
         let mut names: Vec<&str> = self.providers.keys().map(String::as_str).collect();
         names.sort();
@@ -384,6 +408,20 @@ mod tests {
         assert!(provider.matches(&TargetAddr::Ip(ip, 80), Some(ip), &geo));
         let other: IpAddr = "8.8.8.8".parse().unwrap();
         assert!(!provider.matches(&TargetAddr::Ip(other, 80), Some(other), &geo));
+    }
+
+    #[test]
+    fn classical_no_resolve_does_not_use_a_previously_resolved_domain() {
+        let provider = RuleProvider::new(
+            "p".into(), Behavior::Classical,
+            vec!["IP-CIDR,10.0.0.0/8,no-resolve".into()],
+        );
+        let geo = GeoData::default();
+        let ip: IpAddr = "10.1.2.3".parse().unwrap();
+        let domain = TargetAddr::Domain("example.com".into(), 443);
+        assert!(!provider.needs_resolve(&domain));
+        assert!(!provider.matches(&domain, Some(ip), &geo));
+        assert!(provider.matches(&TargetAddr::Ip(ip, 443), None, &geo));
     }
 
     #[test]
