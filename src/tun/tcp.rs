@@ -517,10 +517,23 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
         // Fake IPs only exist for IPv4; a real IPv6 destination is dialed as-is.
         let target = match key.target_ip {
             IpAddr::V4(v4) => match crate::fake_ip::hostname_for(v4) {
-                Some(host) => TargetAddr::Domain(host, key.target_port),
-                None => key_target_addr(&key),
+                Some(host) => Some(TargetAddr::Domain(host, key.target_port)),
+                // A fake-ip this process no longer knows is a dead end:
+                // dialing it can only black-hole, so fail now instead of
+                // timing out ten seconds later.
+                None if crate::fake_ip::is_in_fake_range(v4) => None,
+                None => Some(key_target_addr(&key)),
             },
-            IpAddr::V6(_) => key_target_addr(&key),
+            IpAddr::V6(_) => Some(key_target_addr(&key)),
+        };
+        let Some(target) = target else {
+            diag(format!(
+                "flow {}:{} rejected: unknown fake-ip {}:{}",
+                key.client_ip, key.client_port, key.target_ip, key.target_port
+            ));
+            relay_failed.store(true, Ordering::Relaxed);
+            done.store(true, Ordering::Relaxed);
+            return;
         };
         // Log the resolved target (domain when known), not the fake IP, so a
         // log export names the site a flow belongs to.

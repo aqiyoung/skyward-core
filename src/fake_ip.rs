@@ -59,6 +59,13 @@ pub fn hostname_for(ip: Ipv4Addr) -> Option<String> {
     pool().lock().unwrap().by_ip.get(&ip).cloned()
 }
 
+/// True when `ip` is inside the pool's synthetic range (198.18.0.0/16). A
+/// destination in this range is one of our fake addresses; if the pool no
+/// longer knows it, nothing can be dialed there.
+pub fn is_in_fake_range(ip: Ipv4Addr) -> bool {
+    ip.octets()[0] == 198 && ip.octets()[1] == 18
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,5 +76,14 @@ mod tests {
         assert_eq!(ip, fake_ip_for("EXAMPLE.com"));
         assert_eq!(hostname_for(ip).as_deref(), Some("example.com"));
         assert_ne!(ip, fake_ip_for("other.com"));
+    }
+
+    #[test]
+    fn fake_range_check() {
+        assert!(is_in_fake_range("198.18.0.13".parse().unwrap()));
+        assert!(is_in_fake_range("198.18.255.200".parse().unwrap()));
+        assert!(!is_in_fake_range("198.19.0.13".parse().unwrap()));
+        assert!(!is_in_fake_range("198.17.0.13".parse().unwrap()));
+        assert!(!is_in_fake_range("203.0.113.7".parse().unwrap()));
     }
 }

@@ -126,6 +126,17 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
             let target = match key.dst {
                 IpAddr::V4(v4) => match crate::fake_ip::hostname_for(v4) {
                     Some(host) => TargetAddr::Domain(host, key.dst_port),
+                    // Unknown fake-ip is a dead end: refuse now instead of
+                    // timing out ten seconds later.
+                    None if crate::fake_ip::is_in_fake_range(v4) => {
+                        crate::tun::runtime::diag_udp(format!(
+                            "udp session {}:{} -> {} rejected: unknown fake-ip",
+                            key.src, key.src_port, v4
+                        ));
+                        refuse(&io, &key, first_payload.len());
+                        sessions.lock().unwrap().remove(&key);
+                        return;
+                    }
                     None => TargetAddr::Ip(key.dst, key.dst_port),
                 },
                 IpAddr::V6(_) => TargetAddr::Ip(key.dst, key.dst_port),
