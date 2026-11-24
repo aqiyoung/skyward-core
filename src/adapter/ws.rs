@@ -19,6 +19,22 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 /// Perform the client handshake over `inner` and return the framed stream.
 /// `host` is sent as the `Host` header; `path` is the request path (a leading
 /// `/` is added when missing). Extra `headers` from `ws-opts` are sent as-is.
+/// Remove only the `ed` (early-data) query parameter that Xray clients add
+/// to ws paths, keeping every other query param intact and in order.
+fn strip_early_data_query(path: &str) -> String {
+    let Some((base, query)) = path.split_once('?') else {
+        return path.to_string();
+    };
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty() && !pair.starts_with("ed=") && *pair != "ed")
+        .collect();
+    if kept.is_empty() {
+        return base.to_string();
+    }
+    format!("{}?{}", base, kept.join("&"))
+}
+
 pub async fn connect_ws<S>(
     mut inner: S,
     host: &str,
@@ -36,8 +52,12 @@ where
     } else {
         format!("/{}", path)
     };
+    // Xray's `?ed=N` is a client-side early-data hint, not a query the CDN
+    // should see. concord strips it before building the request; keep the
+    // query minus `ed` so the Cloudflare-fronted node accepts the upgrade.
+    let path = strip_early_data_query(&path);
     let mut request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\n",
+        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Go-http-client/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\n",
         path, host, key
     );
     for (name, value) in headers {
@@ -213,6 +233,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsStream<S> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         loop {
+            // A frame left half-written by poll_write stays in pending_write;
+            // poll_write reported the whole buffer as consumed, so write_all
+            // returned Ok and the relay moved on to reading. Drive that frame
+            // out before waiting for input, or the peer waits forever for the
+            // rest of the bytes (e.g. a TLS ClientHello) and answers nothing.
+            if self.pending_write.is_some() {
+                match self.as_mut().flush_pending(cx) {
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
             if !self.ready.is_empty() {
                 let n = self.ready.len().min(buf.remaining());
                 let chunk: Vec<u8> = self.ready.drain(..n).collect();
@@ -328,6 +360,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsStream<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strips_only_early_data_query() {
+        assert_eq!(strip_early_data_query("/pic/team?ed=2560"), "/pic/team");
+        assert_eq!(strip_early_data_query("/x?ed=2560&foo=bar"), "/x?foo=bar");
+        assert_eq!(strip_early_data_query("/x?foo=bar&ed=10&baz=1"), "/x?foo=bar&baz=1");
+        assert_eq!(strip_early_data_query("/plain"), "/plain");
+    }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn server_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
