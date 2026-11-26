@@ -537,7 +537,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
         };
         // Log the resolved target (domain when known), not the fake IP, so a
         // log export names the site a flow belongs to.
-        let addr = target.address();
+        let mut addr = target.address();
         let mut tasks = self.tasks.lock().unwrap();
         while tasks.try_join_next().is_some() {}
         tasks.spawn(async move {
@@ -549,6 +549,34 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             let engine = crate::runtime_state::engine()
                 .await
                 .unwrap_or(fallback_engine);
+            // The destination is a literal IP (the app resolved via DoH or a
+            // cached answer, so there is no fake-ip mapping). Recover the real
+            // hostname from the first uplink bytes -- TLS ClientHello SNI or
+            // HTTP Host -- so rules match by domain instead of falling through
+            // to DIRECT. mihomo/concord do the same. Wait only briefly so a
+            // client that sends nothing is not delayed.
+            let mut target = target;
+            if let TargetAddr::Ip(_, _) = &target {
+                let mut peek = [0u8; 16 * 1024];
+                let mut n = to_net.peek(&mut peek);
+                if n == 0 {
+                    if tokio::time::timeout(
+                        std::time::Duration::from_millis(250),
+                        to_net.notified(),
+                    )
+                    .await
+                    .is_ok()
+                    {
+                        n = to_net.peek(&mut peek);
+                    }
+                }
+                if let Some(host) = crate::tun::sniff::sniff_host(&peek[..n]) {
+                    let port = target.port();
+                    diag(format!("flow sniffed host {} for {}", host, addr));
+                    target = TargetAddr::Domain(host, port);
+                    addr = target.address();
+                }
+            }
             // Rules and the chain are decided before dialling so the connection
             // the App lists names the same route the packet actually took.
             let rule = engine.decide(&target).await;

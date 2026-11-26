@@ -139,6 +139,17 @@ impl ByteQueue {
         n
     }
 
+    /// Copy up to `out.len()` leading bytes without consuming them. Used for
+    /// protocol sniffing (e.g. TLS SNI) on the first uplink payload.
+    pub fn peek(&self, out: &mut [u8]) -> usize {
+        let queue = self.inner.lock().unwrap();
+        let n = out.len().min(queue.len());
+        for (slot, byte) in out.iter_mut().take(n).zip(queue.iter()) {
+            *slot = *byte;
+        }
+        n
+    }
+
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap().len()
     }
