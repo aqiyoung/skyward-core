@@ -98,8 +98,8 @@ pub fn invoke(data: &[u8]) -> Vec<u8> {
             IS_INIT.store(false, Ordering::Relaxed);
             ok(&call.id, Value::Bool(true))
         }
-        "startListener" => ok(&call.id, Value::Bool(true)),
-        "stopListener" => ok(&call.id, Value::Bool(true)),
+        "startListener" => handle_start_listener(&call),
+        "stopListener" => handle_stop_listener(&call),
         "getProxies" => handle_get_proxies(&call),
         "changeProxy" => handle_change_proxy(&call),
         "asyncTestDelay" => handle_test_delay(&call),
@@ -497,6 +497,11 @@ static ROUTE_REPORTED: std::sync::Mutex<Option<(serde_json::Map<String, Value>, 
     std::sync::Mutex::new(None);
 static ROUTE_WATCH_CANCEL: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>> =
     std::sync::Mutex::new(None);
+
+/// Task handles for the HTTP/SOCKS/mixed inbound listeners opened for the
+/// App's system-proxy mode. Kept so stopListener can close the ports.
+static LISTENER_TASKS: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>> =
+    std::sync::Mutex::new(Vec::new());
 
 fn route_json(picks: &serde_json::Map<String, Value>, version: u64) -> Value {
     json!({
@@ -1554,6 +1559,55 @@ fn handle_quick_setup(call: &MethodCall) -> Vec<u8> {
 
 /// Inline block_on for the small setup futures (they run on a dedicated thread
 /// in the JNI path; this keeps `invoke` synchronous as gomobile expects).
+/// Open the configured inbound listeners (HTTP/SOCKS/mixed/REST) so the App's
+/// system-proxy mode has a local proxy to send browser/app traffic to. Without
+/// this, Android's HTTP proxy points at a port nobody listens on and every
+/// proxied app fails, while the core's own dial_named probes still work.
+fn handle_start_listener(call: &MethodCall) -> Vec<u8> {
+    stop_listener_tasks();
+    let result = block_on(async {
+        let engine = match crate::runtime_state::engine().await {
+            Some(e) => e,
+            None => return Err("no engine loaded".to_string()),
+        };
+        let config_path = crate::runtime_state::config_path()
+            .await
+            .unwrap_or_else(|| PathBuf::from("config.yaml"));
+        let state = crate::AppState {
+            engine: tokio::sync::RwLock::new(engine),
+            config_path: tokio::sync::RwLock::new(config_path),
+            traffic: crate::runtime_state::traffic(),
+        };
+        Ok(crate::spawn_listeners(Arc::new(state)).await)
+    });
+    match result {
+        Ok(Ok(handles)) => {
+            let count = handles.len();
+            *LISTENER_TASKS.lock().unwrap() = handles;
+            crate::jni::emit_log_event(&format!(
+                "[rust-core] startListener: {} inbound(s) opened",
+                count
+            ));
+            ok(&call.id, Value::Bool(true))
+        }
+        Ok(Err(e)) | Err(e) => {
+            crate::jni::emit_log_event(&format!("[rust-core] startListener failed: {}", e));
+            ok(&call.id, Value::Bool(false))
+        }
+    }
+}
+
+fn stop_listener_tasks() {
+    for task in LISTENER_TASKS.lock().unwrap().drain(..) {
+        task.abort();
+    }
+}
+
+fn handle_stop_listener(call: &MethodCall) -> Vec<u8> {
+    stop_listener_tasks();
+    ok(&call.id, Value::Bool(true))
+}
+
 fn block_on<F: std::future::Future + Send + 'static>(future: F) -> Result<F::Output, String>
 where
     F::Output: Send + 'static,
