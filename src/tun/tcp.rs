@@ -611,6 +611,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             let mut read_buf = vec![0u8; 16 * 1024];
             let started = std::time::Instant::now();
             let mut end_reason = "cancelled";
+            let mut end_error = String::new();
             let mut write_shutdown = false;
             let relay = async { 'relay: loop {
                 // App half-closed and its bytes are flushed: close the
@@ -659,6 +660,7 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                         }
                         Err(e) => {
                             end_reason = "read_err";
+                            end_error = e.to_string();
                             flow_diag(format!("flow {} read failed: {}", addr, e));
                             if down_counter.load(Ordering::Relaxed) == 0 {
                                 crate::tunnel::note_failure(&addr, &final_name);
@@ -682,12 +684,17 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
                 _ = relay => {}
             }
             flow_diag(format!(
-                "flow {} done up={} down={} lived={}ms end={}",
+                "flow {} done up={} down={} lived={}ms end={}{}",
                 addr,
                 up_counter.load(Ordering::Relaxed),
                 down_counter.load(Ordering::Relaxed),
                 started.elapsed().as_millis(),
-                end_reason
+                end_reason,
+                if end_error.is_empty() {
+                    String::new()
+                } else {
+                    format!(" err={}", end_error)
+                }
             ));
             done.store(true, Ordering::Relaxed);
         });
