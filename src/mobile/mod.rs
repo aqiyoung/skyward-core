@@ -147,9 +147,11 @@ pub fn invoke(data: &[u8]) -> Vec<u8> {
 }
 
 fn core_version() -> String {
-    // The App's User-Agent probes expect a `clash.meta/<ver>`-style prefix to
-    // select mihomo YAML from subscription providers.
-    format!("clash.meta/{} (rust)", VERSION)
+    // A branded name so the diagnostics page shows this is the Skyward Rust
+    // core, not the upstream Go core. The `clash.meta/` prefix needed for
+    // subscription format detection is added by the App's uaFor(), so it is
+    // deliberately not part of this string.
+    format!("Skyward Core (Rust) v{}", VERSION)
 }
 
 fn handle_init_clash(call: &MethodCall) -> Vec<u8> {
@@ -1719,9 +1721,11 @@ mod tests {
     }
 
     #[test]
-    fn core_version_has_meta_prefix() {
+    fn core_version_is_branded_skyward_rust() {
         let r = response(invoke(br#"{"method":"coreVersion"}"#));
-        assert!(r["result"].as_str().unwrap().starts_with("clash.meta/"));
+        let v = r["result"].as_str().unwrap();
+        assert!(v.starts_with("Skyward Core (Rust) v"), "{v}");
+        assert!(!v.contains("clash.meta/"), "uaFor adds that prefix: {v}");
         assert!(r["error"].is_null());
     }
 

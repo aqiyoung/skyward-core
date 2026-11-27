@@ -439,7 +439,10 @@ mod tests {
         let text = unsafe { std::slice::from_raw_parts(buf, len) };
         let value: serde_json::Value = serde_json::from_slice(text).unwrap();
         assert_eq!(value["id"], "1");
-        assert!(value["result"].as_str().unwrap().starts_with("clash.meta/"));
+        assert!(value["result"]
+            .as_str()
+            .unwrap()
+            .starts_with("Skyward Core (Rust)"));
         skyward_free_buffer(buf, len);
     }
 
