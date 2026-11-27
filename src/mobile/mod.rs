@@ -1586,7 +1586,15 @@ fn handle_start_listener(call: &MethodCall) -> Vec<u8> {
 /// is loaded yet (the deferred call after setupConfig will retry).
 fn open_inbound_listeners() -> bool {
     stop_listener_tasks();
-    let result = block_on(async {
+    // The listener tasks are spawned with tokio::spawn inside spawn_listeners,
+    // so they live on whichever runtime is driving this future. A throwaway
+    // block_on runtime would be dropped on return and close the ports again;
+    // use the App's persistent runtime so the proxy port stays open.
+    let Some(rt) = crate::jni::tokio_runtime() else {
+        crate::jni::emit_log_event("[rust-core] startListener failed: no runtime");
+        return false;
+    };
+    let result: Result<Vec<tokio::task::JoinHandle<()>>, String> = rt.block_on(async {
         let engine = match crate::runtime_state::engine().await {
             Some(e) => e,
             None => return Err("no engine loaded".to_string()),
@@ -1602,7 +1610,7 @@ fn open_inbound_listeners() -> bool {
         Ok(crate::spawn_listeners(Arc::new(state)).await)
     });
     match result {
-        Ok(Ok(handles)) => {
+        Ok(handles) => {
             let count = handles.len();
             *LISTENER_TASKS.lock().unwrap() = handles;
             crate::jni::emit_log_event(&format!(
@@ -1611,7 +1619,7 @@ fn open_inbound_listeners() -> bool {
             ));
             true
         }
-        Ok(Err(e)) | Err(e) => {
+        Err(e) => {
             crate::jni::emit_log_event(&format!("[rust-core] startListener deferred: {}", e));
             false
         }
