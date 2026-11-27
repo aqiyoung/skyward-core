@@ -502,6 +502,11 @@ static ROUTE_WATCH_CANCEL: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>> =
 /// App's system-proxy mode. Kept so stopListener can close the ports.
 static LISTENER_TASKS: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>> =
     std::sync::Mutex::new(Vec::new());
+/// The App calls startListener as a preload BEFORE applying the profile, so
+/// no engine exists yet and the ports cannot be bound then. Remember the
+/// request and open the listeners once setupConfig has loaded a config.
+static LISTENER_WANTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn route_json(picks: &serde_json::Map<String, Value>, version: u64) -> Value {
     json!({
@@ -1455,14 +1460,21 @@ fn handle_setup_config(call: &MethodCall) -> Vec<u8> {
     };
     // Emit the path we are reading to aid diagnosis.
     crate::jni::emit_log_event(&format!("[rust-core] setupConfig reading path: {}", diag_path));
-    match block_on(future) {
+    let outcome = match block_on(future) {
         Ok(Ok(())) => ok(&call.id, Value::String(String::new())),
         Ok(Err(e)) => {
             crate::jni::emit_log_event(&format!("[rust-core] setupConfig FAILED: {}", e));
             ok(&call.id, Value::String(e))
         }
         Err(e) => ok(&call.id, Value::String(e)),
+    };
+    // The App preloads startListener before the config exists. Now that a
+    // config is loaded, open the local proxy ports it asked for so system-
+    // proxy traffic (browser / Google apps) is not sent to a dead port.
+    if LISTENER_WANTED.load(Ordering::Relaxed) {
+        open_inbound_listeners();
     }
+    outcome
 }
 
 /// Download a GeoX resource and reload the active engine so its rules pick up
@@ -1564,6 +1576,15 @@ fn handle_quick_setup(call: &MethodCall) -> Vec<u8> {
 /// this, Android's HTTP proxy points at a port nobody listens on and every
 /// proxied app fails, while the core's own dial_named probes still work.
 fn handle_start_listener(call: &MethodCall) -> Vec<u8> {
+    LISTENER_WANTED.store(true, Ordering::Relaxed);
+    let opened = open_inbound_listeners();
+    ok(&call.id, Value::Bool(opened))
+}
+
+/// Bind the configured inbound ports using the currently loaded engine.
+/// Returns true when at least one listener was opened, false when no config
+/// is loaded yet (the deferred call after setupConfig will retry).
+fn open_inbound_listeners() -> bool {
     stop_listener_tasks();
     let result = block_on(async {
         let engine = match crate::runtime_state::engine().await {
@@ -1588,11 +1609,11 @@ fn handle_start_listener(call: &MethodCall) -> Vec<u8> {
                 "[rust-core] startListener: {} inbound(s) opened",
                 count
             ));
-            ok(&call.id, Value::Bool(true))
+            true
         }
         Ok(Err(e)) | Err(e) => {
-            crate::jni::emit_log_event(&format!("[rust-core] startListener failed: {}", e));
-            ok(&call.id, Value::Bool(false))
+            crate::jni::emit_log_event(&format!("[rust-core] startListener deferred: {}", e));
+            false
         }
     }
 }
@@ -1604,6 +1625,7 @@ fn stop_listener_tasks() {
 }
 
 fn handle_stop_listener(call: &MethodCall) -> Vec<u8> {
+    LISTENER_WANTED.store(false, Ordering::Relaxed);
     stop_listener_tasks();
     ok(&call.id, Value::Bool(true))
 }
