@@ -358,10 +358,16 @@ impl Outbound for Hysteria2Outbound {
                 let packet_id = u16::from_be_bytes(datagram[4..6].try_into().unwrap());
                 let frag_id = datagram[6];
                 let frag_count = datagram[7];
-                let Some((_, addr_used)) = crate::adapter::h3::parse_varint(&datagram[8..]) else {
+                // parse_varint returns (value, used): value is the address
+                // LENGTH, used is only the varint's own byte width. Using
+                // `used` as the address length left address bytes glued to
+                // every UDP payload.
+                let Some((addr_len, varint_len)) =
+                    crate::adapter::h3::parse_varint(&datagram[8..])
+                else {
                     continue;
                 };
-                let payload_start = 8 + addr_used;
+                let payload_start = 8 + varint_len + addr_len as usize;
                 if payload_start > datagram.len() {
                     continue;
                 }

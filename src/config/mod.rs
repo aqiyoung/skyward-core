@@ -446,12 +446,22 @@ impl Config {
                 let src = concrete[i].as_ref().unwrap();
                 let mut clone = src.clone();
                 clone.name = format!("{} ⟶ {}", spec.name, hop);
-                clone.dialer_proxy = dialer.clone();
-                // Only the last hop reaches the site; intermediate hops are
-                // transports and should not be offered as standalone nodes.
-                members.push(clone.name.clone());
+                // Only hops after the entry are told to dial through the
+                // previous hop. Overwriting the entry's own dialer-proxy would
+                // silently drop a source node's preconfigured front proxy.
+                if i > 0 {
+                    clone.dialer_proxy = dialer.clone();
+                }
+                // Only the last hop reaches the site. Intermediate clones stay
+                // in `proxies` for the next hop's dialer-proxy to reference,
+                // but they must NOT be offered as standalone group members: a
+                // select group defaults to its first member, so including the
+                // entry hop made the chain dial just one hop.
+                if i + 1 == hops.len() {
+                    members.push(clone.name.clone());
+                }
                 self.proxies.push(clone);
-                dialer = Some(members.last().unwrap().clone());
+                dialer = Some(format!("{} ⟶ {}", spec.name, hop));
             }
 
             let chain_group_name = spec.name.clone();
@@ -653,10 +663,12 @@ chains:
         let nl_clone = cfg.proxies.iter().find(|p| p.name == "ViaRU ⟶ NL").unwrap();
         assert_eq!(ru_clone.dialer_proxy, None);          // entry: direct
         assert_eq!(nl_clone.dialer_proxy.as_deref(), Some("ViaRU ⟶ RU")); // exit via entry
-        // Hidden select group with the clones as members.
+        // Hidden select group with ONLY the exit clone as a member: the
+        // entry/intermediate clones stay in `proxies` for dialer-proxy links
+        // but must not be selectable, or the chain dials just one hop.
         let group = cfg.proxy_groups.iter().find(|g| g.name == "ViaRU").unwrap();
         assert_eq!(group.kind, "select");
-        assert_eq!(group.proxies, vec!["ViaRU ⟶ RU", "ViaRU ⟶ NL"]);
+        assert_eq!(group.proxies, vec!["ViaRU ⟶ NL"]);
         // Chain name injected into the target group.
         let target = cfg.proxy_groups.iter().find(|g| g.name == "Proxy").unwrap();
         assert!(target.proxies.contains(&"ViaRU".to_string()));

@@ -260,7 +260,9 @@ impl AsyncRead for SsrStream {
         // Read the server IV on first use, before any ciphertext.
         while this.dec.is_none() {
             while this.read_iv_filled < this.iv_len {
-                let mut tmp = [0u8; 16];
+                // XChaCha20 uses a 24-byte IV; a 16-byte buffer panics when
+                // sliced to the remaining IV length.
+                let mut tmp = [0u8; 24];
                 let mut rb = ReadBuf::new(&mut tmp[..this.iv_len - this.read_iv_filled]);
                 match Pin::new(&mut this.inner).poll_read(cx, &mut rb) {
                     Poll::Pending => return Poll::Pending,

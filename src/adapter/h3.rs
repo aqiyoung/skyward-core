@@ -513,12 +513,12 @@ pub fn encode_header_block(headers: &[(String, String)]) -> Vec<u8> {
     put_prefix_int(&mut out, 0, 8, 0);
     put_prefix_int(&mut out, 0, 7, 0);
     for (name, value) in headers {
-        // Literal Header Field Without Indexing — New Name: 001xxxxx,
-        // name length with a 4-bit prefix (the H bit of the name string
-        // is bit 3 of the length byte, handled inside put_string via
-        // the flags position — we emit the first byte manually).
+        // Literal Header Field Without Indexing — New Name (RFC 9204 §4.5.4):
+        // `001 N H | NameLen(3+)`. The name-length prefix is 3 bits; with a
+        // 4-bit prefix names >= 8 bytes shift the H flag into the length and
+        // Hysteria2 auth headers (Hysteria-Auth etc.) become malformed.
         let mut line = Vec::new();
-        put_string(&mut line, name, 4, 0x20);
+        put_string(&mut line, name, 3, 0x20);
         // Value: H bit + 7-bit prefix length, then raw bytes.
         put_string(&mut line, value, 7, 0x00);
         out.extend_from_slice(&line);
@@ -571,9 +571,11 @@ pub fn decode_header_block(data: &[u8]) -> io::Result<Vec<(String, String)>> {
                 pos += used;
                 headers.push((name.to_string(), String::from_utf8_lossy(&value).into_owned()));
             }
-            // Literal Without Indexing, New Name: 001xxxxx
+            // Literal Without Indexing, New Name: 001 N H | NameLen(3+).
+            // The name uses a 3-bit length prefix (RFC 9204 §4.5.4); the H
+            // flag is bit 3, which parse_string reads with prefix_bits=3.
             0x20..=0x3f => {
-                let (name, used) = parse_string(&data[pos..], 4)?;
+                let (name, used) = parse_string(&data[pos..], 3)?;
                 pos += used;
                 let (value, used) = parse_string(&data[pos..], 7)?;
                 pos += used;

@@ -558,18 +558,29 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             let mut target = target;
             if let TargetAddr::Ip(_, _) = &target {
                 let mut peek = [0u8; 16 * 1024];
-                let mut n = to_net.peek(&mut peek);
-                if n == 0 {
-                    if tokio::time::timeout(
-                        std::time::Duration::from_millis(250),
-                        to_net.notified(),
-                    )
-                    .await
-                    .is_ok()
+                let deadline = tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(250);
+                // A TLS ClientHello often arrives in several TCP segments. Keep
+                // re-peeking (and re-sniffing) until the record is complete or
+                // the brief budget expires -- one sniff on the first fragment
+                // would fail and permanently route by IP (the X/GitHub bug).
+                loop {
+                    let n = to_net.peek(&mut peek);
+                    if crate::tun::sniff::sniff_host(&peek[..n]).is_some() {
+                        break;
+                    }
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    if tokio::time::timeout(deadline - now, to_net.notified())
+                        .await
+                        .is_err()
                     {
-                        n = to_net.peek(&mut peek);
+                        break;
                     }
                 }
+                let n = to_net.peek(&mut peek);
                 if let Some(host) = crate::tun::sniff::sniff_host(&peek[..n]) {
                     let port = target.port();
                     diag(format!("flow sniffed host {} for {}", host, addr));

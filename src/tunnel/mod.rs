@@ -292,25 +292,41 @@ impl Engine {
         target: &TargetAddr,
     ) -> io::Result<(Box<dyn crate::adapter::PacketConn>, String, String)> {
         let rule_target = self.decide(target).await;
-        let final_name = self.outbounds.resolve(&rule_target).await;
-        dial_diag(format!(
-            "dial_udp {} -> rule={} outbound={}",
-            target.address(),
-            rule_target,
-            final_name
-        ));
-        match self.outbounds.connect_udp_named(&final_name, target).await {
-            Ok(conn) => Ok((conn, rule_target, final_name)),
-            Err(e) => {
-                dial_diag(format!(
-                    "dial_udp {} via {} FAILED: {}",
-                    target.address(),
-                    final_name,
-                    e
-                ));
-                Err(e)
+        let key = target.address();
+        // Same per-site failover as TCP: a node whose UDP failed for this
+        // destination before is skipped, so a QUIC session does not keep
+        // picking the same dead node (the X/GitHub UDP bug).
+        let mut skipped: Vec<String> = crate::tunnel::failed_nodes_for(&key);
+        let mut last_error = None;
+        for _ in 0..8 {
+            let final_name = self.outbounds.resolve_skipping(&rule_target, &skipped).await;
+            dial_diag(format!(
+                "dial_udp {} -> rule={} outbound={}",
+                target.address(),
+                rule_target,
+                final_name
+            ));
+            match self.outbounds.connect_udp_named(&final_name, target).await {
+                Ok(conn) => return Ok((conn, rule_target, final_name)),
+                Err(e) => {
+                    dial_diag(format!(
+                        "dial_udp {} via {} FAILED: {}",
+                        target.address(),
+                        final_name,
+                        e
+                    ));
+                    crate::tunnel::note_failure(&key, &final_name);
+                    skipped.push(final_name.clone());
+                    if skipped.len() >= self.outbounds.groups.len().max(2) {
+                        break;
+                    }
+                    last_error = Some(e);
+                }
             }
         }
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "no UDP outbound available")
+        }))
     }
 
     /// Dial a target through a specific outbound/group name (used by delay tests).

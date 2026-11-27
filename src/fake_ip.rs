@@ -10,11 +10,17 @@ use std::sync::{Mutex, OnceLock};
 
 static POOL: OnceLock<Mutex<FakeIpPool>> = OnceLock::new();
 
+const BASE: u32 = 0xc612_0000; // 198.18.0.0
+const RANGE: u32 = 0x0001_0000; // /16 = 65536 addresses
+const MAX_ENTRIES: usize = 60_000; // leave headroom below the full range
+
 #[derive(Default)]
 struct FakeIpPool {
     next: u32,
     by_ip: HashMap<Ipv4Addr, String>,
     by_name: HashMap<String, Ipv4Addr>,
+    /// Allocation order for LRU-ish reuse when the pool fills up.
+    order: std::collections::VecDeque<Ipv4Addr>,
 }
 
 fn pool() -> &'static Mutex<FakeIpPool> {
@@ -28,30 +34,63 @@ fn pool() -> &'static Mutex<FakeIpPool> {
     })
 }
 
-/// Return (or allocate) a fake IPv4 address for `host`.
+/// Return (or allocate) a fake IPv4 address for `host`. The allocation stays
+/// inside 198.18.0.0/16 and is bounded: when the pool fills, the oldest
+/// mapping is recycled instead of spinning forever (which used to hang the
+/// whole DNS path and could wander into real public IP space).
 pub fn fake_ip_for(host: &str) -> Ipv4Addr {
     let host = host.to_ascii_lowercase();
     let mut pool = pool().lock().unwrap();
     if let Some(ip) = pool.by_name.get(&host) {
         return *ip;
     }
-    // Skip the reserved low addresses of 198.18.0.0/24.
-    let mut value = pool.next;
-    loop {
-        value = value.wrapping_add(1);
-        if (value & 0xff) == 0 {
-            value = (value & !0xff) | 0x04;
-        }
-        let ip = Ipv4Addr::from(value);
-        if (value & 0xff) > 3 && !pool.by_ip.contains_key(&ip) {
+    // Find a free address within the range, at most a full pass.
+    let mut ip = None;
+    for _ in 0..RANGE {
+        let value = pool.next.wrapping_add(1);
+        // Wrap back to the start of the /16 instead of spilling into 198.19.
+        let offset = if value >= BASE && value < BASE + RANGE {
+            value - BASE
+        } else {
+            1
+        };
+        let next_ip = BASE + offset;
+        pool.next = next_ip;
+        let addr = Ipv4Addr::from(next_ip);
+        let host_byte = (next_ip & 0xff) as u8;
+        if host_byte > 3 && !pool.by_ip.contains_key(&addr) {
+            ip = Some(addr);
             break;
         }
     }
-    pool.next = value;
-    let ip = Ipv4Addr::from(value);
-    pool.by_ip.insert(ip, host.clone());
-    pool.by_name.insert(host, ip);
-    ip
+    let addr = match ip {
+        Some(a) => a,
+        None => {
+            // Pool exhausted: recycle the oldest mapping so DNS never stalls.
+            let oldest = pool
+                .order
+                .pop_front()
+                .unwrap_or_else(|| Ipv4Addr::from(BASE + 4));
+            if let Some(old_host) = pool.by_ip.remove(&oldest) {
+                pool.by_name.remove(&old_host);
+            }
+            oldest
+        }
+    };
+    pool.by_ip.insert(addr, host.clone());
+    pool.by_name.insert(host, addr);
+    pool.order.push_back(addr);
+    // Keep the mapping map bounded even if order/out-of-band inserts drift.
+    while pool.by_ip.len() > MAX_ENTRIES {
+        if let Some(oldest) = pool.order.pop_front() {
+            if let Some(old_host) = pool.by_ip.remove(&oldest) {
+                pool.by_name.remove(&old_host);
+            }
+        } else {
+            break;
+        }
+    }
+    addr
 }
 
 /// Reverse lookup: is `ip` a fake address, and what hostname does it stand for?
