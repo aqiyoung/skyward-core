@@ -206,6 +206,8 @@ pub struct GroupState {
     pub kind: String,
     pub members: Vec<String>,
     pub url: Option<String>,
+    /// Icon URL from the profile, surfaced to the App via getProxies.
+    pub icon: Option<String>,
     /// Selected index for `select`; rolling counter for `load-balance`.
     cursor: AtomicUsize,
     /// Whether an explicit selection (from the App's selected-map or a
@@ -252,6 +254,8 @@ pub struct ProxyInfo {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<String>,
     pub selected: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
 }
 
 /// Regional flags/words present in a group name, used to fill an empty
@@ -610,6 +614,7 @@ impl OutboundManager {
             kind: "select".into(),
             members: global_members,
             url: None,
+            icon: None,
             cursor: AtomicUsize::new(0),
             explicit: AtomicBool::new(false),
         });
@@ -619,6 +624,7 @@ impl OutboundManager {
                 kind: g.kind.clone(),
                 members: g.proxies.clone(),
                 url: g.url.clone(),
+                icon: g.icon.clone(),
                 cursor: AtomicUsize::new(0),
                 explicit: AtomicBool::new(false),
             });
@@ -858,12 +864,14 @@ impl OutboundManager {
             kind: o.kind().to_string(),
             members: Vec::new(),
             selected: None,
+            icon: None,
         }).collect();
         let mut groups: Vec<ProxyInfo> = self.groups.values().map(|g| ProxyInfo {
             name: g.name.clone(),
             kind: g.kind.clone(),
             members: g.members.clone(),
             selected: g.selected(),
+            icon: g.icon.clone(),
         }).collect();
         items.append(&mut groups);
         items.sort_by(|a, b| a.name.cmp(&b.name));
