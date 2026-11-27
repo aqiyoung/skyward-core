@@ -19,6 +19,7 @@ use crate::common::VERSION;
 
 pub mod log_bridge;
 pub mod profile_base;
+pub mod rcx;
 pub mod share_links;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -137,6 +138,20 @@ pub fn invoke(data: &[u8]) -> Vec<u8> {
         "closeConnection" => handle_close_connection(&call),
         "clearDnsCache" => ok(&call.id, Value::Bool(true)),
         "getChainReports" => handle_get_chain_reports(&call),
+        "rcxStatus" => ok(&call.id, block_on(rcx::status()).unwrap_or_else(|_| rcx::status_sync())),
+        "rcxSetPolicy" => {
+            let args = call.arguments.clone();
+            ok(&call.id, block_on(rcx::set_policy(args)).unwrap_or_else(|_| rcx::status_sync()))
+        }
+        "rcxHints" => ok(&call.id, rcx::hints(&call.arguments)),
+        "rcxExplain" => ok(&call.id, rcx::explain(call.arguments.as_str().unwrap_or(""))),
+        "rcxJournal" => ok(&call.id, rcx::journal(&call.arguments)),
+        "rcxAction" => {
+            let args = call.arguments.clone();
+            ok(&call.id, block_on(rcx::action(args)).unwrap_or_else(|_| json!({"decision":{"action":"hold","reason":{"code":""}}})))
+        }
+        "rcxProfiles" => ok(&call.id, rcx::profiles()),
+        "rcxStudio" => ok(&call.id, rcx::studio(&call.arguments)),
         "validateConfig" => handle_validate_config(&call),
         "setupConfig" => handle_setup_config(&call),
         "updateConfig" => handle_setup_config(&call),
@@ -1752,6 +1767,26 @@ mod tests {
         assert_eq!(r["result"], true);
         let r = response(invoke(br#"{"method":"getIsInit"}"#));
         assert_eq!(r["result"], true);
+    }
+
+    #[test]
+    fn rcx_methods_respond_not_unimplemented() {
+        for method in [
+            "rcxStatus", "rcxSetPolicy", "rcxHints", "rcxExplain",
+            "rcxJournal", "rcxAction", "rcxProfiles", "rcxStudio",
+        ] {
+            let input = format!(r#"{{"id":"x","method":"{}"}}"#, method);
+            let r = response(invoke(input.as_bytes()));
+            assert!(
+                r["error"].is_null(),
+                "{} should be implemented: {:?}", method, r["error"]
+            );
+        }
+        // A manual action returns a decision object the App can parse.
+        let r = response(invoke(
+            br#"{"method":"rcxAction","arguments":{"group":"Proxy","action":"change","node":"n1"}}"#,
+        ));
+        assert!(r["result"]["decision"].is_object());
     }
 
     #[test]
