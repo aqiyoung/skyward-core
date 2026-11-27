@@ -268,10 +268,6 @@ pub struct ProxyGroupDef {
     pub use_providers: Vec<String>,
     pub url: Option<String>,
     pub interval: Option<u64>,
-    /// A group's own picture (a URL the subscription supplies). Passed through
-    /// to the App so the Proxies page shows the subscription's icon instead of
-    /// guessing one from the group name.
-    pub icon: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -466,7 +462,6 @@ impl Config {
                 use_providers: Vec::new(),
                 url: None,
                 interval: None,
-                icon: None,
             });
             let target = spec.target_group.clone()
                 .or_else(|| default_target.clone());
@@ -559,20 +554,6 @@ pub struct Overrides {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn group_icon_reaches_proxy_snapshot() {
-        let yaml = r#"
-proxies:
-  - {name: n1, type: direct}
-proxy-groups:
-  - {name: AI Tools, type: select, icon: "https://x/gemini.png", proxies: [n1]}
-"#;
-        let config = Config::from_str(yaml).unwrap();
-        let snapshot = crate::adapter::OutboundManager::new(&config).snapshot();
-        let group = snapshot.iter().find(|p| p.name == "AI Tools").unwrap();
-        assert_eq!(group.icon.as_deref(), Some("https://x/gemini.png"));
-    }
 
     #[test]
     fn http_opts_path_accepts_string_or_list() {
