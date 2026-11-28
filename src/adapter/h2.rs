@@ -186,13 +186,19 @@ impl AsyncWrite for H2Stream {
         self.poll_pending_write(cx)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Drive an in-flight write; the previous no-op dropped the last chunk.
+        self.poll_pending_write(cx).map(|r| r.map(|_| ()))
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Dropping the sender ends the request body.
-        self.body_tx = None;
-        Poll::Ready(Ok(()))
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.poll_pending_write(cx) {
+            Poll::Ready(Ok(_)) => {
+                self.body_tx = None;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }

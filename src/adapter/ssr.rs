@@ -235,6 +235,14 @@ struct SsrStream {
     iv_len: usize,
     read_iv: Vec<u8>,
     read_iv_filled: usize,
+    /// An encrypted frame not fully written yet. The cipher keystream is
+    /// advanced once when the frame is built, so a partial write must resume
+    /// from `pending_off` instead of re-encrypting (which desynchronizes it).
+    pending: Vec<u8>,
+    pending_off: usize,
+    /// True while `pending` still holds the encryption of the current buf, so
+    /// a retried poll_write must not encrypt the same bytes a second time.
+    write_consumed: bool,
 }
 
 impl SsrStream {
@@ -249,7 +257,29 @@ impl SsrStream {
             iv_len,
             read_iv: vec![0u8; iv_len],
             read_iv_filled: 0,
+            pending: Vec::new(),
+            pending_off: 0,
+            write_consumed: false,
         }
+    }
+
+    fn flush_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while self.pending_off < self.pending.len() {
+            match Pin::new(&mut self.inner).poll_write(cx, &self.pending[self.pending_off..]) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "ssr: failed to write frame",
+                    )))
+                }
+                Poll::Ready(Ok(n)) => self.pending_off += n,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        self.pending.clear();
+        self.pending_off = 0;
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -306,17 +336,37 @@ impl AsyncRead for SsrStream {
 impl AsyncWrite for SsrStream {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        let n = buf.len();
-        let mut encrypted = buf.to_vec();
-        this.enc.apply(&mut encrypted);
-        match Pin::new(&mut this.inner).poll_write(cx, &encrypted) {
-            Poll::Ready(Ok(written)) => Poll::Ready(Ok(if written < n { written } else { n })),
-            other => other,
+        match this.flush_pending(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        if !this.write_consumed {
+            let mut encrypted = buf.to_vec();
+            this.enc.apply(&mut encrypted);
+            this.pending = encrypted;
+            this.pending_off = 0;
+            this.write_consumed = true;
+        }
+        match this.flush_pending(cx) {
+            Poll::Ready(Ok(())) => {
+                this.write_consumed = false;
+                Poll::Ready(Ok(buf.len()))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        let this = self.get_mut();
+        match this.flush_pending(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut this.inner).poll_flush(cx),
+            other => other,
+        }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

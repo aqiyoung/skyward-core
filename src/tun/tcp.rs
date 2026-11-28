@@ -487,8 +487,13 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
         }
     }
 
-    /// Stop every relay; used when the VPN goes down.
+    /// Stop every relay; used when the VPN goes down. Notify each flow's
+    /// cancel first, otherwise tasks blocked in their select never wake and
+    /// JoinSet::shutdown() waits forever.
     pub async fn shutdown(&mut self) {
+        for flow in self.flows.values() {
+            flow.cancel.notify_one();
+        }
         self.flows.clear();
         self.tasks.get_mut().unwrap().shutdown().await;
     }

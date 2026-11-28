@@ -96,6 +96,9 @@ where
 }
 
 const OP_CONT: u8 = 0;
+/// Max single WS frame / reassembled message (16 MiB). Larger frames from the
+/// peer are ignored rather than allocated, preventing panic/OOM.
+const MAX_FRAME: u64 = 16 * 1024 * 1024;
 const OP_BINARY: u8 = 2;
 const OP_CLOSE: u8 = 8;
 const OP_PING: u8 = 9;
@@ -179,6 +182,15 @@ impl<S> WsStream<S> {
             }
             len = u64::from_be_bytes(self.raw[pos..pos + 8].try_into().unwrap());
             pos += 8;
+            // A peer-declared multi-GB frame must not drive an allocation or
+            // an overflowing `pos + len` (panic in debug, wrap in release).
+            if len > MAX_FRAME {
+                return None;
+            }
+        }
+        // Reject anything beyond the cap (also covers 16-bit extended lengths).
+        if len > MAX_FRAME as u64 {
+            return None;
         }
         let mask = if masked {
             if self.raw.len() < pos + 4 {
@@ -257,6 +269,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsStream<S> {
             if let Some((fin, opcode, payload)) = self.next_frame() {
                 match opcode {
                     OP_CONT | OP_BINARY | 1 => {
+                        if self.message.len() + payload.len() > MAX_FRAME as usize {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "ws: fragmented message too large",
+                            )));
+                        }
                         self.message.extend_from_slice(&payload);
                         if fin {
                             let message = std::mem::take(&mut self.message);
@@ -277,7 +295,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsStream<S> {
                 }
                 continue;
             }
-            // Need more bytes from the wire.
+            // Need more bytes from the wire. Guard against a peer declaring a
+            // huge frame then dribbling bytes: raw would grow without bound.
+            if self.raw.len() > MAX_FRAME as usize {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "ws: frame buffer too large",
+                )));
+            }
             let mut chunk = [0u8; 8192];
             let mut read_buf = ReadBuf::new(&mut chunk);
             match Pin::new(&mut self.inner).poll_read(cx, &mut read_buf) {

@@ -772,12 +772,24 @@ fn parse_server_hello(msg: &[u8]) -> io::Result<(u16, u16, Vec<u8>)> {
         ));
     }
     let mut pos = 34;
-    let echo_len = body[pos] as usize;
+    // A hostile/malformed ServerHello must not index past `body`.
+    let u8_at = |body: &[u8], p: usize| -> io::Result<u8> {
+        body.get(p).copied().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "tls13: truncated ServerHello")
+        })
+    };
+    let u16_at = |body: &[u8], p: usize| -> io::Result<u16> {
+        let s = body.get(p..p + 2).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "tls13: truncated ServerHello")
+        })?;
+        Ok(u16::from_be_bytes([s[0], s[1]]))
+    };
+    let echo_len = u8_at(body, pos)? as usize;
     pos += 1 + echo_len;
-    let suite = u16::from_be_bytes([body[pos], body[pos + 1]]);
+    let suite = u16_at(body, pos)?;
     pos += 2;
     pos += 1; // compression
-    let ext_total = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+    let ext_total = u16_at(body, pos)? as usize;
     pos += 2;
     let ext_end = (pos + ext_total).min(body.len());
     let mut group = 0u16;

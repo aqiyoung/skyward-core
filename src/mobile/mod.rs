@@ -1629,6 +1629,15 @@ fn open_inbound_listeners() -> bool {
     match result {
         Ok(handles) => {
             let count = handles.len();
+            if count == 0 {
+                // A config that asks for ports but bound none leaves the
+                // system proxy pointing at a dead port. Report failure so the
+                // App knows not to rely on it.
+                crate::jni::emit_log_event(
+                    "[rust-core] startListener: no inbound port could be bound",
+                );
+                return false;
+            }
             *LISTENER_TASKS.lock().unwrap() = handles;
             crate::jni::emit_log_event(&format!(
                 "[rust-core] startListener: {} inbound(s) opened",

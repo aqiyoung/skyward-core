@@ -188,7 +188,9 @@ struct StreamState {
 impl StreamState {
     fn push(&self, data: Bytes) {
         self.queue.lock().unwrap().0.push_back(data);
-        self.notify.notify_waiters();
+        // notify_one stores a permit even when no waiter is registered yet,
+        // unlike notify_waiters which drops the wakeup entirely.
+        self.notify.notify_one();
     }
     fn close(&self, error: Option<String>) {
         let mut q = self.queue.lock().unwrap();
@@ -196,7 +198,7 @@ impl StreamState {
         if error.is_some() {
             q.2 = error;
         }
-        self.notify.notify_waiters();
+        self.notify.notify_one();
     }
 }
 

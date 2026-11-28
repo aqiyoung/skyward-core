@@ -74,7 +74,7 @@ impl SessionManager {
                 if socket.may_recv() && socket.state() == tcp::State::Established {
                     let mut buf = [0u8; 8192];
                     match socket.recv_slice(&mut buf) {
-                        Ok(n) if n > 0 => bridges.to_net.push(&buf[..n]),
+                        Ok(n) if n > 0 => { bridges.to_net.push(&buf[..n]); }
                         _ => {}
                     }
                 }
@@ -124,9 +124,19 @@ impl ByteQueue {
         }
     }
 
-    pub fn push(&self, data: &[u8]) {
-        self.inner.lock().unwrap().extend(data.iter().copied());
+    /// Push bytes. Returns false (dropping the tail) when the queue is at its
+    /// cap, so a stalled outbound cannot grow the buffer without bound.
+    pub fn push(&self, data: &[u8]) -> bool {
+        const CAP: usize = 256 * 1024;
+        let mut queue = self.inner.lock().unwrap();
+        let room = CAP.saturating_sub(queue.len());
+        if room == 0 {
+            return false;
+        }
+        let take = room.min(data.len());
+        queue.extend(data[..take].iter().copied());
         self.ready.notify_one();
+        take == data.len()
     }
 
     /// Pop up to `out.len()` bytes. Returns the number popped.
@@ -224,7 +234,7 @@ pub fn spawn_session(engine: Arc<Engine>, target: TargetAddr, bridges: SessionBr
                 _ = bridges.to_net.notified() => {},
                 result = stream.read(&mut read_buf) => match result {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => bridges.from_net.push(&read_buf[..n]),
+                    Ok(n) => { bridges.from_net.push(&read_buf[..n]); }
                 }
             }
         }
