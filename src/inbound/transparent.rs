@@ -129,7 +129,10 @@ pub async fn serve_redir(listener: TcpListener, state: Arc<AppState>) {
                 tokio::spawn(async move {
                     match original_dst(&stream) {
                         Ok(target) => {
-                            let engine = state.engine.read().await.clone();
+                            // Serve with the live engine, not the snapshot
+                            // this listener was opened with: after a config
+                            // switch the snapshot is the old engine.
+                            let engine = crate::live_engine(&state).await;
                             if let Err(e) = engine.handle(target, stream, &[]).await {
                                 tracing::debug!(%peer, "redir connection ended: {}", e);
                             }
@@ -161,7 +164,9 @@ pub async fn serve_tproxy(listener: TcpListener, state: Arc<AppState>) {
                             return;
                         }
                     };
-                    let engine = state.engine.read().await.clone();
+                    // Serve with the live engine, not the snapshot this
+                    // listener was opened with (see serve_redir).
+                    let engine = crate::live_engine(&state).await;
                     if let Err(e) = engine.handle(target, stream, &[]).await {
                         tracing::debug!(%peer, "tproxy connection ended: {}", e);
                     }

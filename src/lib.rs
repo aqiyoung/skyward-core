@@ -68,6 +68,23 @@ impl AppState {
     }
 }
 
+/// The engine currently serving traffic for this state: the live global
+/// engine when one is loaded, else the state's own snapshot.
+///
+/// The mobile path keeps the live engine in the global slot (see
+/// `runtime_state`) and opens listeners with a one-shot snapshot state, so
+/// listeners and the REST controller must read through here — reading the
+/// snapshot directly would keep serving the engine from before the last
+/// config switch (the transparent inbounds did exactly that). On the
+/// CLI/FFI path there is no global engine and the snapshot IS the live one,
+/// so the fallback is the correct behaviour there, not a stale read.
+pub async fn live_engine(state: &AppState) -> Arc<Engine> {
+    match crate::runtime_state::engine().await {
+        Some(engine) => engine,
+        None => state.engine.read().await.clone(),
+    }
+}
+
 /// Spawn all configured listeners (inbounds + REST controller) and return their
 /// task handles so a caller (CLI or FFI) can shut them down. The config is
 /// read from the current engine snapshot.

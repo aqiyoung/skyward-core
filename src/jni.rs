@@ -3,8 +3,11 @@
 //! Core.kt calls these static methods, and we call back into its `ResultHandler`
 //! / `TunHandler` interfaces.
 //!
-//! All entries use `extern "system"` with a `catch_unwind` guard. The JNIEnv
-//! lifetime is tied to the native method call; global refs outlive it.
+//! All entries use `extern "system"` with a `catch_unwind` guard (see
+//! `guarded` below): a panic crossing a JNI boundary is undefined behaviour
+//! and in practice aborts the whole App process, so no export may let one
+//! escape. The JNIEnv lifetime is tied to the native method call; global
+//! refs outlive it.
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -26,7 +29,7 @@ static TUN_HANDLER: Mutex<Option<GlobalRef>> = Mutex::new(None);
 /// Serializes the whole start/stop TUN sequence. Distinct from TUN_SESSION so
 /// the blocking engine lookup and old-task join never hold the session lock.
 static TUN_START_LOCK: Mutex<()> = Mutex::new(());
-static TOKIO_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static TOKIO_RUNTIME: OnceLock<Option<tokio::runtime::Runtime>> = OnceLock::new();
 static TUN_WAKE: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
 
 /// Ask Android's VpnService to keep a socket out of the VPN tunnel. Every
@@ -154,15 +157,42 @@ pub fn resolve_app_package(protocol: i32, source: &str, target: &str) -> Option<
     Some(name)
 }
 
+/// Run `f` behind a panic guard and return `on_panic` if it unwinds.
+///
+/// Every `extern "system"` export must go through this: a panic crossing a
+/// JNI boundary is undefined behaviour and in practice aborts the App, so
+/// the panic is logged to the App event channel and the caller sees a
+/// failure return value instead of a crash.
+fn guarded<R>(f: impl FnOnce() -> R, on_panic: R) -> R {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(value) => value,
+        Err(_) => {
+            emit_log_event("[rust-core] JNI entry panicked; returning fallback");
+            on_panic
+        }
+    }
+}
+
+/// Lock a JNI-side mutex, recovering the data if a previous holder panicked.
+/// The guarded entries above mean such a panic can no longer crash the
+/// process, but the poisoned lock must not fail every later call either.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub(crate) fn tokio_runtime() -> Option<&'static tokio::runtime::Runtime> {
+    // The runtime is built once; a build failure is cached as None (rather
+    // than panicking) so every caller degrades to its own failure path.
     TOKIO_RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(2)
             .build()
-            .expect("build jni tokio runtime")
+            .ok()
     });
-    TOKIO_RUNTIME.get()
+    TOKIO_RUNTIME.get().as_ref().and_then(|rt| rt.as_ref())
 }
 
 fn vm() -> Option<&'static JavaVM> {
@@ -227,22 +257,27 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_initVm(
     env: JNIEnv,
     _class: JObject,
 ) {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    if let Ok(vm) = env.get_java_vm() {
-        let _ = JAVA_VM.set(vm);
-    }
-    INIT.call_once(|| {
-        // Install a global tracing subscriber writing to stderr. Android
-        // logcat captures stderr, so all tracing! calls (including startTun
-        // diagnostics) become visible. Never fails the JNI call.
-        use tracing_subscriber::fmt::format::FmtSpan;
-        let _ = tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
-            .with_max_level(tracing::Level::INFO)
-            .with_span_events(FmtSpan::NONE)
-            .try_init();
-        tracing::info!("skyward-core JNI initialized (rust)");
-    });
+    guarded(
+        move || {
+            static INIT: std::sync::Once = std::sync::Once::new();
+            if let Ok(vm) = env.get_java_vm() {
+                let _ = JAVA_VM.set(vm);
+            }
+            INIT.call_once(|| {
+                // Install a global tracing subscriber writing to stderr. Android
+                // logcat captures stderr, so all tracing! calls (including startTun
+                // diagnostics) become visible. Never fails the JNI call.
+                use tracing_subscriber::fmt::format::FmtSpan;
+                let _ = tracing_subscriber::fmt()
+                    .with_writer(std::io::stderr)
+                    .with_max_level(tracing::Level::INFO)
+                    .with_span_events(FmtSpan::NONE)
+                    .try_init();
+                tracing::info!("skyward-core JNI initialized (rust)");
+            });
+        },
+        (),
+    );
 }
 
 #[no_mangle]
@@ -275,45 +310,49 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_invokeMethod(
     data: JString,
     handler: JObject,
 ) {
-    let input = java_string(&mut env, &data);
-    // Flutter delivers core calls on one serial queue. Like the Go bridge,
-    // return immediately for network probes so polling can continue.
-    if serde_json::from_str::<mobile::MethodCall>(&input)
-        .is_ok_and(|call| matches!(call.method.as_str(), "asyncTestDelay" | "probe" | "serviceCheck" | "outboundIp"))
-    {
-        if let (Some(vm), Some(rt)) = (vm(), tokio_runtime()) {
-            if let Ok(handler) = env.new_global_ref(&handler) {
-                rt.spawn_blocking(move || {
-                    let result = mobile::invoke(input.as_bytes());
-                    if let Ok(mut env) = vm.attach_current_thread() {
-                        if let Err(e) = fire_result(&mut env, handler.as_obj(), &result) {
-                            tracing::warn!("async invokeMethod callback: {}", e);
-                            let _ = env.exception_clear();
+    guarded(move || {
+        let input = java_string(&mut env, &data);
+        // Flutter delivers core calls on one serial queue. Like the Go bridge,
+        // return immediately for network probes so polling can continue.
+        if serde_json::from_str::<mobile::MethodCall>(&input)
+            .is_ok_and(|call| matches!(call.method.as_str(), "asyncTestDelay" | "probe" | "serviceCheck" | "outboundIp"))
+        {
+            if let (Some(vm), Some(rt)) = (vm(), tokio_runtime()) {
+                if let Ok(handler) = env.new_global_ref(&handler) {
+                    rt.spawn_blocking(move || {
+                        let result = mobile::invoke(input.as_bytes());
+                        if let Ok(mut env) = vm.attach_current_thread() {
+                            if let Err(e) = fire_result(&mut env, handler.as_obj(), &result) {
+                                tracing::warn!("async invokeMethod callback: {}", e);
+                                let _ = env.exception_clear();
+                            }
                         }
-                    }
-                });
-                return;
+                    });
+                    return;
+                }
             }
         }
-    }
-    let result = mobile::invoke(input.as_bytes());
-    if let Err(e) = fire_result(&mut env, &handler, &result) {
-        let _ = env.throw_new("java/lang/RuntimeException", format!("invokeMethod callback: {}", e));
-    }
+        let result = mobile::invoke(input.as_bytes());
+        if let Err(e) = fire_result(&mut env, &handler, &result) {
+            let _ = env.throw_new("java/lang/RuntimeException", format!("invokeMethod callback: {}", e));
+        }
+    }, ());
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_setEventListener(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JObject,
     handler: JObject,
 ) {
-    let global = if handler.is_null() {
-        None
-    } else {
-        env.new_global_ref(&handler).ok()
-    };
-    *EVENT_LISTENER.lock().unwrap() = global;
+    guarded(move || {
+        let global = if handler.is_null() {
+            None
+        } else {
+            env.new_global_ref(&handler).ok()
+        };
+        *lock(&EVENT_LISTENER) = global;
+    }, ());
 }
 
 #[no_mangle]
@@ -324,12 +363,14 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_quickSetup(
     setup_params: JString,
     handler: JObject,
 ) {
-    let init = java_string(&mut env, &init_params);
-    let setup = java_string(&mut env, &setup_params);
-    let result = mobile::android_quick_setup(&init, &setup);
-    if let Err(e) = fire_result(&mut env, &handler, result.as_bytes()) {
-        let _ = env.throw_new("java/lang/RuntimeException", format!("quickSetup callback: {}", e));
-    }
+    guarded(move || {
+        let init = java_string(&mut env, &init_params);
+        let setup = java_string(&mut env, &setup_params);
+        let result = mobile::android_quick_setup(&init, &setup);
+        if let Err(e) = fire_result(&mut env, &handler, result.as_bytes()) {
+            let _ = env.throw_new("java/lang/RuntimeException", format!("quickSetup callback: {}", e));
+        }
+    }, ());
 }
 
 #[no_mangle]
@@ -337,7 +378,9 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startListener(
     _env: JNIEnv,
     _class: JObject,
 ) {
-    let _ = mobile::invoke(br#"{"method":"startListener"}"#);
+    guarded(|| {
+        let _ = mobile::invoke(br#"{"method":"startListener"}"#);
+    }, ());
 }
 
 #[no_mangle]
@@ -345,7 +388,9 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_stopListener(
     _env: JNIEnv,
     _class: JObject,
 ) {
-    let _ = mobile::invoke(br#"{"method":"stopListener"}"#);
+    guarded(|| {
+        let _ = mobile::invoke(br#"{"method":"stopListener"}"#);
+    }, ());
 }
 
 #[no_mangle]
@@ -353,19 +398,19 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_stopTun(
     _env: JNIEnv,
     _class: JObject,
 ) {
-    stop_tun();
+    guarded(stop_tun, ());
 }
 
 /// Shared teardown used by the JNI stopTun entry and by core shutdown.
 pub fn stop_tun() {
-    let _guard = TUN_START_LOCK.lock().unwrap();
+    let _guard = lock(&TUN_START_LOCK);
     // Only take the session under the lock; the blocking join happens after
     // it is released so a stuck old task cannot hold TUN_SESSION hostage.
-    let previous = TUN_SESSION.lock().unwrap().take();
+    let previous = lock(&TUN_SESSION).take();
     if let (Some(previous), Some(rt)) = (previous, tokio_runtime()) {
         finish_tun(rt, previous);
     }
-    *TUN_HANDLER.lock().unwrap() = None;
+    *lock(&TUN_HANDLER) = None;
 }
 
 fn finish_tun(rt: &tokio::runtime::Runtime, session: TunSession) {
@@ -398,15 +443,29 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
     dns: JString,
     options: JString,
 ) -> jboolean {
-    let stack_text = java_string(&mut env, &stack);
-    let address_text = java_string(&mut env, &address);
-    let dns_text = java_string(&mut env, &dns);
-    let options_text = java_string(&mut env, &options);
+    guarded(move || start_tun_inner(&mut env, fd, handler, stack, address, dns, options), JNI_FALSE)
+}
 
-    let _guard = TUN_START_LOCK.lock().unwrap();
+/// The body of `startTun`, split out so the JNI export itself stays a thin
+/// guarded wrapper. Returns JNI_TRUE once the TUN reader is live.
+fn start_tun_inner(
+    env: &mut JNIEnv,
+    fd: jint,
+    handler: JObject,
+    stack: JString,
+    address: JString,
+    dns: JString,
+    options: JString,
+) -> jboolean {
+    let stack_text = java_string(env, &stack);
+    let address_text = java_string(env, &address);
+    let dns_text = java_string(env, &dns);
+    let options_text = java_string(env, &options);
+
+    let _guard = lock(&TUN_START_LOCK);
     // Take the old session without holding TUN_SESSION across the engine
     // lookup or the old task's join.
-    let mut previous = TUN_SESSION.lock().unwrap().take();
+    let mut previous = lock(&TUN_SESSION).take();
     let Some(rt) = tokio_runtime() else { return JNI_FALSE };
     let Some(engine) = rt.block_on(crate::runtime_state::engine()) else {
         if let Some(previous) = previous { finish_tun(rt, previous); }
@@ -436,7 +495,7 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
             // Config is tuning only; never fail TUN startup over it. Fall back
             // to defaults so the VPN can still come up and carry traffic.
             tracing::warn!("startTun: config parse fell back to defaults: {}", e);
-            crate::tun::TunConfig::parse("gvisor", "198.18.0.1/30", "0.0.0.0", "").unwrap()
+            crate::tun::TunConfig::default()
         }
     };
 
@@ -453,7 +512,7 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
             if let Some(previous) = previous.take() {
                 finish_tun(rt, previous);
             }
-            *TUN_HANDLER.lock().unwrap() = Some(handler);
+            *lock(&TUN_HANDLER) = Some(handler);
             let cancel = Arc::new(tokio::sync::Notify::new());
             let stop = cancel.clone();
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -467,7 +526,7 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
             let _ = rt.block_on(async {
                 tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx).await
             });
-            *TUN_SESSION.lock().unwrap() = Some(TunSession { cancel, task });
+            *lock(&TUN_SESSION) = Some(TunSession { cancel, task });
             JNI_TRUE
         }
         Err(e) => {
@@ -489,26 +548,30 @@ fn traffic_json(total: bool) -> String {
 
 #[no_mangle]
 pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_getTraffic(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JObject,
     _only_statistics_proxy: jboolean,
 ) -> jstring {
-    let text = traffic_json(false);
-    env.new_string(text)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    guarded(move || {
+        let text = traffic_json(false);
+        env.new_string(text)
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    }, std::ptr::null_mut())
 }
 
 #[no_mangle]
 pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_getTotalTraffic(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JObject,
     _only_statistics_proxy: jboolean,
 ) -> jstring {
-    let text = traffic_json(true);
-    env.new_string(text)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    guarded(move || {
+        let text = traffic_json(true);
+        env.new_string(text)
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    }, std::ptr::null_mut())
 }
 
 #[cfg(test)]
@@ -543,5 +606,14 @@ mod tests {
     fn jni_true_false_constants() {
         assert_eq!(JNI_TRUE, 1);
         assert_eq!(JNI_FALSE, 0);
+    }
+
+    #[test]
+    fn guarded_returns_the_fallback_instead_of_unwinding() {
+        // A panic inside a guarded JNI entry must not cross the boundary:
+        // the caller sees the fallback value (here -1) and the process lives.
+        let value = guarded(|| -> i32 { panic!("boom") }, -1);
+        assert_eq!(value, -1);
+        assert_eq!(guarded(|| 42, -1), 42);
     }
 }

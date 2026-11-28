@@ -260,6 +260,13 @@ fn read_words(r: &mut Reader) -> io::Result<Vec<u64>> {
     if len < 1 {
         return Err(invalid("domain set bitmap empty".into()));
     }
+    // Each word costs 8 bytes on the wire. A count claiming more words than
+    // the bytes left can hold is corrupt, not a huge allocation: bound the
+    // capacity by the remaining data before allocating (a 16-byte header
+    // claiming len=10^9 used to ask for ~8 GiB up front).
+    if len as usize > r.remaining() / 8 {
+        return Err(invalid("domain set bitmap length exceeds data".into()));
+    }
     let mut words = Vec::with_capacity(len as usize);
     for _ in 0..len {
         words.push(r.u64()?);
@@ -269,4 +276,30 @@ fn read_words(r: &mut Reader) -> io::Result<Vec<u64>> {
 
 fn get_bit(bitmap: &[u64], i: usize) -> bool {
     bitmap.get(i / 64).map(|w| (w >> (i % 64)) & 1 == 1).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_words_rejects_a_count_larger_than_the_data() {
+        // A header claiming 10^9 words (8 GiB of allocation) with only one
+        // word of data behind it must fail before allocating.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1_000_000_000i64.to_be_bytes());
+        buf.extend_from_slice(&[0u8; 8]);
+        let mut r = Reader::new(&buf);
+        assert!(read_words(&mut r).is_err());
+    }
+
+    #[test]
+    fn read_words_accepts_an_exact_count() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2i64.to_be_bytes());
+        buf.extend_from_slice(&42u64.to_be_bytes());
+        buf.extend_from_slice(&7u64.to_be_bytes());
+        let mut r = Reader::new(&buf);
+        assert_eq!(read_words(&mut r).unwrap(), vec![42, 7]);
+    }
 }

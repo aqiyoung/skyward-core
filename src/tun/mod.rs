@@ -50,6 +50,17 @@ pub struct TunConfig {
     pub options: TunOptions,
 }
 
+impl Default for TunConfig {
+    fn default() -> Self {
+        Self {
+            stack: "gvisor".into(),
+            addresses: vec!["198.18.0.1/30".into()],
+            dns: vec!["0.0.0.0".into()],
+            options: TunOptions::default(),
+        }
+    }
+}
+
 impl TunConfig {
     pub fn parse(stack: &str, address: &str, dns: &str, options: &str) -> io::Result<Self> {
         // Options are tuning hints only (mtu/gso/CC). Never fail TUN startup

@@ -139,12 +139,9 @@ async fn handle_socks(mut stream: TcpStream, state: Arc<AppState>) -> io::Result
     // Success reply with an unspecified bound address (mihomo does the same).
     stream.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
 
-    // The listener was opened with a one-shot AppState snapshot. Always prefer
-    // the live global engine so a config switch updates the system proxy too.
-    let engine = match crate::runtime_state::engine().await {
-        Some(e) => e,
-        None => state.engine.read().await.clone(),
-    };
+    // The listener was opened with a one-shot AppState snapshot. Always serve
+    // with the live engine so a config switch updates the system proxy too.
+    let engine = crate::live_engine(&state).await;
     engine.handle(target, stream, &[]).await
 }
 
@@ -199,10 +196,7 @@ async fn handle_http(mut stream: TcpStream, state: Arc<AppState>) -> io::Result<
         rewrite_request_line(&head, uri)
     };
 
-    let engine = match crate::runtime_state::engine().await {
-        Some(e) => e,
-        None => state.engine.read().await.clone(),
-    };
+    let engine = crate::live_engine(&state).await;
     engine.handle(target, stream, &forward).await
 }
 

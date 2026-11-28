@@ -265,6 +265,11 @@ fn handle_get_proxies(call: &MethodCall) -> Vec<u8> {
                 other => other,
             };
             view.insert("type".into(), Value::String(display_type.to_string()));
+            // Group icon from the profile (`icon:`), when the profile sets
+            // one. Nodes and chain-generated groups carry none.
+            if let Some(icon) = &item.icon {
+                view.insert("icon".into(), Value::String(icon.clone()));
+            }
             if !item.members.is_empty() {
                 view.insert("all".into(), json!(item.members));
                 if let Some(sel) = &item.selected {
@@ -1448,9 +1453,7 @@ fn handle_setup_config(call: &MethodCall) -> Vec<u8> {
         };
         // startListener may have been preloaded before the config existed;
         // open the ports now that a config has been applied.
-        if LISTENER_WANTED.load(Ordering::Relaxed) {
-            open_inbound_listeners();
-        }
+        maybe_open_deferred_listeners();
         return outcome;
     };
 
@@ -1535,9 +1538,7 @@ fn handle_setup_config(call: &MethodCall) -> Vec<u8> {
     // The App preloads startListener before the config exists. Now that a
     // config is loaded, open the local proxy ports it asked for so system-
     // proxy traffic (browser / Google apps) is not sent to a dead port.
-    if LISTENER_WANTED.load(Ordering::Relaxed) {
-        open_inbound_listeners();
-    }
+    maybe_open_deferred_listeners();
     outcome
 }
 
@@ -1545,10 +1546,12 @@ fn handle_setup_config(call: &MethodCall) -> Vec<u8> {
 /// the new geoip/geosite data. Returns an empty string on success.
 fn handle_update_geo_data(call: &MethodCall) -> Vec<u8> {
     let geo_type = call.arguments.as_str().unwrap_or("").to_string();
+    // The future reports whether the engine was actually reloaded, so the
+    // deferred listener reopen below only runs when a new engine exists.
     let future = async move {
         let home = match home_dir() {
             Some(h) => h,
-            None => return "core home dir not set".to_string(),
+            None => return ("core home dir not set".to_string(), false),
         };
         match crate::geo::download_geo(&geo_type, &home).await {
             Ok(n) => {
@@ -1565,20 +1568,28 @@ fn handle_update_geo_data(call: &MethodCall) -> Vec<u8> {
                             "[rust-core] updateGeoData reload failed: {}",
                             e
                         ));
+                        (String::new(), false)
                     } else {
                         crate::jni::emit_log_event("[rust-core] updateGeoData engine reloaded");
+                        (String::new(), true)
                     }
+                } else {
+                    (String::new(), false)
                 }
-                String::new()
             }
             Err(e) => {
                 crate::jni::emit_log_event(&format!("[rust-core] updateGeoData {} failed: {}", geo_type, e));
-                e
+                (e, false)
             }
         }
     };
     match block_on(future) {
-        Ok(message) => ok(&call.id, Value::String(message)),
+        Ok((message, reloaded)) => {
+            if reloaded {
+                maybe_open_deferred_listeners();
+            }
+            ok(&call.id, Value::String(message))
+        }
         Err(e) => ok(&call.id, Value::String(e)),
     }
 }
@@ -1600,6 +1611,9 @@ fn handle_quick_setup(call: &MethodCall) -> Vec<u8> {
         })
         .unwrap_or_default();
     let applied = selected.len();
+    // The future reports whether it installed a fresh engine (the no-engine
+    // fallback), so the deferred listener reopen below only runs then:
+    // applying selections to the running engine changes no ports.
     let future = async move {
         match crate::runtime_state::engine().await {
             Some(engine) => {
@@ -1612,7 +1626,7 @@ fn handle_quick_setup(call: &MethodCall) -> Vec<u8> {
                     engine.outbounds.outbounds.len(),
                     engine.outbounds.groups.len()
                 ));
-                Ok(())
+                Ok(false)
             }
             None => {
                 let config = crate::config::Config::default();
@@ -1622,12 +1636,17 @@ fn handle_quick_setup(call: &MethodCall) -> Vec<u8> {
                     std::path::PathBuf::from("."),
                 )
                 .await;
-                Ok(())
+                Ok(true)
             }
         }
     };
     match block_on(future) {
-        Ok(Ok(())) => ok(&call.id, Value::String(String::new())),
+        Ok(Ok(installed)) => {
+            if installed {
+                maybe_open_deferred_listeners();
+            }
+            ok(&call.id, Value::String(String::new()))
+        }
         Ok(Err(e)) => ok(&call.id, Value::String(e)),
         Err(e) => ok(&call.id, Value::String(e)),
     }
@@ -1643,6 +1662,18 @@ fn handle_start_listener(call: &MethodCall) -> Vec<u8> {
     LISTENER_WANTED.store(true, Ordering::Relaxed);
     let opened = open_inbound_listeners();
     ok(&call.id, Value::Bool(opened))
+}
+
+/// Reopen the inbound listeners after an engine install, when the App asked
+/// for them before a config existed. This is the single deferred-open point:
+/// every handler that installs a new engine (setupConfig, updateGeoData,
+/// quickSetup's fallback engine) calls it instead of duplicating the check,
+/// so a config switch can neither leave the system proxy pointed at a dead
+/// port nor leave stale listeners bound after the ports changed.
+pub(crate) fn maybe_open_deferred_listeners() {
+    if LISTENER_WANTED.load(Ordering::Relaxed) {
+        open_inbound_listeners();
+    }
 }
 
 /// Bind the configured inbound ports using the currently loaded engine.

@@ -204,6 +204,9 @@ impl Outbound for UnimplementedOutbound {
 pub struct GroupState {
     pub name: String,
     pub kind: String,
+    /// Group icon from the profile (`icon:`), if any; chain-generated and
+    /// synthetic groups have none.
+    pub icon: Option<String>,
     pub members: Vec<String>,
     pub url: Option<String>,
     /// Selected index for `select`; rolling counter for `load-balance`.
@@ -249,6 +252,8 @@ pub struct ProxyInfo {
     pub name: String,
     #[serde(rename = "type")]
     pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<String>,
     pub selected: Option<String>,
@@ -608,6 +613,7 @@ impl OutboundManager {
         groups.insert("GLOBAL".into(), GroupState {
             name: "GLOBAL".into(),
             kind: "select".into(),
+            icon: None,
             members: global_members,
             url: None,
             cursor: AtomicUsize::new(0),
@@ -617,6 +623,7 @@ impl OutboundManager {
             groups.insert(g.name.clone(), GroupState {
                 name: g.name.clone(),
                 kind: g.kind.clone(),
+                icon: g.icon.clone(),
                 members: g.proxies.clone(),
                 url: g.url.clone(),
                 cursor: AtomicUsize::new(0),
@@ -856,12 +863,14 @@ impl OutboundManager {
         let mut items: Vec<ProxyInfo> = self.outbounds.values().map(|o| ProxyInfo {
             name: o.name().to_string(),
             kind: o.kind().to_string(),
+            icon: None,
             members: Vec::new(),
             selected: None,
         }).collect();
         let mut groups: Vec<ProxyInfo> = self.groups.values().map(|g| ProxyInfo {
             name: g.name.clone(),
             kind: g.kind.clone(),
+            icon: g.icon.clone(),
             members: g.members.clone(),
             selected: g.selected(),
         }).collect();
@@ -928,5 +937,21 @@ mod tests {
         let manager = OutboundManager::new(&config);
         let global = manager.groups.get("GLOBAL").expect("GLOBAL group");
         assert_eq!(global.members, vec!["n1".to_string()]);
+    }
+
+    #[test]
+    fn group_icon_flows_from_profile_to_snapshot() {
+        let config = crate::config::Config::from_str(
+            "proxies:\n  - {name: n1, type: direct}\nproxy-groups:\n  - {name: g1, type: select, icon: https://example.com/g1.png, proxies: [n1]}\n  - {name: g2, type: select, proxies: [n1]}\n",
+        ).unwrap();
+        let manager = OutboundManager::new(&config);
+        let snap = manager.snapshot();
+        let by_name = |n: &str| snap.iter().find(|i| i.name == n).unwrap();
+        assert_eq!(
+            by_name("g1").icon.as_deref(),
+            Some("https://example.com/g1.png")
+        );
+        assert_eq!(by_name("g2").icon, None);
+        assert_eq!(by_name("GLOBAL").icon, None);
     }
 }

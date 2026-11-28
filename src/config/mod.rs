@@ -261,6 +261,10 @@ pub struct ProxyGroupDef {
     pub name: String,
     #[serde(rename = "type")]
     pub kind: String,
+    /// Optional group icon (URL or name), passed through to the App's group
+    /// view. Absent in most profiles; chain-generated groups never have one.
+    #[serde(default)]
+    pub icon: Option<String>,
     #[serde(default)]
     pub proxies: Vec<String>,
     /// Provider names whose proxies should be included as members (`use:`).
@@ -468,6 +472,9 @@ impl Config {
             self.proxy_groups.push(ProxyGroupDef {
                 name: chain_group_name.clone(),
                 kind: "select".into(),
+                // Chain-generated groups have no icon; the App falls back to
+                // its default group glyph for them.
+                icon: None,
                 proxies: members,
                 use_providers: Vec::new(),
                 url: None,
