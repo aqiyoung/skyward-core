@@ -6,7 +6,7 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::Arc;
 
 use tokio::net::{TcpListener, TcpStream};
@@ -37,10 +37,14 @@ fn set_transparent(fd: libc::c_int) -> io::Result<()> {
 
 /// Build a listener bound to 0.0.0.0 with IP_TRANSPARENT (required by TPROXY).
 fn bind_transparent(port: u16) -> io::Result<TcpListener> {
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
+    let raw_fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    if raw_fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    // Own the fd immediately so every early return below closes it instead of
+    // leaking one descriptor per failed bind (port conflict / missing caps).
+    let owned = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let fd = owned.as_raw_fd();
     let enable: libc::c_int = 1;
     unsafe {
         if libc::setsockopt(
@@ -73,7 +77,8 @@ fn bind_transparent(port: u16) -> io::Result<TcpListener> {
     if unsafe { libc::listen(fd, 128) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    let std_listener = unsafe { StdTcpListener::from_raw_fd(fd) };
+    // Transfer ownership to the std listener only on the success path.
+    let std_listener = unsafe { StdTcpListener::from_raw_fd(owned.into_raw_fd()) };
     std_listener.set_nonblocking(true)?;
     TcpListener::from_std(std_listener)
 }
@@ -105,6 +110,12 @@ fn original_dst(stream: &TcpStream) -> io::Result<TargetAddr> {
     };
     if result < 0 {
         return Err(io::Error::last_os_error());
+    }
+    if len < std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SO_ORIGINAL_DST returned a short address",
+        ));
     }
     let ip = IpAddr::V4(Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)));
     Ok(TargetAddr::Ip(ip, u16::from_be(addr.sin_port)))

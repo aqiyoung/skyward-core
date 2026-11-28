@@ -122,6 +122,7 @@ fn dispatch(data: &[u8]) -> Vec<u8> {
         "forceGc" => ok(&call.id, Value::Bool(true)),
         "shutdown" => {
             IS_INIT.store(false, Ordering::Relaxed);
+            shutdown_runtime();
             ok(&call.id, Value::Bool(true))
         }
         "startListener" => handle_start_listener(&call),
@@ -547,6 +548,9 @@ static ROUTE_WATCH_CANCEL: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>> =
 
 /// Task handles for the HTTP/SOCKS/mixed inbound listeners opened for the
 /// App's system-proxy mode. Kept so stopListener can close the ports.
+/// Guards the whole stop→bind→register sequence so two concurrent
+/// startListener calls cannot leave an orphan listener holding the port.
+static LISTENER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static LISTENER_TASKS: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>> =
     std::sync::Mutex::new(Vec::new());
 /// The App calls startListener as a preload BEFORE applying the profile, so
@@ -1645,6 +1649,7 @@ fn handle_start_listener(call: &MethodCall) -> Vec<u8> {
 /// Returns true when at least one listener was opened, false when no config
 /// is loaded yet (the deferred call after setupConfig will retry).
 fn open_inbound_listeners() -> bool {
+    let _guard = LISTENER_LOCK.lock().unwrap();
     stop_listener_tasks();
     // The listener tasks are spawned with tokio::spawn inside spawn_listeners,
     // so they live on whichever runtime is driving this future. A throwaway
@@ -1701,9 +1706,40 @@ fn stop_listener_tasks() {
     }
 }
 
+/// Tear down every background worker on shutdown / VPN stop. Previously
+/// `shutdown` only flipped a flag, so long-lived connections kept flowing
+/// through the old engine and the route watch kept emitting events.
+fn shutdown_runtime() {
+    {
+        let _guard = LISTENER_LOCK.lock().unwrap();
+        stop_listener_tasks();
+    }
+    stop_route_watch();
+    crate::jni::stop_tun();
+    // Close established connections and wake anything waiting on the old
+    // engine's close signal.
+    let future = async {
+        if let Some(engine) = crate::runtime_state::engine().await {
+            engine.close_connections().await;
+        }
+    };
+    let _ = block_on(future);
+}
+
 fn handle_stop_listener(call: &MethodCall) -> Vec<u8> {
     LISTENER_WANTED.store(false, Ordering::Relaxed);
-    stop_listener_tasks();
+    {
+        let _guard = LISTENER_LOCK.lock().unwrap();
+        stop_listener_tasks();
+    }
+    // Accept loops are aborted above, but established per-connection tasks
+    // are detached; close them explicitly so they stop using the old engine.
+    let future = async {
+        if let Some(engine) = crate::runtime_state::engine().await {
+            engine.close_connections().await;
+        }
+    };
+    let _ = block_on(future);
     ok(&call.id, Value::Bool(true))
 }
 

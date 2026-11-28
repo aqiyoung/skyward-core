@@ -9,6 +9,11 @@ use sha1::{Digest, Sha1};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+/// Largest client frame we will buffer. A malicious `len` in the frame header
+/// must never turn into an unbounded `vec![0u8; len]` allocation.
+pub const MAX_FRAME: usize = 1024 * 1024;
+/// A client that sends a header but never the payload must not pin the task.
+const FRAME_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct Websocket {
     inner: Upgraded,
@@ -73,8 +78,13 @@ impl Websocket {
         if masked {
             self.inner.read_exact(&mut mask).await?;
         }
+        if len > MAX_FRAME as u64 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "websocket frame too large"));
+        }
         let mut payload = vec![0u8; len as usize];
-        self.inner.read_exact(&mut payload).await?;
+        tokio::time::timeout(FRAME_READ_TIMEOUT, self.inner.read_exact(&mut payload))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "websocket frame read timed out"))??;
         if masked {
             for (i, byte) in payload.iter_mut().enumerate() {
                 *byte ^= mask[i % 4];

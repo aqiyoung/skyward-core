@@ -23,6 +23,9 @@ struct TunSession {
 
 static TUN_SESSION: Mutex<Option<TunSession>> = Mutex::new(None);
 static TUN_HANDLER: Mutex<Option<GlobalRef>> = Mutex::new(None);
+/// Serializes the whole start/stop TUN sequence. Distinct from TUN_SESSION so
+/// the blocking engine lookup and old-task join never hold the session lock.
+static TUN_START_LOCK: Mutex<()> = Mutex::new(());
 static TOKIO_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static TUN_WAKE: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
 
@@ -30,8 +33,11 @@ static TUN_WAKE: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
 /// outbound connection the core makes must go through this, otherwise the
 /// kernel routes it back into our own TUN and nothing can connect.
 pub fn protect_fd(fd: i32) -> bool {
-    let handler = TUN_HANDLER.lock().unwrap();
-    let Some(handler) = handler.as_ref() else {
+    // Clone the GlobalRef out of the lock before calling Java. protect() is
+    // a hot path for every outbound socket; holding the mutex across the JNI
+    // call also deadlocks if Java re-enters native and touches TUN_HANDLER.
+    let handler = TUN_HANDLER.lock().ok().and_then(|g| g.as_ref().cloned());
+    let Some(handler) = handler else {
         protect_diag("no protect handler registered");
         return false;
     };
@@ -347,19 +353,37 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_stopTun(
     _env: JNIEnv,
     _class: JObject,
 ) {
-    let mut session = TUN_SESSION.lock().unwrap();
-    if let Some(previous) = session.take() {
-        if let Some(rt) = tokio_runtime() {
-            finish_tun(rt, previous);
-        }
+    stop_tun();
+}
+
+/// Shared teardown used by the JNI stopTun entry and by core shutdown.
+pub fn stop_tun() {
+    let _guard = TUN_START_LOCK.lock().unwrap();
+    // Only take the session under the lock; the blocking join happens after
+    // it is released so a stuck old task cannot hold TUN_SESSION hostage.
+    let previous = TUN_SESSION.lock().unwrap().take();
+    if let (Some(previous), Some(rt)) = (previous, tokio_runtime()) {
+        finish_tun(rt, previous);
     }
     *TUN_HANDLER.lock().unwrap() = None;
 }
 
 fn finish_tun(rt: &tokio::runtime::Runtime, session: TunSession) {
     session.cancel.notify_one();
-    if let Err(error) = rt.block_on(session.task) {
-        tracing::warn!(%error, "TUN task failed while stopping");
+    // Bound the join: a wedged reader must never hang the JNI thread (ANR).
+    let mut task = session.task;
+    // Construct the timeout *inside* block_on: `tokio::time::timeout` needs a
+    // reactor, which block_on only installs once its future is polled.
+    let outcome = rt.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(2), &mut task).await
+    });
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "TUN task failed while stopping"),
+        Err(_) => {
+            task.abort();
+            emit_log_event("[rust-core] stopTun: TUN task did not exit in 2s, aborting it");
+        }
     }
 }
 
@@ -379,15 +403,20 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
     let dns_text = java_string(&mut env, &dns);
     let options_text = java_string(&mut env, &options);
 
-    let mut session = TUN_SESSION.lock().unwrap();
+    let _guard = TUN_START_LOCK.lock().unwrap();
+    // Take the old session without holding TUN_SESSION across the engine
+    // lookup or the old task's join.
+    let mut previous = TUN_SESSION.lock().unwrap().take();
     let Some(rt) = tokio_runtime() else { return JNI_FALSE };
     let Some(engine) = rt.block_on(crate::runtime_state::engine()) else {
+        if let Some(previous) = previous { finish_tun(rt, previous); }
         emit_log_event("[rust-core] startTun: no profile has been loaded");
         return JNI_FALSE;
     };
     let handler = match env.new_global_ref(handler) {
         Ok(global) => global,
         Err(e) => {
+            if let Some(previous) = previous { finish_tun(rt, previous); }
             emit_log_event(&format!("[rust-core] unable to retain protect handler: {}", e));
             return JNI_FALSE;
         }
@@ -421,7 +450,7 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
             let wake = TUN_WAKE
                 .get_or_init(|| Arc::new(tokio::sync::Notify::new()))
                 .clone();
-            if let Some(previous) = session.take() {
+            if let Some(previous) = previous.take() {
                 finish_tun(rt, previous);
             }
             *TUN_HANDLER.lock().unwrap() = Some(handler);
@@ -438,10 +467,14 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
             let _ = rt.block_on(async {
                 tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx).await
             });
-            *session = Some(TunSession { cancel, task });
+            *TUN_SESSION.lock().unwrap() = Some(TunSession { cancel, task });
             JNI_TRUE
         }
         Err(e) => {
+            // Device creation failed: do not strand the previous TUN task.
+            if let Some(previous) = previous {
+                finish_tun(rt, previous);
+            }
             let msg = format!("[rust-core] FATAL: device from fd failed: {}", e);
             tracing::error!("{}", msg);
             emit_log_event(&msg);

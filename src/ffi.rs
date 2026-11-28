@@ -12,6 +12,7 @@ use std::ffi::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -35,6 +36,8 @@ pub enum SkywardStatus {
     RuntimeError = 5,
     Panic = 6,
     NotImplemented = 7,
+    /// Handle was already destroyed (or is not one we created).
+    InvalidHandle = 8,
 }
 
 #[repr(C)]
@@ -71,8 +74,9 @@ pub struct SkywardHooks {
     pub user_data: *mut std::ffi::c_void,
 }
 
-// SAFETY: hooks are only ever invoked from the runtime's Tokio threads with the
-// user_data pointer supplied by the caller, which the caller must keep valid.
+// SAFETY: `user_data` must point to a value that stays valid for the entire
+// lifetime of the runtime and is safe to touch from multiple threads. The host
+// owns that guarantee; see the docs on `skyward_set_hooks`.
 unsafe impl Send for SkywardHooks {}
 unsafe impl Sync for SkywardHooks {}
 
@@ -80,14 +84,29 @@ struct HooksCell(Mutex<Option<SkywardHooks>>);
 unsafe impl Send for HooksCell {}
 unsafe impl Sync for HooksCell {}
 
-fn emit(cell: &HooksCell, which: fn(&SkywardHooks) -> Option<extern "C" fn(*const u8, usize, *mut std::ffi::c_void)>, event: &str) {
-    if let Ok(guard) = cell.0.lock() {
-        if let Some(hooks) = guard.as_ref() {
-            if let Some(cb) = which(hooks) {
-                let bytes = event.as_bytes();
-                unsafe { cb(bytes.as_ptr(), bytes.len(), hooks.user_data) };
-            }
+fn emit(
+    cell: &HooksCell,
+    which: fn(&SkywardHooks) -> Option<extern "C" fn(*const u8, usize, *mut std::ffi::c_void)>,
+    event: &str,
+) {
+    // Clone the (Copy) hooks out of the lock before calling foreign code:
+    // a callback that re-enters skyward_set_hooks would deadlock if we held
+    // the mutex. Recover from poison so one bad callback cannot silence all
+    // future events.
+    let hooks = {
+        let guard = cell.0.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(h) => *h,
+            None => return,
         }
+    };
+    if let Some(cb) = which(&hooks) {
+        let bytes = event.as_bytes();
+        // A panic in a C callback must not unwind across the ABI boundary and
+        // poison anything else.
+        let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+            cb(bytes.as_ptr(), bytes.len(), hooks.user_data)
+        }));
     }
 }
 
@@ -98,11 +117,19 @@ pub struct SkywardRuntime {
     home_dir: PathBuf,
     #[allow(dead_code)]
     embed_mode: bool,
+    /// Bumped by every apply_config; a late builder only installs its engine
+    /// when its generation is still current (R40).
+    config_generation: AtomicU64,
     hooks: HooksCell,
 }
 
 /// Opaque handle returned by `skyward_create` and consumed by every other call.
-pub struct SkywardHandle(SkywardRuntime);
+/// `destroyed` makes a second `skyward_destroy` a no-op and rejects calls made
+/// through a stale handle instead of dereferencing freed memory.
+pub struct SkywardHandle {
+    runtime: SkywardRuntime,
+    destroyed: AtomicBool,
+}
 
 fn with<F>(handle: *mut SkywardHandle, f: F) -> SkywardStatus
 where
@@ -112,9 +139,13 @@ where
         return SkywardStatus::NullPointer;
     }
     let result = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: the caller guarantees a live handle from skyward_create.
-        let rt = unsafe { &(*handle).0 };
-        f(rt)
+        // SAFETY: handle came from skyward_create and has not been destroyed;
+        // the atomic guard below rejects stale/double-destroyed pointers.
+        let handle = unsafe { &*handle };
+        if handle.destroyed.load(Ordering::Acquire) {
+            return Err(SkywardStatus::InvalidHandle);
+        }
+        f(&handle.runtime)
     }));
     match result {
         Ok(Ok(())) => SkywardStatus::Ok,
@@ -123,12 +154,30 @@ where
     }
 }
 
+/// `(ptr, len)` strings are caller-owned. Reject absurd lengths before
+/// `from_raw_parts` so a corrupt length cannot become an unbounded read.
+const MAX_STRING: usize = 16 * 1024 * 1024;
+
 unsafe fn cstr_to_string(ptr: *const c_char, len: usize) -> Result<String, SkywardStatus> {
     if ptr.is_null() {
         return Err(SkywardStatus::NullPointer);
     }
+    if len > MAX_STRING {
+        return Err(SkywardStatus::InvalidUtf8);
+    }
     let bytes = std::slice::from_raw_parts(ptr as *const u8, len);
     String::from_utf8(bytes.to_vec()).map_err(|_| SkywardStatus::InvalidUtf8)
+}
+
+/// Bounded scan for a NUL-terminated C string. `CStr::from_ptr` scans until
+/// it happens to find a NUL, so a non-terminated pointer reads adjacent memory.
+unsafe fn bounded_cstr(ptr: *const c_char, max: usize) -> Result<String, SkywardStatus> {
+    if ptr.is_null() {
+        return Err(SkywardStatus::NullPointer);
+    }
+    let bytes = std::slice::from_raw_parts(ptr as *const u8, max);
+    let end = bytes.iter().position(|b| *b == 0).ok_or(SkywardStatus::InvalidUtf8)?;
+    String::from_utf8(bytes[..end].to_vec()).map_err(|_| SkywardStatus::InvalidUtf8)
 }
 
 fn home_dir_from_options(opts: *const SkywardOptions) -> Result<PathBuf, SkywardStatus> {
@@ -140,7 +189,7 @@ fn home_dir_from_options(opts: *const SkywardOptions) -> Result<PathBuf, Skyward
         if home.is_null() {
             Ok(PathBuf::from("."))
         } else {
-            Ok(PathBuf::from(std::ffi::CStr::from_ptr(home).to_string_lossy().into_owned()))
+            Ok(PathBuf::from(bounded_cstr(home, 4096)?))
         }
     }
 }
@@ -170,14 +219,18 @@ pub extern "C" fn skyward_create(opts: *const SkywardOptions) -> *mut SkywardHan
                 return ptr::null_mut();
             }
         };
-        let handle = SkywardHandle(SkywardRuntime {
-            tokio,
-            state: Mutex::new(None),
-            tasks: Mutex::new(Vec::new()),
-            home_dir,
-            embed_mode,
-            hooks: HooksCell(Mutex::new(None)),
-        });
+        let handle = SkywardHandle {
+            runtime: SkywardRuntime {
+                tokio,
+                state: Mutex::new(None),
+                tasks: Mutex::new(Vec::new()),
+                home_dir,
+                embed_mode,
+                config_generation: AtomicU64::new(0),
+                hooks: HooksCell(Mutex::new(None)),
+            },
+            destroyed: AtomicBool::new(false),
+        };
         Box::into_raw(Box::new(handle))
     })
     .unwrap_or(ptr::null_mut())
@@ -208,11 +261,12 @@ pub extern "C" fn skyward_apply_config(
     with(handle, |rt| {
         let text = unsafe { cstr_to_string(yaml as *const c_char, len)? };
         let config = Config::from_str(&text).map_err(|_| SkywardStatus::ConfigError)?;
+        // Hold the state lock across build+install so two concurrent applies
+        // cannot interleave and let an older config overwrite a newer one.
+        let mut guard = rt.state.lock().unwrap_or_else(|e| e.into_inner());
+        rt.config_generation.fetch_add(1, Ordering::AcqRel);
         // An existing state reuses its traffic counters; a fresh one creates them.
-        let state = {
-            let guard = rt.state.lock().map_err(|_| SkywardStatus::RuntimeError)?;
-            guard.as_ref().cloned()
-        };
+        let state = guard.as_ref().cloned();
         let fresh_traffic;
         let traffic = match &state {
             Some(s) => s.traffic.clone(),
@@ -226,8 +280,7 @@ pub extern "C" fn skyward_apply_config(
             Some(s) => rt.tokio.block_on(s.replace_engine(engine)),
             None => {
                 let config_path = rt.home_dir.join("config.yaml");
-                *rt.state.lock().map_err(|_| SkywardStatus::RuntimeError)? =
-                    Some(Arc::new(AppState::new(engine, config_path, traffic)));
+                *guard = Some(Arc::new(AppState::new(engine, config_path, traffic)));
             }
         }
         Ok(())
@@ -240,7 +293,12 @@ pub extern "C" fn skyward_start_inbound(handle: *mut SkywardHandle) -> SkywardSt
         let state = rt.state.lock().map_err(|_| SkywardStatus::RuntimeError)?
             .as_ref().cloned().ok_or(SkywardStatus::NotInitialized)?;
         let handles = rt.tokio.block_on(spawn_listeners(state.clone()));
-        let mut tasks = rt.tasks.lock().map_err(|_| SkywardStatus::RuntimeError)?;
+        let mut tasks = rt.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        // Repeat calls must replace the previous listener set; otherwise the
+        // old tasks keep the port bound and serve the old engine.
+        for task in tasks.drain(..) {
+            task.abort();
+        }
         tasks.extend(handles);
         Ok(())
     })
@@ -268,8 +326,7 @@ pub extern "C" fn skyward_query_dns(
         if name.is_null() || out.is_null() {
             return Err(SkywardStatus::NullPointer);
         }
-        let host = unsafe { std::ffi::CStr::from_ptr(name) }
-            .to_str().map_err(|_| SkywardStatus::InvalidUtf8)?.to_string();
+        let host = unsafe { bounded_cstr(name, 1024)? };
         let state = rt.state.lock().map_err(|_| SkywardStatus::RuntimeError)?
             .as_ref().cloned().ok_or(SkywardStatus::NotInitialized)?;
         let config = state.engine.blocking_read().config.dns.clone().unwrap_or_default();
@@ -308,14 +365,18 @@ pub extern "C" fn skyward_handle_tun_packet(
 }
 
 #[no_mangle]
+/// Register callbacks. `user_data` must remain valid, and safe to use from
+/// Tokio worker threads, until `skyward_destroy` or a later `skyward_set_hooks`
+/// replaces the table. Set it to null (or call skyward_destroy) to unregister.
 pub extern "C" fn skyward_set_hooks(handle: *mut SkywardHandle, hooks: *const SkywardHooks) {
     let _ = with(handle, |rt| {
-        if hooks.is_null() {
-            *rt.hooks.0.lock().map_err(|_| SkywardStatus::RuntimeError)? = None;
+        let value = if hooks.is_null() {
+            None
         } else {
-            let value = unsafe { *(hooks as *const SkywardHooks) };
-            *rt.hooks.0.lock().map_err(|_| SkywardStatus::RuntimeError)? = Some(value);
-        }
+            Some(unsafe { *hooks })
+        };
+        let mut guard = rt.hooks.0.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = value;
         Ok(())
     });
 }
@@ -344,25 +405,61 @@ pub extern "C" fn skyward_invoke_method(
         return ptr::null_mut();
     }
     let result = catch_unwind(AssertUnwindSafe(|| {
+        if len > MAX_STRING {
+            return None;
+        }
         let input = unsafe { std::slice::from_raw_parts(data, len) };
-        crate::mobile::invoke(input)
+        Some(crate::mobile::invoke(input))
     }));
-    let bytes = result.unwrap_or_else(|_| b"{}".to_vec());
+    // On panic there is no valid response; return null rather than a bogus
+    // "{}" that the caller might treat as a successful empty answer.
+    let Ok(Some(bytes)) = result else {
+        unsafe { *out_len = 0; }
+        return ptr::null_mut();
+    };
+
+    // Store the length in a header immediately before the returned pointer.
+    // free then trusts the header, so a caller passing a wrong `len` cannot
+    // reconstruct a Vec with the wrong capacity and corrupt the heap.
+    use std::alloc::{alloc, dealloc, Layout};
+    let header = std::mem::size_of::<usize>();
+    let total = header + bytes.len();
+    let Ok(layout) = Layout::from_size_align(total, std::mem::align_of::<usize>()) else {
+        unsafe { *out_len = 0; }
+        return ptr::null_mut();
+    };
+    let raw = unsafe { alloc(layout) };
+    if raw.is_null() {
+        unsafe { *out_len = 0; }
+        return ptr::null_mut();
+    }
+    unsafe {
+        std::ptr::write_unaligned(raw as *mut usize, bytes.len());
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), raw.add(header), bytes.len());
+    }
     unsafe { *out_len = bytes.len(); }
-    let mut boxed = bytes.into_boxed_slice();
-    let ptr = boxed.as_mut_ptr();
-    std::mem::forget(boxed);
-    ptr
+    unsafe { raw.add(header) }
 }
 
-/// Free a buffer returned by `skyward_invoke_method`.
+/// Free a buffer returned by `skyward_invoke_method`. The `len` argument is
+/// ignored: the true length is read from the header written by the allocator.
+/// Each returned pointer must be freed exactly once.
 #[no_mangle]
-pub extern "C" fn skyward_free_buffer(ptr: *mut u8, len: usize) {
+pub extern "C" fn skyward_free_buffer(ptr: *mut u8, _len: usize) {
     if ptr.is_null() {
         return;
     }
+    use std::alloc::{dealloc, Layout};
     let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
-        drop(Vec::from_raw_parts(ptr, len, len));
+        let header = std::mem::size_of::<usize>();
+        let raw = ptr.sub(header);
+        let len = std::ptr::read_unaligned(raw as *const usize);
+        if let Ok(layout) = Layout::from_size_align(
+            header + len,
+            std::mem::align_of::<usize>(),
+        ) {
+            dealloc(raw, layout);
+        }
     }));
 }
 
@@ -371,11 +468,27 @@ pub extern "C" fn skyward_destroy(handle: *mut SkywardHandle) {
     if handle.is_null() {
         return;
     }
-    let _ = catch_unwind(|| {
-        // Abort tasks before dropping the runtime so they don't outlive it.
-        let _ = skyward_close_inbound(handle);
-        unsafe { drop(Box::from_raw(handle)); }
-    });
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+        let handle = &*handle;
+        // First caller wins; a second destroy becomes a no-op instead of a
+        // double-free.
+        if handle.destroyed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // Unregister callbacks before tearing down so no worker can invoke a
+        // host pointer that the host is about to release.
+        let mut hooks = handle.runtime.hooks.0.lock().unwrap_or_else(|e| e.into_inner());
+        *hooks = None;
+        drop(hooks);
+        // Abort listener tasks before dropping the runtime so they don't
+        // outlive it.
+        let mut tasks = handle.runtime.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        for task in tasks.drain(..) {
+            task.abort();
+        }
+        drop(tasks);
+        drop(Box::from_raw(handle as *const SkywardHandle as *mut SkywardHandle));
+    }));
 }
 
 #[cfg(test)]
@@ -444,6 +557,71 @@ mod tests {
             .unwrap()
             .starts_with("Skyward Core (Rust)"));
         skyward_free_buffer(buf, len);
+    }
+
+    #[test]
+    fn free_buffer_uses_header_not_caller_len() {
+        let input = br#"{"method":"coreVersion"}"#;
+        let mut len = 0usize;
+        let buf = skyward_invoke_method(input.as_ptr(), input.len(), &mut len);
+        assert!(!buf.is_null());
+        // Deliberately wrong length: the header must be authoritative.
+        skyward_free_buffer(buf, 1);
+    }
+
+    #[test]
+    fn stale_handle_is_rejected_after_destroy() {
+        let home = std::ffi::CString::new(".").unwrap();
+        let opts = make_options(&home);
+        let handle = skyward_create(&opts);
+        assert!(!handle.is_null());
+        skyward_destroy(handle);
+        // A second destroy and any later call must not dereference freed memory.
+        skyward_destroy(handle);
+        let yaml = b"mode: rule\n";
+        assert_eq!(
+            skyward_apply_config(handle, yaml.as_ptr(), yaml.len()),
+            SkywardStatus::InvalidHandle,
+        );
+    }
+
+    #[test]
+    fn bounded_cstr_rejects_missing_terminator() {
+        let buf = [b'x'; 16];
+        assert_eq!(
+            unsafe { bounded_cstr(buf.as_ptr() as *const c_char, buf.len()) },
+            Err(SkywardStatus::InvalidUtf8),
+        );
+    }
+
+    static HOOK_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    extern "C" fn counting_hook(_: *const u8, _: usize, _: *mut std::ffi::c_void) {
+        HOOK_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn a_poisoned_hook_lock_does_not_silence_events() {
+        let cell = Arc::new(HooksCell(Mutex::new(None)));
+        // Poison the mutex the way a panic while setting hooks would.
+        let poisoned = cell.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.0.lock().unwrap();
+            panic!("poison the hooks lock");
+        })
+        .join();
+
+        HOOK_CALLS.store(0, Ordering::Relaxed);
+        // Both set and emit must recover via into_inner().
+        let hooks = SkywardHooks {
+            connection: Some(counting_hook),
+            dns: None,
+            provider: None,
+            user_data: ptr::null_mut(),
+        };
+        *cell.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(hooks);
+        emit(&cell, |h| h.connection, "{}");
+        assert_eq!(HOOK_CALLS.load(Ordering::Relaxed), 1);
     }
 
     #[test]

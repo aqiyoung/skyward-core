@@ -9,18 +9,29 @@ use tokio::net::TcpStream;
 use crate::adapter::tls::connect_tls;
 use crate::adapter::BoxedStream;
 
+/// Body cap for normal downloads (subscriptions, providers).
+pub const MAX_BODY: usize = 16 * 1024 * 1024;
+/// Body cap for large GeoX downloads (a few MB each).
+pub const MAX_BODY_LARGE: usize = 64 * 1024 * 1024;
+/// A single chunk or WebSocket frame is never allowed above this.
+pub const MAX_CHUNK: usize = 1024 * 1024;
+
 pub async fn fetch_url(url: &str) -> io::Result<Vec<u8>> {
     // Hard cap the whole download so a dead upstream cannot stall core startup.
-    fetch_url_timeout(url, Duration::from_secs(3)).await
+    fetch_url_timeout(url, Duration::from_secs(3), MAX_BODY).await
 }
 
 /// Download with a longer deadline, for large GeoX files (a few MB each).
 pub async fn fetch_url_large(url: &str) -> io::Result<Vec<u8>> {
-    fetch_url_timeout(url, Duration::from_secs(60)).await
+    fetch_url_timeout(url, Duration::from_secs(60), MAX_BODY_LARGE).await
 }
 
-pub async fn fetch_url_timeout(url: &str, timeout: Duration) -> io::Result<Vec<u8>> {
-    match tokio::time::timeout(timeout, fetch_url_inner(url)).await {
+pub async fn fetch_url_timeout(
+    url: &str,
+    timeout: Duration,
+    max_body: usize,
+) -> io::Result<Vec<u8>> {
+    match tokio::time::timeout(timeout, fetch_url_inner(url, max_body)).await {
         Ok(r) => r,
         Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "download timed out")),
     }
@@ -28,7 +39,7 @@ pub async fn fetch_url_timeout(url: &str, timeout: Duration) -> io::Result<Vec<u
 
 use std::time::Duration;
 
-async fn fetch_url_inner(url: &str) -> io::Result<Vec<u8>> {
+async fn fetch_url_inner(url: &str, max_body: usize) -> io::Result<Vec<u8>> {
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid URL"))?;
@@ -127,6 +138,11 @@ async fn fetch_url_inner(url: &str) -> io::Result<Vec<u8>> {
             if size == 0 {
                 break;
             }
+            // A hostile server can declare an astronomical chunk size; cap it
+            // before allocating, and cap the accumulated body as well.
+            if size > MAX_CHUNK || size > max_body.saturating_sub(body.len()) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "chunk too large"));
+            }
             let mut chunk = vec![0u8; size];
             stream.read_exact(&mut chunk).await?;
             body.extend_from_slice(&chunk);
@@ -135,8 +151,80 @@ async fn fetch_url_inner(url: &str) -> io::Result<Vec<u8>> {
         }
         Ok(body)
     } else {
+        // Read at most max_body + 1 bytes; anything more is an error rather
+        // than an unbounded allocation from read_to_end.
         let mut body = Vec::new();
-        stream.read_to_end(&mut body).await?;
+        let mut limited = stream.take((max_body as u64) + 1);
+        limited.read_to_end(&mut body).await?;
+        if body.len() > max_body {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "response body too large"));
+        }
         Ok(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// A server that declares a chunk larger than the cap. The client must
+    /// reject the size *before* allocating it, rather than OOM-aborting.
+    #[tokio::test]
+    async fn rejects_oversized_chunk_without_allocating() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut req = vec![0u8; 1024];
+            let _ = socket.read(&mut req).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFF\r\n")
+                .await
+                .unwrap();
+        });
+        let url = format!("http://127.0.0.1:{}/x", port);
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            fetch_url_inner(&url, MAX_BODY),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err(), "oversized chunk must be rejected");
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        server.abort();
+    }
+
+    /// A server that never stops sending bytes must be cut off at max_body.
+    #[tokio::test]
+    async fn caps_uncapped_response_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut req = vec![0u8; 1024];
+            let _ = socket.read(&mut req).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\n\r\n")
+                .await
+                .unwrap();
+            let block = vec![b'x'; 64 * 1024];
+            // More than the 4 KiB cap below, in small writes.
+            for _ in 0..8 {
+                if socket.write_all(&block).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let url = format!("http://127.0.0.1:{}/x", port);
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            fetch_url_inner(&url, 4096),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err(), "body over max_body must be rejected");
+        server.abort();
     }
 }

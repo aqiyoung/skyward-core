@@ -260,7 +260,7 @@ impl ProviderRegistry {
                     Some(bytes) => bytes,
                     None => {
                         let url = def.url.as_ref().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "http provider needs url"))?;
-                        let bytes = fetch_url_timeout(url, Duration::from_secs(15)).await?;
+                        let bytes = fetch_url_timeout(url, Duration::from_secs(15), crate::fetch::MAX_BODY).await?;
                         if let Some(path) = &def.path {
                             let path = resolve_path(path, data_dir);
                             if let Some(parent) = path.parent() {
