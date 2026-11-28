@@ -141,32 +141,81 @@ pub fn journal(_args: &Value) -> Value {
     Value::Array(Vec::new())
 }
 
+/// Pull a top-level scalar (or a quoted one) out of a small YAML file.
+/// The built-in metadata is simple enough that a full YAML parser is overkill.
+fn yaml_scalar(text: &str, key: &str) -> String {
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix(key) {
+            if let Some(rest) = rest.strip_prefix(':') {
+                let v = rest.trim();
+                if v.is_empty() || v.starts_with('{') || v.starts_with('[') {
+                    continue;
+                }
+                return v.trim_matches(|c| c == '"' || c == '\'').to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// One built-in entry: (filename without extension, is_scenario, YAML text).
+const BUILTIN_PROFILES: &[(&str, &str)] = &[
+    ("bypass-cn", include_str!("rcx_builtin/bypass-cn.yaml")),
+    ("bypass-ir", include_str!("rcx_builtin/bypass-ir.yaml")),
+    ("bypass-ru", include_str!("rcx_builtin/bypass-ru.yaml")),
+    ("fastest", include_str!("rcx_builtin/fastest.yaml")),
+    ("from-list", include_str!("rcx_builtin/from-list.yaml")),
+    ("simple", include_str!("rcx_builtin/simple.yaml")),
+    ("stable", include_str!("rcx_builtin/stable.yaml")),
+    ("whitelist-ru", include_str!("rcx_builtin/whitelist-ru.yaml")),
+];
+const BUILTIN_SCENARIOS: &[(&str, &str)] = &[
+    ("every-group", include_str!("rcx_builtin/scenarios/every-group.yaml")),
+    ("whitelist-ru", include_str!("rcx_builtin/scenarios/whitelist-ru.yaml")),
+];
+
 pub fn profiles() -> Value {
     let layer = state().lock().unwrap().layer.clone();
     let mut out = Vec::new();
-    // Always ship the built-in simple profile the App references by id
-    // (rcxDefaultProfile). Without it the routing library is empty and the
-    // "use scenario" / group-profile UI is disabled.
-    out.push(json!({
-        "id": "builtin/simple",
-        "kind": "",
-        "title": "Simple",
-        "description": "Direct connection by default",
-        "text": "rules:\n  - MATCH,DIRECT\n",
-    }));
-    // Scenarios are the library entries the "use scenario" toggle needs;
-    // profiles are the strategy groups. Both are plain maps of name -> text
-    // in the user layer sent by the App.
-    for (key, scenario_key) in [("scenarios", "scenario"), ("profiles", "")] {
+
+    // Built-in library, mirroring the Go kernel's embedded builtin/*.yaml and
+    // builtin/scenarios/*.yaml. These give the App a non-empty library so the
+    // "use scenario" toggle is enabled and route profiles resolve by id.
+    for (name, text) in BUILTIN_PROFILES {
+        out.push(json!({
+            "id": format!("builtin/{}", name),
+            "kind": "",
+            "title": yaml_scalar(text, "title"),
+            "description": yaml_scalar(text, "description"),
+            "level": yaml_scalar(text, "level"),
+            "source": "builtin",
+            "text": text,
+        }));
+    }
+    for (name, text) in BUILTIN_SCENARIOS {
+        out.push(json!({
+            "id": format!("builtin/{}", name),
+            "kind": "scenario",
+            "title": yaml_scalar(text, "title"),
+            "description": yaml_scalar(text, "description"),
+            "source": "builtin",
+            "text": text,
+        }));
+    }
+
+    // User/subscription entries sent in the routing layer.
+    for (key, kind) in [("scenarios", "scenario"), ("profiles", "")] {
         let Some(map) = layer.get(key).and_then(|v| v.as_object()) else {
             continue;
         };
         for (id, v) in map {
             out.push(json!({
                 "id": id,
-                "kind": scenario_key,
+                "kind": kind,
                 "title": v.get("title").and_then(|x| x.as_str()).unwrap_or(id),
                 "text": v.as_str().unwrap_or(""),
+                "source": "user",
             }));
         }
     }

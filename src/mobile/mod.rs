@@ -21,6 +21,7 @@ pub mod log_bridge;
 pub mod profile_base;
 pub mod rcx;
 pub mod share_links;
+pub mod traffic_history;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MethodCall {
@@ -155,6 +156,11 @@ fn dispatch(data: &[u8]) -> Vec<u8> {
         "getExternalProvider" => handle_external_provider(&call),
         "updateDns" => handle_update_dns(&call),
         "updateGeoData" => handle_update_geo_data(&call),
+        "getTrafficHistory" => {
+            traffic_history::ensure_sampler();
+            let since = call.arguments.as_u64().unwrap_or(0);
+            ok(&call.id, traffic_history::read(since))
+        }
         "getConnections" => handle_get_connections(&call),
         "getConnectionCount" => handle_connection_count(&call),
         "closeConnections" => handle_close_connections(&call),
@@ -1833,6 +1839,32 @@ mod tests {
             br#"{"method":"rcxAction","arguments":{"group":"Proxy","action":"change","node":"n1"}}"#,
         ));
         assert!(r["result"]["decision"].is_object());
+    }
+
+    #[test]
+    fn rcx_profiles_ship_builtin_scenarios() {
+        // The App's "use scenario" toggle is disabled unless the library has
+        // at least one scenario entry; Go ships these built-ins, so must we.
+        let r = response(invoke(br#"{"method":"rcxProfiles"}"#));
+        let items = r["result"].as_array().unwrap();
+        assert!(items.len() >= 10, "builtin library too small: {}", items.len());
+        let scenarios: Vec<_> = items.iter()
+            .filter(|p| p["kind"].as_str() == Some("scenario"))
+            .collect();
+        assert!(!scenarios.is_empty(), "no builtin scenarios -> toggle disabled");
+        assert!(scenarios.iter().any(|p| p["id"] == "builtin/every-group"));
+        assert!(items.iter().any(|p| p["id"] == "builtin/simple"));
+    }
+
+    #[test]
+    fn get_traffic_history_is_implemented() {
+        // Android forces the native-history path; a missing method leaves the
+        // statistics page permanently empty.
+        let r = response(invoke(br#"{"method":"getTrafficHistory","arguments":0}"#));
+        assert!(r["error"].is_null(), "getTrafficHistory error: {:?}", r["error"]);
+        assert!(r["result"].is_object());
+        assert!(r["result"]["rows"].is_array());
+        assert!(r["result"]["revision"].is_number());
     }
 
     #[test]
