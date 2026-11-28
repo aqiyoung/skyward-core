@@ -1332,6 +1332,13 @@ fn merge_base_to_running_config(profile_path: &str, overlay: &str) -> Result<Str
 }
 
 fn handle_setup_config(call: &MethodCall) -> Vec<u8> {
+    // The App sends the whole routing layer (profiles, scenarios, per-group
+    // bindings) here as `rcx`. Storing it makes the auto-route library and
+    // scenario toggle work from the first profile apply, not only after a
+    // later rcxSetPolicy call.
+    if let Some(rcx) = call.arguments.get("rcx") {
+        crate::mobile::rcx::set_layer(rcx.clone());
+    }
     // Arguments: {"base":{"path":"...","overlay":"..."},"test-url":"...","selected-map":{...}}
     //
     // When the App sends a base, the config to load is NOT the profile file

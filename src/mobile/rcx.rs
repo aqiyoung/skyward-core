@@ -109,11 +109,16 @@ pub async fn status() -> Value {
 /// the App applies this response directly to rcxStatusState, so it must carry
 /// the groups/scenario, not a placeholder.
 pub async fn set_policy(args: Value) -> Value {
-    {
-        let mut s = state().lock().unwrap();
-        s.layer = args;
-    }
+    set_layer(args);
     status().await
+}
+
+/// Store the user layer that the App attaches to setupConfig (`rcx` key).
+/// This is the primary path: the App sends the whole routing layer when it
+/// applies a profile, before any rcxSetPolicy call.
+pub fn set_layer(args: Value) {
+    let mut s = state().lock().unwrap();
+    s.layer = args;
 }
 
 pub fn hints(args: &Value) -> Value {
@@ -139,12 +144,28 @@ pub fn journal(_args: &Value) -> Value {
 pub fn profiles() -> Value {
     let layer = state().lock().unwrap().layer.clone();
     let mut out = Vec::new();
-    if let Some(map) = layer.get("profiles").and_then(|v| v.as_object()) {
-        for (k, v) in map {
+    // Always ship the built-in simple profile the App references by id
+    // (rcxDefaultProfile). Without it the routing library is empty and the
+    // "use scenario" / group-profile UI is disabled.
+    out.push(json!({
+        "id": "builtin/simple",
+        "kind": "",
+        "title": "Simple",
+        "description": "Direct connection by default",
+        "text": "rules:\n  - MATCH,DIRECT\n",
+    }));
+    // Scenarios are the library entries the "use scenario" toggle needs;
+    // profiles are the strategy groups. Both are plain maps of name -> text
+    // in the user layer sent by the App.
+    for (key, scenario_key) in [("scenarios", "scenario"), ("profiles", "")] {
+        let Some(map) = layer.get(key).and_then(|v| v.as_object()) else {
+            continue;
+        };
+        for (id, v) in map {
             out.push(json!({
-                "id": k,
-                "kind": "",
-                "title": v.get("title").and_then(|x| x.as_str()).unwrap_or(k),
+                "id": id,
+                "kind": scenario_key,
+                "title": v.get("title").and_then(|x| x.as_str()).unwrap_or(id),
                 "text": v.as_str().unwrap_or(""),
             }));
         }
