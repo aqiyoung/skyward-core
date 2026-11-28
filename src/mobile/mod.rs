@@ -21,6 +21,7 @@ pub mod log_bridge;
 pub mod profile_base;
 pub mod rcx;
 pub mod share_links;
+pub mod strategy;
 pub mod traffic_history;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -182,7 +183,10 @@ fn dispatch(data: &[u8]) -> Vec<u8> {
             ok(&call.id, block_on(rcx::action(args)).unwrap_or_else(|_| json!({"decision":{"action":"hold","reason":{"code":""}}})))
         }
         "rcxProfiles" => ok(&call.id, rcx::profiles()),
-        "rcxStudio" => ok(&call.id, rcx::studio(&call.arguments)),
+        "rcxStudio" => {
+            let args = call.arguments.clone();
+            ok(&call.id, block_on(rcx::studio(args)).unwrap_or_else(|_| json!({})))
+        }
         "validateConfig" => handle_validate_config(&call),
         "setupConfig" => handle_setup_config(&call),
         "updateConfig" => handle_setup_config(&call),
@@ -1932,6 +1936,42 @@ mod tests {
         assert!(r["result"].is_object());
         assert!(r["result"]["rows"].is_array());
         assert!(r["result"]["revision"].is_number());
+    }
+
+    #[tokio::test]
+    async fn strategy_studio_returns_preview_levels() {
+        // A strategy editor lint must return per-level member names, not the
+        // empty result the stub used to return.
+        let source = "version: 1\nlevels:\n  - match: {name-contains: US}\n    pick: latency\n";
+        rcx::set_layer(json!({ "strategies": { "Proxy": source } }));
+        let result = rcx::studio(json!({
+            "op": "lint",
+            "kind": "strategy",
+            "group": "Proxy",
+            "text": source,
+            "localGroup": { "members": ["US 01", "HK 02", "DIRECT"] },
+        }))
+        .await;
+        let levels = result["strategyLevels"]
+            .as_array()
+            .expect("strategyLevels must be a list");
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0][0], "US 01");
+        assert!(result["errors"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn status_marks_strategy_support_and_uses_numeric_member_count() {
+        let status = rcx::status().await;
+        assert_eq!(status["strategySupport"], true);
+        assert!(status["strategies"].is_object());
+        for group in status["groups"].as_array().unwrap() {
+            assert!(
+                group["members"].is_number(),
+                "RcxGroupStatus.members must be a count, got {:?}",
+                group["members"]
+            );
+        }
     }
 
     #[test]

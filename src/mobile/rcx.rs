@@ -28,6 +28,26 @@ fn as_obj(v: &Value) -> Map<String, Value> {
     v.as_object().cloned().unwrap_or_default()
 }
 
+/// Ordered members of a group as (name, is_direct), for strategy preview.
+fn group_members(engine: &crate::tunnel::Engine, group: &str) -> Vec<(String, bool)> {
+    let Some(state) = engine.outbounds.groups.get(group) else {
+        return Vec::new();
+    };
+    state
+        .members
+        .iter()
+        .map(|name| {
+            let is_direct = engine
+                .outbounds
+                .outbounds
+                .get(name)
+                .map(|o| o.kind() == "direct")
+                .unwrap_or(false);
+            (name.clone(), is_direct)
+        })
+        .collect()
+}
+
 /// Build the rcxStatus object the App parses into RcxStatus. Auto-route is
 /// reported as running whenever a profile is loaded, with one entry per
 /// select/url-test group so the routing pages have real data to show.
@@ -39,8 +59,12 @@ pub async fn status() -> Value {
     };
     let running = engine.is_some();
     let mut groups = Vec::new();
-    if let Some(engine) = engine {
+    let mut strategies = serde_json::Map::new();
+    if let Some(engine) = &engine {
         // Group snapshots: name, current node, members, and control mode.
+        // `members` is an int in the App's RcxGroupStatus model -- sending the
+        // member array here made RcxStatus.fromJson throw and dropped the
+        // whole status, which is why the auto-route page appeared empty.
         for g in engine.outbounds.groups.values() {
             let name = &g.name;
             let now = g.selected().unwrap_or_default();
@@ -53,11 +77,6 @@ pub async fn status() -> Value {
                 .and_then(|v| v.get(name))
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let now_value = if now.is_empty() {
-                Value::Null
-            } else {
-                Value::String(now)
-            };
             groups.push(json!({
                 "name": name,
                 "source": "profile",
@@ -67,9 +86,37 @@ pub async fn status() -> Value {
                 "offered": g.members.clone(),
                 "binding": binding,
                 "control": { "mode": mode },
-                "now": now_value,
-                "members": g.members.clone(),
+                "now": now,
+                "members": g.members.len(),
+                "candidates": g.members.len(),
             }));
+        }
+        // One report per scripted group. The main page builds its list from
+        // `strategies.keys` plus `groups`, so without this it shows
+        // "此订阅没有运行中的脚本组" even with groups loaded.
+        if let Some(map) = layer.get("strategies").and_then(|v| v.as_object()) {
+            for (name, value) in map {
+                let source = value.as_str().unwrap_or("");
+                let (issue, empty) = match super::strategy::parse(source) {
+                    Err(e) => (e, true),
+                    Ok(_) => {
+                        let members = group_members(&engine, name);
+                        let empty = super::strategy::strategy_levels(source, name, &members)
+                            .map(|levels| levels.iter().all(|l| l.is_empty()))
+                            .unwrap_or(true);
+                        (String::new(), empty)
+                    }
+                };
+                let selected = engine.outbounds.groups.get(name).and_then(|g| g.selected())
+                    .unwrap_or_default();
+                strategies.insert(name.clone(), json!({
+                    "source": "user",
+                    "offered": engine.outbounds.groups.contains_key(name),
+                    "issue": issue,
+                    "empty": empty,
+                    "selected": selected,
+                }));
+            }
         }
     }
     // A scenario is active only when the layer actually names one.
@@ -91,14 +138,25 @@ pub async fn status() -> Value {
     json!({
         "running": running,
         "mode": if running { "rule" } else { "stopped" },
-        "strategySupport": false,
-        "strategies": {},
+        // The App gates every strategy editor behind this flag
+        // (providers/routing.dart:131 canScriptGroupsProvider).
+        "strategySupport": true,
+        "strategies": strategies,
         "network": "",
         "groups": groups,
         "energy": { "level": "balanced" },
         "problems": [],
         "split": "",
-        "library": 0,
+        "library": layer
+            .get("profiles")
+            .and_then(|v| v.as_object())
+            .map(|m| m.len() as u64)
+            .unwrap_or(0)
+            + layer
+                .get("scenarios")
+                .and_then(|v| v.as_object())
+                .map(|m| m.len() as u64)
+                .unwrap_or(0),
         "scenario": scenario,
         "tunnelMode": "rule",
         "reload": false,
@@ -258,8 +316,88 @@ pub async fn action(args: Value) -> Value {
     })
 }
 
-pub fn studio(_args: &Value) -> Value {
-    json!({ "text": "", "strategyLevels": [], "errors": [], "warnings": [] })
+/// One profile-editor operation. The App dispatches on `op` *and* `kind`;
+/// the Go core intercepts `kind:'strategy'` before the generic studio.
+pub async fn studio(args: Value) -> Value {
+    let op = args.get("op").and_then(|v| v.as_str()).unwrap_or("");
+    let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    let group = args.get("group").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let layer = state().lock().unwrap().layer.clone();
+
+    if kind == "strategy" {
+        match op {
+            "source" => {
+                let source = layer
+                    .get("strategies")
+                    .and_then(|m| m.get(&group))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                return json!({ "text": source });
+            }
+            "lint" => {
+                let source = if text.is_empty() {
+                    layer
+                        .get("strategies")
+                        .and_then(|m| m.get(&group))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                } else {
+                    text.clone()
+                };
+                let members = if let Some(spec) = args.get("localGroup") {
+                    spec.get("members")
+                        .and_then(|v| v.as_array())
+                        .map(|names| {
+                            names
+                                .iter()
+                                .filter_map(|n| n.as_str())
+                                .map(|n| (n.to_string(), false))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                } else if let Some(engine) = crate::runtime_state::engine().await {
+                    group_members(&engine, &group)
+                } else {
+                    Vec::new()
+                };
+                return match super::strategy::strategy_levels(&source, &group, &members) {
+                    Ok(levels) => json!({ "strategyLevels": levels }),
+                    Err(e) => json!({ "errors": [{ "message": e }] }),
+                };
+            }
+            _ => {
+                return json!({ "errors": [{ "message": "unknown strategy operation" }] });
+            }
+        }
+    }
+
+    // Generic profile/scenario studio operations.
+    match op {
+        "source" => {
+            let source = layer
+                .get("profiles")
+                .and_then(|m| m.get(&id))
+                .or_else(|| layer.get("scenarios").and_then(|m| m.get(&id)))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            json!({ "text": source })
+        }
+        "format" => json!({ "text": text }),
+        "lint" => {
+            // A profile/scenario document must at least be valid YAML; the
+            // Go core runs a full lint, but this keeps the editor honest.
+            match serde_yaml::from_str::<serde_yaml::Value>(&text) {
+                Ok(_) => json!({}),
+                Err(e) => json!({ "errors": [{ "message": e.to_string() }] }),
+            }
+        }
+        _ => json!({}),
+    }
 }
 
 /// A cheap status for set_policy's immediate response; the full status is
