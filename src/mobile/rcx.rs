@@ -199,24 +199,6 @@ pub fn journal(_args: &Value) -> Value {
     Value::Array(Vec::new())
 }
 
-/// Pull a top-level scalar (or a quoted one) out of a small YAML file.
-/// The built-in metadata is simple enough that a full YAML parser is overkill.
-fn yaml_scalar(text: &str, key: &str) -> String {
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix(key) {
-            if let Some(rest) = rest.strip_prefix(':') {
-                let v = rest.trim();
-                if v.is_empty() || v.starts_with('{') || v.starts_with('[') {
-                    continue;
-                }
-                return v.trim_matches(|c| c == '"' || c == '\'').to_string();
-            }
-        }
-    }
-    String::new()
-}
-
 /// One built-in entry: (filename without extension, is_scenario, YAML text).
 const BUILTIN_PROFILES: &[(&str, &str)] = &[
     ("bypass-cn", include_str!("rcx_builtin/bypass-cn.yaml")),
@@ -233,6 +215,43 @@ const BUILTIN_SCENARIOS: &[(&str, &str)] = &[
     ("whitelist-ru", include_str!("rcx_builtin/scenarios/whitelist-ru.yaml")),
 ];
 
+/// Build a ProfileInfo from its YAML document. The App localizes `title`
+/// and `description` through `l10n[locale][englishText]`; without the l10n
+/// map every built-in profile/scenario shows its English source text.
+fn profile_info(id: &str, kind: &str, source: &str, text: &str) -> Value {
+    let doc: serde_yaml::Value = serde_yaml::from_str(text).unwrap_or(serde_yaml::Value::Null);
+    let scalar = |key: &str| -> String {
+        doc.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
+    };
+    let mut l10n = serde_json::Map::new();
+    if let Some(languages) = doc.get("l10n").and_then(|v| v.as_mapping()) {
+        for (language, entries) in languages {
+            let Some(language) = language.as_str() else { continue };
+            let mut phrases = serde_json::Map::new();
+            if let Some(entries) = entries.as_mapping() {
+                for (phrase, translation) in entries {
+                    if let (Some(phrase), Some(translation)) =
+                        (phrase.as_str(), translation.as_str())
+                    {
+                        phrases.insert(phrase.to_string(), json!(translation));
+                    }
+                }
+            }
+            l10n.insert(language.to_string(), Value::Object(phrases));
+        }
+    }
+    json!({
+        "id": id,
+        "kind": kind,
+        "title": scalar("title"),
+        "description": scalar("description"),
+        "level": scalar("level"),
+        "source": source,
+        "text": text,
+        "l10n": Value::Object(l10n),
+    })
+}
+
 pub fn profiles() -> Value {
     let layer = state().lock().unwrap().layer.clone();
     let mut out = Vec::new();
@@ -241,25 +260,15 @@ pub fn profiles() -> Value {
     // builtin/scenarios/*.yaml. These give the App a non-empty library so the
     // "use scenario" toggle is enabled and route profiles resolve by id.
     for (name, text) in BUILTIN_PROFILES {
-        out.push(json!({
-            "id": format!("builtin/{}", name),
-            "kind": "",
-            "title": yaml_scalar(text, "title"),
-            "description": yaml_scalar(text, "description"),
-            "level": yaml_scalar(text, "level"),
-            "source": "builtin",
-            "text": text,
-        }));
+        out.push(profile_info(&format!("builtin/{}", name), "", "builtin", text));
     }
     for (name, text) in BUILTIN_SCENARIOS {
-        out.push(json!({
-            "id": format!("builtin/{}", name),
-            "kind": "scenario",
-            "title": yaml_scalar(text, "title"),
-            "description": yaml_scalar(text, "description"),
-            "source": "builtin",
-            "text": text,
-        }));
+        out.push(profile_info(
+            &format!("builtin/{}", name),
+            "scenario",
+            "builtin",
+            text,
+        ));
     }
 
     // User/subscription entries sent in the routing layer.
@@ -268,13 +277,8 @@ pub fn profiles() -> Value {
             continue;
         };
         for (id, v) in map {
-            out.push(json!({
-                "id": id,
-                "kind": kind,
-                "title": v.get("title").and_then(|x| x.as_str()).unwrap_or(id),
-                "text": v.as_str().unwrap_or(""),
-                "source": "user",
-            }));
+            let text = v.as_str().unwrap_or("");
+            out.push(profile_info(id, kind, "user", text));
         }
     }
     Value::Array(out)

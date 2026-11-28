@@ -1925,7 +1925,12 @@ mod tests {
             .collect();
         assert!(!scenarios.is_empty(), "no builtin scenarios -> toggle disabled");
         assert!(scenarios.iter().any(|p| p["id"] == "builtin/every-group"));
-        assert!(items.iter().any(|p| p["id"] == "builtin/simple"));
+        let simple = items.iter().find(|p| p["id"] == "builtin/simple").unwrap();
+        // The App localizes titles through l10n[locale][englishText]; without
+        // these maps every built-in entry renders in English.
+        let zh = simple["l10n"]["zh-CN"].as_object().unwrap();
+        assert!(!zh.is_empty(), "builtin profile has no Chinese translations");
+        assert!(zh.keys().any(|k| k == "Simple"));
     }
 
     #[test]
