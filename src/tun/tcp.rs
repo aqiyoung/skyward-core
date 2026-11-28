@@ -254,7 +254,15 @@ impl<T: Read + Write + Send + 'static> TcpManager<T> {
             };
 
             if flow.state == State::SynReceived && tcp.flags & ACK != 0 {
-                flow.state = State::Established;
+                // Only the ACK that acknowledges our SYN completes the
+                // handshake. A stale/replayed ACK must not turn a half-open
+                // connection into an Established one.
+                if tcp.ack == flow.local_isn.wrapping_add(1) {
+                    flow.state = State::Established;
+                } else {
+                    // Challenge a bogus ACK with an ACK of our own.
+                    break 'act Act::Ack(flow.client_next);
+                }
             }
             flow.peer_window = tcp.window as u32;
 
@@ -871,12 +879,18 @@ fn parse_tcp(packet: &[u8], payload_offset: usize) -> Option<TcpHeader> {
     if p.len() < 20 {
         return None;
     }
+    let data_offset = ((p[12] >> 4) as usize) * 4;
+    // A TCP header is at least 20 bytes and cannot exceed the captured packet;
+    // otherwise payload() would hand header bytes to the relay as data.
+    if data_offset < 20 || data_offset > p.len() {
+        return None;
+    }
     Some(TcpHeader {
         src_port: u16::from_be_bytes([p[0], p[1]]),
         dst_port: u16::from_be_bytes([p[2], p[3]]),
         seq: u32::from_be_bytes([p[4], p[5], p[6], p[7]]),
         ack: u32::from_be_bytes([p[8], p[9], p[10], p[11]]),
-        data_offset: ((p[12] >> 4) as usize) * 4,
+        data_offset,
         flags: p[13],
         window: u16::from_be_bytes([p[14], p[15]]),
     })
@@ -1190,14 +1204,17 @@ mod tests {
         let tport = 1u16;
         let cport = 40000u16;
         tcp.handle_packet(&client_packet(client, target, cport, tport, 1000, 0, SYN, &[]));
+        // The handshake ACK must acknowledge the SYN-ACK's random ISN.
+        let synack = io.lock().unwrap().out.clone();
+        let ack_num = parse_tcp(&synack, 20).unwrap().seq.wrapping_add(1);
         io.lock().unwrap().out.clear();
 
         // Complete the handshake, then send data.
         tcp.handle_packet(&client_packet(
-            client, target, cport, tport, 1001, 1, ACK, &[],
+            client, target, cport, tport, 1001, ack_num, ACK, &[],
         ));
         tcp.handle_packet(&client_packet(
-            client, target, cport, tport, 1001, 1, PSH | ACK, b"hello",
+            client, target, cport, tport, 1001, ack_num, PSH | ACK, b"hello",
         ));
 
         let out = io.lock().unwrap().out.clone();
@@ -1332,8 +1349,10 @@ mod tests {
         let target = v4(127, 0, 0, 1);
         let (cport, tport) = (40000u16, 1u16);
         tcp.handle_packet(&client_packet(client, target, cport, tport, 1000, 0, SYN, &[]));
-        tcp.handle_packet(&client_packet(client, target, cport, tport, 1001, 1, ACK, &[]));
-        let pkt = client_packet(client, target, cport, tport, 1001, 1, PSH | ACK, b"hello");
+        let synack = io.lock().unwrap().out.clone();
+        let ack_num = parse_tcp(&synack, 20).unwrap().seq.wrapping_add(1);
+        tcp.handle_packet(&client_packet(client, target, cport, tport, 1001, ack_num, ACK, &[]));
+        let pkt = client_packet(client, target, cport, tport, 1001, ack_num, PSH | ACK, b"hello");
         tcp.handle_packet(&pkt);
         tcp.handle_packet(&pkt); // retransmission of the same segment
         let key = *tcp.flows.keys().next().unwrap();

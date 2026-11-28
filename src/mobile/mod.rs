@@ -82,8 +82,32 @@ fn encode(response: MethodResponse) -> Vec<u8> {
     serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec())
 }
 
-/// Dispatch one call and return the encoded response bytes.
+/// Dispatch one call and return the encoded response bytes. A panic anywhere
+/// in a handler is caught here: this runs under JNI, and a panic crossing an
+/// `extern "system"` boundary is undefined behaviour (often an App crash).
 pub fn invoke(data: &[u8]) -> Vec<u8> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(data))) {
+        Ok(bytes) => bytes,
+        Err(payload) => {
+            let msg = panic_message(&payload);
+            tracing::error!("core dispatch panicked: {}", msg);
+            crate::jni::emit_log_event(&format!("[rust-core] dispatch panic: {}", msg));
+            err("", "internal_error", format!("core panic: {}", msg))
+        }
+    }
+}
+
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+fn dispatch(data: &[u8]) -> Vec<u8> {
     let call: MethodCall = match serde_json::from_slice(data) {
         Ok(c) => c,
         Err(e) => return err("", "invalid_arguments", format!("decode method call: {}", e)),
@@ -1401,10 +1425,16 @@ fn handle_setup_config(call: &MethodCall) -> Vec<u8> {
             }
             String::new()
         };
-        return match block_on(future) {
+        let outcome = match block_on(future) {
             Ok(message) => ok(&call.id, Value::String(message)),
             Err(e) => ok(&call.id, Value::String(e)),
         };
+        // startListener may have been preloaded before the config existed;
+        // open the ports now that a config has been applied.
+        if LISTENER_WANTED.load(Ordering::Relaxed) {
+            open_inbound_listeners();
+        }
+        return outcome;
     };
 
     // The App sends the user's current selection for every selector group
