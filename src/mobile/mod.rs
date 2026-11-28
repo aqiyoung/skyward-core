@@ -17,6 +17,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::common::VERSION;
 
+pub mod country_table;
 pub mod log_bridge;
 pub mod profile_base;
 pub mod rcx;
