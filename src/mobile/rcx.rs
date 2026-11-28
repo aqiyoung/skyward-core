@@ -29,6 +29,37 @@ fn as_obj(v: &Value) -> Map<String, Value> {
 }
 
 /// Ordered members of a group as (name, is_direct), for strategy preview.
+fn yaml_to_json(value: &serde_yaml::Value) -> Value {
+    serde_json::to_value(value).unwrap_or_else(|_| json!({}))
+}
+
+/// Profile document the editor renders. The Go core returns this from
+/// `ParseProfile` via `lint`; the App needs the keys below or it renders a
+/// completely blank page (`routing_studio.dart:368` gates on `profile`).
+fn profile_document(text: &str) -> Value {
+    let doc = serde_yaml::from_str::<serde_yaml::Value>(text).unwrap_or(serde_yaml::Value::Null);
+    let mut profile = yaml_to_json(&doc);
+    if !profile.is_object() {
+        profile = json!({});
+    }
+    if let Some(map) = profile.as_object_mut() {
+        for (key, value) in [
+            ("title", json!("")),
+            ("description", json!("")),
+            ("pool", json!({})),
+            ("prefer", json!([])),
+            ("switch", json!({ "feel": "balanced" })),
+            ("energy", json!("balanced")),
+            ("stranded", json!("hold")),
+            ("level", json!("simple")),
+            ("tags", json!({})),
+        ] {
+            map.entry(key.to_string()).or_insert(value);
+        }
+    }
+    profile
+}
+
 fn group_members(engine: &crate::tunnel::Engine, group: &str) -> Vec<(String, bool)> {
     let Some(state) = engine.outbounds.groups.get(group) else {
         return Vec::new();
@@ -77,11 +108,25 @@ pub async fn status() -> Value {
                 .and_then(|v| v.get(name))
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+            // The App renders the group's header from this id; an empty value
+            // makes rcxProfileTitle() fall back to "Auto" (自动) even when the
+            // user picked a behavior. binding.profile is what setScenario /
+            // the choice editor writes into the layer.
+            let profile = binding
+                .get("profile")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let profile_title = profile
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .to_string();
             groups.push(json!({
                 "name": name,
                 "source": "profile",
-                "profile": "",
-                "profileTitle": "",
+                "profile": profile,
+                "profileTitle": profile_title,
                 "level": "simple",
                 "offered": g.members.clone(),
                 "binding": binding,
@@ -391,12 +436,23 @@ pub async fn studio(args: Value) -> Value {
                 .to_string();
             json!({ "text": source })
         }
-        "format" => json!({ "text": text }),
+        "format" => {
+            // The editor edits the profile object and asks us to serialize it
+            // back to YAML; echoing the old text would discard every edit.
+            let formatted = match args.get("profile") {
+                Some(profile) => serde_yaml::to_string(profile).unwrap_or(text.clone()),
+                None => text.clone(),
+            };
+            json!({ "text": formatted })
+        }
         "lint" => {
-            // A profile/scenario document must at least be valid YAML; the
-            // Go core runs a full lint, but this keeps the editor honest.
+            // Parse the document and hand the editor a profile object. Without
+            // `profile` the whole editor body is skipped by the App.
             match serde_yaml::from_str::<serde_yaml::Value>(&text) {
-                Ok(_) => json!({}),
+                Ok(_) => json!({
+                    "profile": profile_document(&text),
+                    "text": text,
+                }),
                 Err(e) => json!({ "errors": [{ "message": e.to_string() }] }),
             }
         }

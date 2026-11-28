@@ -1967,6 +1967,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn studio_lint_returns_a_profile_for_the_editor() {
+        let r = response(invoke(
+            br#"{"method":"rcxStudio","arguments":{"op":"lint","text":"rcx: 1\ntitle: My profile\nlevel: simple\nprefer:\n  - { label: Working, when: not dead }\n"}}"#,
+        ));
+        assert!(r["error"].is_null());
+        let profile = &r["result"]["profile"];
+        assert!(profile.is_object(), "editor needs a profile object: {:?}", r);
+        assert_eq!(profile["title"], "My profile");
+        assert!(profile["pool"].is_object());
+        assert!(profile["prefer"].is_array());
+        assert_eq!(profile["level"], "simple");
+    }
+
+    #[tokio::test]
     async fn status_marks_strategy_support_and_uses_numeric_member_count() {
         let status = rcx::status().await;
         assert_eq!(status["strategySupport"], true);
