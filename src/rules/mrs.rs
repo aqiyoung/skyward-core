@@ -18,9 +18,12 @@ use super::provider::{domain_entry, Behavior, Entry};
 pub fn parse_mrs(raw: &[u8], behavior: Behavior) -> io::Result<Vec<Entry>> {
     let mut decoder = ruzstd::decoding::StreamingDecoder::new(std::io::Cursor::new(raw))
         .map_err(|e| invalid(format!("mrs zstd: {}", e)))?;
+    // A few KB of compressed data can expand to GBs. Cap the read itself so a
+    // malicious/corrupt provider cannot OOM before the size check runs.
+    const MAX_MRS: usize = 64 * 1024 * 1024;
     let mut plain = Vec::new();
-    decoder.read_to_end(&mut plain)?;
-    if plain.len() > 64 * 1024 * 1024 {
+    decoder.by_ref().take(MAX_MRS as u64 + 1).read_to_end(&mut plain)?;
+    if plain.len() > MAX_MRS {
         return Err(invalid("mrs decompressed size unreasonable".into()));
     }
     let mut r = Reader::new(&plain);
@@ -45,7 +48,7 @@ pub fn parse_mrs(raw: &[u8], behavior: Behavior) -> io::Result<Vec<Entry>> {
         Behavior::Domain => {
             let set = DomainSet::parse(&mut r)?;
             let mut entries = Vec::new();
-            for pattern in set.enumerate() {
+            for pattern in set.enumerate()? {
                 if let Some(entry) = domain_entry(&pattern) {
                     entries.push(entry);
                 }
@@ -64,6 +67,11 @@ fn parse_ipcidr(r: &mut Reader) -> io::Result<Vec<Entry>> {
     let count = r.i64()?;
     if count < 1 {
         return Err(invalid("ipcidr set empty".into()));
+    }
+    // Each entry needs 32 bytes; a count larger than the remaining buffer
+    // could never be valid and must not drive a huge with_capacity().
+    if count as usize > r.remaining() / 32 + 1 {
+        return Err(invalid("ipcidr count unreasonable".into()));
     }
     let mut entries = Vec::with_capacity(count as usize);
     for _ in 0..count {
@@ -106,6 +114,12 @@ impl<'a> Reader<'a> {
 
     fn skip(&mut self, n: usize) -> io::Result<()> {
         self.bytes(n).map(|_| ())
+    }
+
+    /// Bytes left unread, used to bound attacker-controlled counts before
+    /// allocating vectors.
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
     }
 
     fn u8(&mut self) -> io::Result<u8> {
@@ -161,8 +175,12 @@ impl DomainSet {
     }
 
     /// Position of the `i`-th set bit (0-based) in the label bitmap.
-    fn select_ith_one(&self, i: usize) -> usize {
+    /// Returns None when the trie data is malformed (rank out of range).
+    fn select_ith_one(&self, i: usize) -> Option<usize> {
         let target = i as u64;
+        if self.label_bitmap.is_empty() || i >= *self.ranks.last()? as usize {
+            return None;
+        }
         let mut lo = 0usize;
         let mut hi = self.label_bitmap.len();
         while lo + 1 < hi {
@@ -173,12 +191,15 @@ impl DomainSet {
                 hi = mid;
             }
         }
-        let mut rest = target - self.ranks[lo];
+        let mut rest = target.checked_sub(self.ranks[lo])?;
         let mut word = self.label_bitmap[lo];
         loop {
+            if word == 0 {
+                return None;
+            }
             let bit = word.trailing_zeros() as usize;
             if rest == 0 {
-                return lo * 64 + bit;
+                return Some(lo * 64 + bit);
             }
             rest -= 1;
             word &= word - 1;
@@ -187,14 +208,26 @@ impl DomainSet {
 
     /// All stored patterns, in mihomo's Foreach form: "example.com"
     /// (exact), ".example.com" (subdomains only), "*.example.com".
-    fn enumerate(&self) -> Vec<String> {
+    fn enumerate(&self) -> io::Result<Vec<String>> {
         let mut out = Vec::new();
         let mut current: Vec<u8> = Vec::new();
-        self.traverse(0, 0, &mut current, &mut out);
-        out
+        self.traverse(0, 0, &mut current, &mut out, 0)?;
+        Ok(out)
     }
 
-    fn traverse(&self, node_id: usize, mut bm_idx: usize, current: &mut Vec<u8>, out: &mut Vec<String>) {
+    fn traverse(
+        &self,
+        node_id: usize,
+        mut bm_idx: usize,
+        current: &mut Vec<u8>,
+        out: &mut Vec<String>,
+        depth: usize,
+    ) -> io::Result<()> {
+        // A domain label chain cannot exceed 127 labels; deeper recursion
+        // means a corrupt trie and would otherwise exhaust the stack.
+        if depth > 127 {
+            return Err(invalid("mrs trie too deep".into()));
+        }
         if get_bit(&self.leaves, node_id) {
             let mut key = current.clone();
             if key.last() == Some(&b'+') {
@@ -205,13 +238,17 @@ impl DomainSet {
         }
         loop {
             if get_bit(&self.label_bitmap, bm_idx) {
-                return;
+                return Ok(());
             }
-            let label = self.labels[bm_idx - node_id];
-            let next_node = bm_idx - node_id + 1;
-            let next_bm = self.select_ith_one(next_node - 1) + 1;
+            let offset = bm_idx.checked_sub(node_id)
+                .ok_or_else(|| invalid("mrs trie index underflow".into()))?;
+            let label = *self.labels.get(offset)
+                .ok_or_else(|| invalid("mrs trie label out of range".into()))?;
+            let next_node = offset + 1;
+            let next_bm = self.select_ith_one(next_node - 1)
+                .ok_or_else(|| invalid("mrs trie rank out of range".into()))? + 1;
             current.push(label);
-            self.traverse(next_node, next_bm, current, out);
+            self.traverse(next_node, next_bm, current, out, depth + 1)?;
             current.pop();
             bm_idx += 1;
         }

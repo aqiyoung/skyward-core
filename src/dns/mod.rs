@@ -25,7 +25,13 @@ fn parse_upstream(server: &str) -> Option<std::net::SocketAddr> {
 /// Resolve through the core's protected DNS path. The system resolver must not
 /// be used here: once the VPN is up it forwards queries to the TUN address and
 /// the lookup loops back into the tunnel we are hosting.
+/// Resolve through the engine's DNS resolver when a config is loaded, so the
+/// user's custom nameserver is honored on the DIRECT path. Fall back to the
+/// default protected resolver before any config exists.
 pub async fn resolve_host(host: &str) -> std::io::Result<Vec<IpAddr>> {
+    if let Some(engine) = crate::runtime_state::engine().await {
+        return engine.resolver.resolve(host).await;
+    }
     SHARED
         .get_or_init(|| Resolver::new(DnsConfig::default()))
         .resolve(host)

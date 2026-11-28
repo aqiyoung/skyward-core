@@ -204,6 +204,12 @@ impl<T: Read + Write + Send + 'static> UdpManager<T> {
                         }
                         incoming = conn.recv(&mut buf) => {
                             match incoming {
+                                Ok(0) => {
+                                    // Channel closed (e.g. Hysteria2 UDP session
+                                    // ended): signal session end instead of
+                                    // forwarding empty packets forever.
+                                    Ok(false)
+                                }
                                 Ok(n) => {
                                     down_counter.fetch_add(n as u64, Ordering::Relaxed);
                                     let packet = build_udp_reply(

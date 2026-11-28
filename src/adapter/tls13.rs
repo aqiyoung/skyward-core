@@ -906,9 +906,11 @@ impl Tls13Stream {
     /// inner stream's first bytes, and the pending sealed records must
     /// still go out on the socket before any raw writes.
     pub fn into_raw_parts(mut self) -> (BoxedStream, BytesMut, Vec<u8>) {
-        let mut read_first = BytesMut::new();
-        read_first.extend_from_slice(&self.plain_buf);
-        read_first.extend_from_slice(&self.raw_buf);
+        // Only decrypted plaintext belongs in the inner stream's read-ahead.
+        // `raw_buf` holds still-sealed TLS records read from the socket; after
+        // the Vision flip the peer sends plaintext, so appending those record
+        // bytes would corrupt the stream's first bytes.
+        let read_first = self.plain_buf.clone();
         let pending_write = self.write_buf.split_off(self.write_pos);
         (self.inner, read_first, pending_write)
     }
