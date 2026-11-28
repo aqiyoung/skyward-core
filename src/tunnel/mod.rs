@@ -181,7 +181,7 @@ impl Engine {
         let geo = Arc::new(GeoData::load_from(&geo_dirs));
         log(format!("engine: geo done ({:?}) geoip={} geosite={} ({:?})",
             t0.elapsed(), geo.geoip.len(), geo.geosite.len(), t0.elapsed()));
-        let providers = Arc::new(ProviderRegistry::load(&config, data_dir).await);
+        let providers = ProviderRegistry::load(&config, data_dir).await;
         log(format!("engine: rule providers done ({:?})", t0.elapsed()));
         let connections = Arc::new(ConnectionTracker::new());
         Self {

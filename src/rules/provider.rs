@@ -8,6 +8,7 @@ use std::io;
 use std::net::IpAddr;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use ipnet::IpNet;
@@ -193,22 +194,25 @@ impl RuleProvider {
 
 #[derive(Debug, Default)]
 pub struct ProviderRegistry {
-    providers: HashMap<String, RuleProvider>,
+    /// Interior mutability lets the periodic refresh task swap entries while
+    /// rule matching (sync, shared reference) keeps reading them.
+    providers: RwLock<HashMap<String, RuleProvider>>,
 }
 
 impl ProviderRegistry {
     pub fn len(&self) -> usize {
-        self.providers.len()
+        self.providers.read().unwrap().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.providers.is_empty()
+        self.providers.read().unwrap().is_empty()
     }
 
     /// Build all providers. Network/file failures are logged and skipped so
     /// the kernel still starts with the remaining rules.
-    pub async fn load(config: &Config, data_dir: &Path) -> Self {
+    pub async fn load(config: &Config, data_dir: &Path) -> Arc<Self> {
         let mut registry = Self::default();
+        let mut refresh_defs: Vec<(String, RuleProviderDef)> = Vec::new();
         // Providers build concurrently: a profile can carry dozens of
         // remote sets and first load would otherwise serialize their
         // downloads. Failures stay per-provider so one bad set cannot
@@ -219,30 +223,93 @@ impl ProviderRegistry {
             let def = def.clone();
             let data_dir = data_dir.to_path_buf();
             tasks.push(tokio::spawn(async move {
-                let provider = Self::build(&name, &def, &data_dir).await;
-                (name, provider)
+                let provider = Self::build(&name, &def, &data_dir, false).await;
+                (name, def, provider)
             }));
         }
         for task in tasks {
             match task.await {
-                Ok((name, Ok(provider))) => {
+                Ok((name, def, Ok(provider))) => {
                     tracing::info!("rule provider {} loaded ({} entries)", name, provider.len());
-                    registry.providers.insert(name, provider);
+                    registry
+                        .providers
+                        .write()
+                        .unwrap()
+                        .insert(name.clone(), provider);
+                    // mihomo semantics: providers with an `interval` must
+                    // refresh periodically. Start tasks after the registry is
+                    // wrapped in an Arc below so they can share it.
+                    if def.interval.filter(|s| *s > 0).is_some() {
+                        refresh_defs.push((name, def));
+                    }
                 }
-                Ok((name, Err(e))) => {
+                Ok((name, _, Err(e))) => {
                     tracing::warn!("failed to load rule provider {}: {}", name, e)
                 }
                 Err(e) => tracing::warn!("rule provider task failed: {}", e),
             }
         }
+        let registry = Arc::new(registry);
+        for (name, def) in refresh_defs {
+            let refresh_registry = registry.clone();
+            let refresh_dir = data_dir.to_path_buf();
+            let seconds = def.interval.unwrap_or(3600).max(1);
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(seconds));
+                ticker.tick().await; // the first tick is immediate; skip it
+                loop {
+                    ticker.tick().await;
+                    match Self::build(&name, &def, &refresh_dir, true).await {
+                        Ok(provider) => {
+                            refresh_registry
+                                .providers
+                                .write()
+                                .unwrap()
+                                .insert(name.clone(), provider);
+                            tracing::info!("rule provider {} refreshed", name);
+                        }
+                        Err(e) => tracing::warn!(
+                            "rule provider {} refresh failed, keeping old rules: {}",
+                            name, e
+                        ),
+                    }
+                }
+            });
+        }
         registry
     }
 
-    async fn build(name: &str, def: &RuleProviderDef, data_dir: &Path) -> io::Result<RuleProvider> {
+    async fn build(
+        name: &str,
+        def: &RuleProviderDef,
+        data_dir: &Path,
+        force: bool,
+    ) -> io::Result<RuleProvider> {
         let behavior = Behavior::parse(&def.behavior).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, format!("unknown provider behavior '{}'", def.behavior))
         })?;
         let format = def.format.as_deref().unwrap_or("yaml").to_ascii_lowercase();
+        let parse = |raw: &[u8]| -> io::Result<RuleProvider> {
+            if format == "mrs" {
+                let entries = parse_mrs(raw, behavior)?;
+                return Ok(RuleProvider::from_entries(name.to_string(), behavior, entries));
+            }
+            let lines = if raw.is_empty() {
+                def.payload.clone()
+            } else {
+                parse_payload(raw, &format)
+            };
+            // parse_payload cannot fail syntactically: a truncated or corrupt
+            // cache would otherwise become an empty ruleset and stick forever.
+            if !raw.is_empty() && lines.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider payload contains no rules",
+                ));
+            }
+            Ok(RuleProvider::new(name.to_string(), behavior, lines))
+        };
+
         let raw: Vec<u8> = match def.kind.as_str() {
             "inline" => Vec::new(),
             "file" => {
@@ -251,64 +318,62 @@ impl ProviderRegistry {
                 tokio::fs::read(&path).await.map_err(|e| io::Error::new(e.kind(), format!("read {}: {}", path.display(), e)))?
             }
             "http" => {
-                // Prefer the cached copy so startup is instant and offline-safe.
-                let cached = match &def.path {
-                    Some(path) => tokio::fs::read(resolve_path(path, data_dir)).await.ok(),
-                    None => None,
-                };
-                match cached {
-                    Some(bytes) => bytes,
-                    None => {
-                        let url = def.url.as_ref().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "http provider needs url"))?;
-                        let bytes = fetch_url_timeout(url, Duration::from_secs(15), crate::fetch::MAX_BODY).await?;
-                        if let Some(path) = &def.path {
-                            let path = resolve_path(path, data_dir);
-                            if let Some(parent) = path.parent() {
-                                let _ = tokio::fs::create_dir_all(parent).await;
-                            }
-                            let _ = tokio::fs::write(&path, &bytes).await;
-                        }
-                        bytes
+                // Prefer the cached copy so startup is instant and offline-safe,
+                // but only when a refresh is not forced. A corrupt/truncated
+                // cache must trigger a re-download instead of bricking the set.
+                let cached = if force {
+                    None
+                } else {
+                    match &def.path {
+                        Some(path) => tokio::fs::read(resolve_path(path, data_dir)).await.ok(),
+                        None => None,
                     }
+                };
+                if let Some(bytes) = cached {
+                    if let Ok(provider) = parse(&bytes) {
+                        return Ok(provider);
+                    }
+                    tracing::warn!("rule provider {} cache is corrupt, refetching", name);
                 }
+                let url = def.url.as_ref().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "http provider needs url"))?;
+                let bytes = fetch_url_timeout(url, Duration::from_secs(15), crate::fetch::MAX_BODY).await?;
+                if let Some(path) = &def.path {
+                    let path = resolve_path(path, data_dir);
+                    if let Some(parent) = path.parent() {
+                        let _ = tokio::fs::create_dir_all(parent).await;
+                    }
+                    let _ = tokio::fs::write(&path, &bytes).await;
+                }
+                bytes
             }
             other => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("unknown provider type '{}'", other))),
         };
-        if format == "mrs" {
-            let entries = parse_mrs(&raw, behavior)?;
-            return Ok(RuleProvider::from_entries(name.to_string(), behavior, entries));
-        }
-        let lines = if raw.is_empty() {
-            def.payload.clone()
-        } else {
-            parse_payload(&raw, &format)
-        };
-        let _ = def.interval; // periodic refresh is not implemented yet
-        Ok(RuleProvider::new(name.to_string(), behavior, lines))
+        parse(&raw)
     }
 
     pub fn insert(&mut self, provider: RuleProvider) {
-        self.providers.insert(provider.name.clone(), provider);
+        self.providers.write().unwrap().insert(provider.name.clone(), provider);
     }
 
     pub fn matches(&self, name: &str, addr: &TargetAddr, resolved: Option<IpAddr>, geo: &GeoData) -> bool {
-        self.providers.get(name)
+        self.providers.read().unwrap().get(name)
             .map(|p| p.matches(addr, resolved, geo))
             .unwrap_or(false)
     }
 
     pub fn needs_resolve(&self, name: &str, addr: &TargetAddr) -> bool {
-        self.providers.get(name).map(|p| p.needs_resolve(addr)).unwrap_or(false)
+        self.providers.read().unwrap().get(name).map(|p| p.needs_resolve(addr)).unwrap_or(false)
     }
 
-    pub fn names(&self) -> Vec<&str> {
-        let mut names: Vec<&str> = self.providers.keys().map(String::as_str).collect();
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.providers.read().unwrap().keys().cloned().collect();
         names.sort();
         names
     }
 
     pub fn snapshot(&self) -> Vec<ProviderInfo> {
-        let mut items: Vec<ProviderInfo> = self.providers.values().map(|p| ProviderInfo {
+        let guard = self.providers.read().unwrap();
+        let mut items: Vec<ProviderInfo> = guard.values().map(|p| ProviderInfo {
             name: p.name.clone(),
             behavior: p.behavior.as_str().to_string(),
             count: p.len(),
