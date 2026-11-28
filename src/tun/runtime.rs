@@ -25,6 +25,7 @@ pub async fn run<T>(
     engine: Arc<Engine>,
     wake: Arc<Notify>,
     cancel: Arc<Notify>,
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) where
     T: Read + Write + Send + 'static,
 {
@@ -33,6 +34,12 @@ pub async fn run<T>(
     let mut udp = UdpManager::new(engine, io.clone());
     tcp.set_mtu(config.options.mtu);
     let mut buf = vec![0u8; 65536];
+    // Signal that the reader is about to start. The App establishes() the VPN
+    // before calling startTun, so DNS queries can already be queued on the fd;
+    // startTun must not report success until we are about to drain them.
+    if let Some(tx) = ready {
+        let _ = tx.send(());
+    }
 
     loop {
         // Drain every packet the device has queued before sleeping: reading
@@ -494,6 +501,7 @@ mod tests {
             engine,
             Arc::new(Notify::new()),
             cancel.clone(),
+            None,
         ));
         assert!(
             tokio::time::timeout(Duration::from_millis(300), &mut task)

@@ -427,8 +427,16 @@ pub extern "system" fn Java_com_follow_clash_core_mobile_Mobile_startTun(
             *TUN_HANDLER.lock().unwrap() = Some(handler);
             let cancel = Arc::new(tokio::sync::Notify::new());
             let stop = cancel.clone();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
             let task = rt.spawn(async move {
-                crate::tun::runtime::run(device, config, engine, wake, stop).await;
+                crate::tun::runtime::run(device, config, engine, wake, stop, Some(ready_tx)).await;
+            });
+            // The App establishes() the VPN before calling startTun, so DNS may
+            // already be queued on the fd. Wait until the reader is live before
+            // reporting success, otherwise the first DNS burst is dropped and
+            // the network stays down until the resolver retries.
+            let _ = rt.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx).await
             });
             *session = Some(TunSession { cancel, task });
             JNI_TRUE
